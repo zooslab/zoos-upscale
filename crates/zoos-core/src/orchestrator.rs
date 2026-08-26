@@ -435,6 +435,9 @@ impl JobOrchestrator {
         started_at_ms: u64,
     ) -> Result<(), WorkspaceError> {
         self.inner.store.publish_image_output(job_id)?;
+        self.inner
+            .store
+            .finish_manifest(job_id, "completed", exit_code, started_at_ms)?;
         self.inner.store.update_summary(job_id, |summary| {
             summary.status = JobStatus::Completed;
             summary.progress_percent = 100;
@@ -442,9 +445,7 @@ impl JobOrchestrator {
             summary.message = "Validation completed successfully".into();
             summary.error = None;
         })?;
-        self.inner
-            .store
-            .finish_manifest(job_id, "completed", exit_code, started_at_ms)
+        Ok(())
     }
 
     fn finalize_cancelled(&self, job_id: &str, started_at_ms: u64) -> Result<(), WorkspaceError> {

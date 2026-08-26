@@ -358,4 +358,25 @@ mod tests {
             JobStatus::Interrupted
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_directory_symlink_cannot_escape_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let outside = tempfile::tempdir().expect("outside directory must be created");
+        let store = WorkspaceStore::new(directory.path()).expect("store must be created");
+        let created = store
+            .create_fake_job(FakeBehavior::Success)
+            .expect("job must be created");
+        let job_dir = directory.path().join(&created.job_id);
+        fs::remove_dir_all(&job_dir).expect("temporary job directory must be removed");
+        symlink(outside.path(), &job_dir).expect("test symlink must be created");
+
+        assert!(matches!(
+            store.load_summary(&created.job_id),
+            Err(WorkspaceError::UnsafeRunnerRequest)
+        ));
+    }
 }

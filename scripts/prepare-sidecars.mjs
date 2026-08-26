@@ -33,8 +33,8 @@ if (buildResult.status !== 0) {
 }
 
 const executableSuffix = targetTriple.includes('windows') ? '.exe' : ''
-const binaryName = `zoos-runner-fake${executableSuffix}`
-const source = join(repositoryRoot, 'target', profile, binaryName)
+const buildBinaryName = `zoos-runner-fake-bin${executableSuffix}`
+const source = join(repositoryRoot, 'target', profile, buildBinaryName)
 const binariesDirectory = join(repositoryRoot, 'src-tauri', 'binaries')
 const destination = join(
   binariesDirectory,

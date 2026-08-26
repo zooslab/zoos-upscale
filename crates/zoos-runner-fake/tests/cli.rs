@@ -8,7 +8,7 @@ use zoos_runner_protocol::{
 
 #[test]
 fn cli_reports_typed_capabilities() {
-    let result = Command::new(env!("CARGO_BIN_EXE_zoos-runner-fake"))
+    let result = Command::new(env!("CARGO_BIN_EXE_zoos-runner-fake-bin"))
         .args(["--capabilities", "--json"])
         .output()
         .expect("runner must start");
@@ -52,7 +52,7 @@ fn cli_handles_unicode_and_space_paths_without_a_shell() {
     )
     .expect("job must be written");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_zoos-runner-fake"))
+    let result = Command::new(env!("CARGO_BIN_EXE_zoos-runner-fake-bin"))
         .args(["run", "--job"])
         .arg(&job_path)
         .output()

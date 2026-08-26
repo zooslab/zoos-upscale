@@ -540,3 +540,27 @@ impl BackendError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn event_reader_rejects_a_line_before_unbounded_allocation() {
+        let (mut writer, reader) = tokio::io::duplex(MAX_EVENT_LINE_BYTES * 2);
+        let writer_task = tokio::spawn(async move {
+            writer
+                .write_all(&vec![b'x'; MAX_EVENT_LINE_BYTES + 1])
+                .await
+                .expect("test data must be written");
+        });
+        let mut reader = BufReader::new(reader);
+
+        let result = read_bounded_line(&mut reader).await;
+
+        assert!(matches!(result, Err(ReadEventError::TooLong)));
+        writer_task.await.expect("writer task must finish");
+    }
+}

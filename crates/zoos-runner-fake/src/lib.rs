@@ -22,7 +22,10 @@ pub fn run_cli(arguments: impl IntoIterator<Item = String>) -> i32 {
         [command, job_flag, job_path] if command == "run" && job_flag == "--job" => {
             run_job_file(Path::new(job_path), &mut io::stdout().lock())
         }
-        [command] if command == "__grandchild-hang" => hang_forever(),
+        [command] if command == "__grandchild-hang" => {
+            ignore_termination_signal();
+            hang_forever()
+        }
         _ => {
             eprintln!("usage: zoos-runner-fake run --job <absolute-path>");
             EXIT_INVALID_INPUT
@@ -90,7 +93,7 @@ pub fn run_job(request: &FakeJobRequest, output: &mut impl Write) -> i32 {
         FakeBehavior::Crash => std::process::abort(),
         FakeBehavior::Hang => hang_forever(),
         FakeBehavior::CompletedThenNonzero => run_success(request, &mut events, EXIT_INTERNAL),
-        FakeBehavior::SpawnGrandchildAndHang => spawn_grandchild_and_hang(),
+        FakeBehavior::SpawnGrandchildAndHang => spawn_grandchild_and_hang(request),
     }
 }
 
@@ -168,7 +171,7 @@ fn write_fake_output(path: &Path, job_id: &str) -> io::Result<()> {
     result
 }
 
-fn spawn_grandchild_and_hang() -> i32 {
+fn spawn_grandchild_and_hang(request: &FakeJobRequest) -> i32 {
     let executable = match std::env::current_exe() {
         Ok(executable) => executable,
         Err(error) => {
@@ -184,7 +187,23 @@ fn spawn_grandchild_and_hang() -> i32 {
         .stderr(Stdio::null())
         .spawn()
     {
-        Ok(child) => eprintln!("spawned fake grandchild pid={}", child.id()),
+        Ok(mut child) => {
+            let pid_path = request
+                .output
+                .path
+                .parent()
+                .and_then(Path::parent)
+                .map(|workspace| workspace.join("grandchild.pid"));
+            if let Some(pid_path) = pid_path
+                && let Err(error) = fs::write(&pid_path, child.id().to_string())
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("could not record fake grandchild pid: {error}");
+                return EXIT_INTERNAL;
+            }
+            eprintln!("spawned fake grandchild pid={}", child.id());
+        }
         Err(error) => {
             eprintln!("could not spawn fake grandchild: {error}");
             return EXIT_INTERNAL;
@@ -199,6 +218,18 @@ fn hang_forever() -> i32 {
         thread::sleep(Duration::from_secs(60));
     }
 }
+
+#[cfg(unix)]
+fn ignore_termination_signal() {
+    // SAFETY: this is a dedicated test-only process. Ignoring SIGTERM intentionally verifies
+    // that the host escalates process-group cancellation to SIGKILL after its grace period.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+}
+
+#[cfg(not(unix))]
+fn ignore_termination_signal() {}
 
 struct EventWriter<'a, W> {
     output: &'a mut W,

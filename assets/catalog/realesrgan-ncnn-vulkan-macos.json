@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "id": "realesrgan-ncnn-vulkan-macos",
+  "version": "0.2.5.0",
+  "platform": "macos",
+  "architectures": ["arm64", "x86_64"],
+  "approved_for_distribution": false,
+  "bundled_in_release": false,
+  "source": {
+    "repository": "https://github.com/xinntao/Real-ESRGAN",
+    "release": "v0.2.5.0",
+    "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-macos.zip",
+    "archive_size": 51817124,
+    "sha256": "e0ad05580abfeb25f8d8fb55aaf7bedf552c375b5b4d9bd3c8d59764d2cc333a"
+  },
+  "provenance": {
+    "engine_repository": "https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan",
+    "engine_release": "v0.2.0",
+    "engine_commit": "37026f49824c5cf84062e7c6a5dd71445dcf610f",
+    "ncnn_commit": "6125c9f47cd14b589de0521350668cf9d3d37e3c",
+    "libwebp_commit": "8ea81561d2fdd382da60f57958741a7c23a18eb6"
+  },
+  "license_review": {
+    "engine_code": "MIT",
+    "model_weights": "unapproved",
+    "note": "Development cache only. Model redistribution terms require separate approval."
+  },
+  "files": [
+    {
+      "archive_path": "realesrgan-ncnn-vulkan",
+      "destination": "bin/realesrgan-ncnn-vulkan",
+      "kind": "engine",
+      "size": 26787080,
+      "sha256": "c1c35d92079085de96b9d547fd7e4464bc8a2e9ccf28d7b8c712d72ade91b7cc",
+      "executable": true
+    },
+    {
+      "archive_path": "models/realesrgan-x4plus.param",
+      "destination": "models/realesrgan-x4plus.param",
+      "kind": "model",
+      "size": 116029,
+      "sha256": "35330ececcea33b6c397a72548e788d5d53becee4734c50b7fada36e89f10a86",
+      "executable": false
+    },
+    {
+      "archive_path": "models/realesrgan-x4plus.bin",
+      "destination": "models/realesrgan-x4plus.bin",
+      "kind": "model",
+      "size": 33424520,
+      "sha256": "713ee713b0353afaa27976f0563a64a5043bd70b9bd8936c2e26e25ebcdbcddf",
+      "executable": false
+    },
+    {
+      "archive_path": "models/realesrgan-x4plus-anime.param",
+      "destination": "models/realesrgan-x4plus-anime.param",
+      "kind": "model",
+      "size": 30290,
+      "sha256": "2b8fb6e0ae4d2d85704ca08c119a2f5ea40add4f2ecd512eb7f4cd44b6127ed4",
+      "executable": false
+    },
+    {
+      "archive_path": "models/realesrgan-x4plus-anime.bin",
+      "destination": "models/realesrgan-x4plus-anime.bin",
+      "kind": "model",
+      "size": 8943500,
+      "sha256": "fe01c269cfd10cdef8e018ab66ebe750cf79c7af4d1f9c16c737e1295229bacc",
+      "executable": false
+    }
+  ]
+}

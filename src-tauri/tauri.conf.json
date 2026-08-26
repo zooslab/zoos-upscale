@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.zooslab.zoosupscale",
   "build": {
-    "beforeDevCommand": "pnpm sidecar:prepare && pnpm dev",
+    "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "pnpm build",
     "frontendDist": "../dist"

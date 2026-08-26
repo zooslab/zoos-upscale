@@ -6,9 +6,20 @@ import { join } from 'node:path'
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url))
 const inventoryPath = join(repositoryRoot, 'licenses', 'javascript-production.json')
 const checkOnly = process.argv.includes('--check')
-const approvedLicenses = new Set(['Apache-2.0', 'Apache-2.0 OR MIT', 'MIT'])
+const approvedLicenses = new Set([
+  'Apache-2.0',
+  'Apache-2.0 OR MIT',
+  'BSD-2-Clause',
+  'BSD-3-Clause',
+  'BlueOak-1.0.0',
+  'CC0-1.0',
+  'ISC',
+  'MIT',
+  'MIT-0',
+  'MPL-2.0',
+])
 
-const result = spawnSync('pnpm', ['licenses', 'list', '--json', '--prod'], {
+const result = spawnSync('pnpm', ['licenses', 'list', '--json'], {
   cwd: repositoryRoot,
   encoding: 'utf8',
   maxBuffer: 16 * 1024 * 1024,
@@ -22,7 +33,7 @@ const report = JSON.parse(result.stdout)
 const dependencies = []
 for (const [license, packages] of Object.entries(report)) {
   if (!approvedLicenses.has(license)) {
-    throw new Error(`Unapproved production JavaScript license: ${license}`)
+    throw new Error(`Unapproved JavaScript license: ${license}`)
   }
   for (const dependency of packages) {
     for (const version of dependency.versions) {
@@ -39,7 +50,7 @@ for (const [license, packages] of Object.entries(report)) {
 dependencies.sort((left, right) =>
   left.name.localeCompare(right.name) || left.version.localeCompare(right.version),
 )
-const contents = `${JSON.stringify({ schema_version: 1, dependencies }, null, 2)}\n`
+const contents = `${JSON.stringify({ schema_version: 1, scope: 'all', dependencies }, null, 2)}\n`
 
 if (checkOnly) {
   const existing = readFileSync(inventoryPath, 'utf8')
@@ -53,4 +64,3 @@ if (checkOnly) {
   writeFileSync(inventoryPath, contents)
   console.log('Updated licenses/javascript-production.json')
 }
-

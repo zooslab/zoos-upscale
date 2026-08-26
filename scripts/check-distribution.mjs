@@ -9,6 +9,7 @@ const readJson = (path) => JSON.parse(readFileSync(join(repositoryRoot, path), '
 
 const tauri = readJson('src-tauri/tauri.conf.json')
 const sidecars = readJson('sidecars/manifest.json')
-validateDistribution(tauri, sidecars)
+const realEsrgan = readJson('assets/catalog/realesrgan-ncnn-vulkan-macos.json')
+validateDistribution(tauri, sidecars, [realEsrgan])
 
 console.log('Public bundle contains no unapproved sidecars, engines, or models')

@@ -1,9 +1,13 @@
 const forbiddenBundlePattern = /(?:fake|realesrgan|\.param$|\.bin$)/i
 
 export function validateDistribution(tauri, sidecars, catalogs = []) {
+  const resourceConfiguration = tauri.bundle?.resources ?? []
+  const resources = Array.isArray(resourceConfiguration)
+    ? resourceConfiguration
+    : Object.keys(resourceConfiguration)
   const configuredAssets = [
     ...(tauri.bundle?.externalBin ?? []),
-    ...Object.keys(tauri.bundle?.resources ?? {}),
+    ...resources,
   ]
 
   for (const asset of configuredAssets) {
@@ -28,4 +32,3 @@ export function validateDistribution(tauri, sidecars, catalogs = []) {
     }
   }
 }
-

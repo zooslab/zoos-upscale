@@ -24,7 +24,7 @@ test('rejects a model configured as a public resource', () => {
   assert.throws(
     () =>
       validateDistribution(
-        { bundle: { resources: { 'models/photo.bin': 'models/photo.bin' } } },
+        { bundle: { resources: ['models/photo.bin'] } },
         { sidecars: [] },
       ),
     /unapproved runtime asset/,
@@ -50,3 +50,20 @@ test('rejects an unapproved sidecar marked for release', () => {
   )
 })
 
+test('rejects an unapproved catalog marked for release', () => {
+  assert.throws(
+    () =>
+      validateDistribution(
+        { bundle: {} },
+        { sidecars: [] },
+        [
+          {
+            id: 'model-package',
+            bundled_in_release: true,
+            approved_for_distribution: false,
+          },
+        ],
+      ),
+    /approved_for_distribution=true/,
+  )
+})

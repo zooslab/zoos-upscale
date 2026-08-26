@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeDevCommand": "pnpm sidecar:prepare && pnpm dev"
+  },
+  "bundle": {
+    "externalBin": ["binaries/zoos-runner-fake"]
+  }
+}

@@ -10,10 +10,13 @@
     "pnpm": ">=11.19.0 <12"
   },
   "scripts": {
+    "app:dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
     "dev": "vite",
     "build": "pnpm check && vite build",
+    "bundle:check": "node scripts/check-bundle.mjs",
     "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",
     "distribution:check": "node scripts/check-distribution.mjs",
+    "engine:fetch": "node scripts/fetch-engine.mjs",
     "license:check": "node scripts/license-inventory.mjs --check && pnpm distribution:check && pnpm test:scripts",
     "license:inventory": "node scripts/license-inventory.mjs",
     "preview": "vite preview",
@@ -37,6 +40,7 @@
     "svelte-check": "4.7.6",
     "typescript": "6.0.2",
     "vite": "8.2.2",
-    "vitest": "4.1.11"
+    "vitest": "4.1.11",
+    "yauzl": "3.4.0"
   }
 }

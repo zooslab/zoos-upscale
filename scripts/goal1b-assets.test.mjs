@@ -114,6 +114,26 @@ test('rejects a symlink used as the cache destination root', async () => {
   await assert.rejects(fetchAndInstallOrt(catalog, cache, async () => { throw new Error('network forbidden') }), /Symbolic link is forbidden/)
 })
 
+test('rejects a cache root redirected through its project cache parent', async () => {
+  const dylib = arm64MachO()
+  const archivePath = './runtime/lib/runtime.dylib'
+  const archive = tarGzip([{ name: archivePath, contents: dylib }])
+  const catalog = ortCatalog(archive, archivePath, dylib)
+  const project = await temporaryDirectory('zoos-ort-parent-symlink')
+  const outside = await temporaryDirectory('zoos-ort-parent-outside')
+  await symlink(outside, join(project, '.cache'))
+
+  let networkUsed = false
+  await assert.rejects(
+    fetchAndInstallOrt(catalog, join(project, '.cache', 'runtime-assets'), async () => {
+      networkUsed = true
+      return new Response(archive, { status: 200 })
+    }),
+    /Symbolic link is forbidden in cache path/,
+  )
+  assert.equal(networkUsed, false)
+})
+
 test('installs both verified weights and reuses them fully offline', async () => {
   const photo = Buffer.from('photo-weight')
   const anime = Buffer.from('anime-weight')

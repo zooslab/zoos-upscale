@@ -93,6 +93,7 @@ export function validateArm64MachO(buffer) {
 
 export async function fetchAndInstallOrt(catalogValue, cacheRoot, fetchImplementation = globalThis.fetch) {
   const catalog = validateOrtCatalog(catalogValue)
+  await assertSafeCacheRoot(cacheRoot)
   const destination = join(cacheRoot, catalog.id, catalog.version)
   if (await verifyInstallation(catalog, destination, validateArm64MachO)) return destination
   if (await exists(destination)) throw new Error(`Existing ONNX Runtime cache is incomplete: ${destination}`)
@@ -104,6 +105,7 @@ export async function fetchAndInstallOrt(catalogValue, cacheRoot, fetchImplement
 
 export async function fetchAndInstallWeights(catalogValue, cacheRoot, fetchImplementation = globalThis.fetch) {
   const catalog = validateWeightCatalog(catalogValue)
+  await assertSafeCacheRoot(cacheRoot)
   const destination = join(cacheRoot, catalog.id, catalog.version)
   if (await verifyInstallation(catalog, destination)) return destination
   if (await exists(destination)) throw new Error(`Existing weight cache is incomplete: ${destination}`)
@@ -192,6 +194,7 @@ async function fetchVerifiedBuffer(url, sha256, size, fetchImplementation) {
 }
 
 async function installFiles(catalog, destination, files, binaryValidator) {
+  await assertSafeCacheRoot(dirname(dirname(destination)))
   const staging = `${destination}.staging-${randomUUID()}`
   await mkdir(staging, { recursive: true })
   try {
@@ -205,11 +208,40 @@ async function installFiles(catalog, destination, files, binaryValidator) {
     }
     await writeFile(join(staging, 'catalog.json'), `${JSON.stringify(catalog, null, 2)}\n`)
     await mkdir(dirname(destination), { recursive: true })
+    await assertSafeCacheRoot(dirname(dirname(destination)))
     await rename(staging, destination)
     return destination
   } catch (error) {
     await rm(staging, { recursive: true, force: true })
     throw error
+  }
+}
+
+async function assertSafeCacheRoot(cacheRoot) {
+  const absolute = resolve(cacheRoot)
+  const parent = dirname(absolute)
+
+  // The caller controls this boundary. Inspect both it and its direct parent so a project
+  // `.cache` link cannot silently redirect verified development assets outside the workspace.
+  for (const candidate of [parent, absolute]) {
+    let current = candidate
+    while (true) {
+      try {
+        const info = await lstat(current)
+        if (info.isSymbolicLink()) {
+          throw new Error(`Symbolic link is forbidden in cache path: ${current}`)
+        }
+        if (!info.isDirectory()) {
+          throw new Error(`Cache path component is not a directory: ${current}`)
+        }
+        break
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error
+        const next = dirname(current)
+        if (next === current) throw error
+        current = next
+      }
+    }
   }
 }
 

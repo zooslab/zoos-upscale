@@ -5314,6 +5314,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "zoos-media"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "zoos-runner-protocol",
+]
+
+[[package]]
 name = "zoos-runner-fake"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,18 @@
+[package]
+name = "zoos-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+zoos-runner-protocol = { path = "../zoos-runner-protocol" }
+
+[dev-dependencies]
+tempfile = "=3.27.0"

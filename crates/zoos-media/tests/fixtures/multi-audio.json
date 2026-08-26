@@ -1,0 +1,22 @@
+{
+  "streams": [
+    {
+      "index": 0,
+      "codec_name": "hevc",
+      "codec_type": "video",
+      "width": 3840,
+      "height": 2160,
+      "pix_fmt": "yuv420p",
+      "field_order": "progressive",
+      "r_frame_rate": "30000/1001",
+      "avg_frame_rate": "30000/1001",
+      "nb_read_frames": "300",
+      "color_transfer": "bt709",
+      "color_primaries": "bt709"
+    },
+    { "index": 1, "codec_name": "aac", "codec_type": "audio" },
+    { "index": 2, "codec_name": "flac", "codec_type": "audio" }
+  ],
+  "chapters": [],
+  "format": { "format_name": "matroska,webm", "duration": "10.010000" }
+}

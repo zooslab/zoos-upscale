@@ -1,0 +1,21 @@
+{
+  "streams": [
+    {
+      "index": 0,
+      "codec_name": "h264",
+      "codec_type": "video",
+      "width": 1280,
+      "height": 720,
+      "pix_fmt": "yuv420p",
+      "field_order": "progressive",
+      "r_frame_rate": "25/1",
+      "avg_frame_rate": "25/1",
+      "nb_read_frames": "250",
+      "color_transfer": "bt709",
+      "color_primaries": "bt709"
+    },
+    { "index": 1, "codec_name": "aac", "codec_type": "audio" }
+  ],
+  "chapters": [],
+  "format": { "format_name": "matroska,webm", "duration": "10.000000" }
+}

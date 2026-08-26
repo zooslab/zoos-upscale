@@ -1,0 +1,27 @@
+{
+  "streams": [
+    {
+      "index": 0,
+      "codec_name": "h264",
+      "codec_type": "video",
+      "width": 1920,
+      "height": 1080,
+      "pix_fmt": "yuv420p",
+      "field_order": "progressive",
+      "r_frame_rate": "30/1",
+      "avg_frame_rate": "30/1",
+      "nb_read_frames": "300",
+      "color_transfer": "bt709",
+      "color_primaries": "bt709"
+    },
+    { "index": 1, "codec_name": "aac", "codec_type": "audio" },
+    { "index": 2, "codec_name": "mov_text", "codec_type": "subtitle" }
+  ],
+  "chapters": [
+    { "id": 0, "start_time": "0.000000", "end_time": "5.000000" }
+  ],
+  "format": {
+    "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+    "duration": "10.000000"
+  }
+}

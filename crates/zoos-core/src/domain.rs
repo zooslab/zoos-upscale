@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use zoos_runner_protocol::{FakeBehavior, FakeJobRequest};
+use zoos_runner_protocol::{FakeBehavior, FakeJobRequest, ImageUpscaleJobRequest};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -148,12 +148,14 @@ pub(crate) struct StoredJob {
 #[derive(Debug, Clone)]
 pub(crate) enum StoredRunnerRequest {
     Fake(FakeJobRequest),
+    ImageUpscale(ImageUpscaleJobRequest),
 }
 
 impl StoredRunnerRequest {
     pub fn output_path(&self) -> &PathBuf {
         match self {
             Self::Fake(request) => &request.output.path,
+            Self::ImageUpscale(request) => &request.output.path,
         }
     }
 }

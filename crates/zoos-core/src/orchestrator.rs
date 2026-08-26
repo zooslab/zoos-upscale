@@ -5,9 +5,14 @@ use std::time::Duration;
 
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, watch};
-use zoos_runner_protocol::{FakeBehavior, RunnerEvent, RunnerEventPayload, RunnerTask};
+use zoos_runner_protocol::{
+    FakeBehavior, ImageModelId, RunnerCapabilities, RunnerEvent, RunnerEventPayload, RunnerTask,
+};
 
-use crate::domain::{ExecutionRequest, JobErrorView, JobKind, JobStatus, JobSummary};
+use crate::domain::{
+    ExecutionRequest, ImagePreset, ImageSettings, JobErrorView, JobKind, JobStatus, JobSummary,
+    StoredRunnerRequest,
+};
 use crate::process::{
     BackendError, ExecutionBackend, ProcessExecutionBackend, RunnerLaunchSpec, RunnerRegistry,
 };
@@ -53,6 +58,18 @@ impl JobOrchestrator {
 
     pub fn create_fake_job(&self, behavior: FakeBehavior) -> Result<JobSummary, OrchestratorError> {
         Ok(self.inner.store.create_fake_job(behavior)?)
+    }
+
+    pub fn create_image_job(
+        &self,
+        input_path: impl AsRef<Path>,
+        preset: ImagePreset,
+        scale: u8,
+    ) -> Result<JobSummary, OrchestratorError> {
+        Ok(self
+            .inner
+            .store
+            .create_image_job(input_path.as_ref(), ImageSettings { preset, scale })?)
     }
 
     pub fn list_jobs(&self) -> Result<Vec<JobSummary>, OrchestratorError> {
@@ -146,27 +163,17 @@ impl JobOrchestrator {
                 return;
             }
         };
-        let expected_task = match stored.progress.summary.kind {
-            JobKind::FakeValidation => RunnerTask::FakeValidation,
-            JobKind::ImageUpscale => RunnerTask::ImageUpscale,
-        };
+        if let Err(error) = self.inner.store.recheck_image_input(&job_id) {
+            self.finish_with_workspace_error(&job_id, &error, started_at_ms)
+                .await;
+            return;
+        }
         if let Err(error) = self
             .inner
             .backend
             .probe(&launch)
             .await
-            .and_then(|capabilities| {
-                capabilities
-                    .tasks
-                    .contains(&expected_task)
-                    .then_some(())
-                    .ok_or_else(|| {
-                        BackendError::ProbeFailed(format!(
-                            "runner {} does not support {expected_task:?}",
-                            launch.runner_id
-                        ))
-                    })
-            })
+            .and_then(|capabilities| validate_capabilities(&stored, &capabilities, &launch))
         {
             let _progress_guard = self.inner.progress_updates.lock().await;
             if let Err(reporting_error) = self.finalize_failed(&job_id, &error, started_at_ms) {
@@ -243,7 +250,7 @@ impl JobOrchestrator {
         };
         if let Err(error) = finalization
             && let Err(reporting_error) =
-                self.finish_with_internal_error_locked(&job_id, error.to_string(), started_at_ms)
+                self.finish_with_workspace_error_locked(&job_id, &error, started_at_ms)
         {
             eprintln!("could not persist terminal state for job {job_id}: {reporting_error}");
         }
@@ -295,12 +302,60 @@ impl JobOrchestrator {
         }
     }
 
+    async fn finish_with_workspace_error(
+        &self,
+        job_id: &str,
+        error: &WorkspaceError,
+        started_at_ms: u64,
+    ) {
+        let _progress_guard = self.inner.progress_updates.lock().await;
+        if let Err(reporting_error) =
+            self.finish_with_workspace_error_locked(job_id, error, started_at_ms)
+        {
+            eprintln!("could not persist image safety failure for job {job_id}: {reporting_error}");
+        }
+    }
+
+    fn finish_with_workspace_error_locked(
+        &self,
+        job_id: &str,
+        error: &WorkspaceError,
+        started_at_ms: u64,
+    ) -> Result<(), WorkspaceError> {
+        let WorkspaceError::Image(image_error) = error else {
+            return self.finish_with_internal_error_locked(
+                job_id,
+                error.to_string(),
+                started_at_ms,
+            );
+        };
+        let cleanup = self.inner.store.cleanup_unverified_output(job_id);
+        let code = image_error.code().to_owned();
+        let message = image_error.to_string();
+        let progress = self.inner.store.update_summary(job_id, |summary| {
+            summary.status = JobStatus::Failed;
+            summary.stage = None;
+            summary.message = "Image upscale failed".into();
+            summary.error = Some(JobErrorView { code, message });
+        });
+        let manifest = self.inner.store.finish_manifest(
+            job_id,
+            &format!("image_error: {image_error}"),
+            None,
+            started_at_ms,
+        );
+        cleanup?;
+        progress?;
+        manifest
+    }
+
     fn finalize_completed(
         &self,
         job_id: &str,
         exit_code: Option<i32>,
         started_at_ms: u64,
     ) -> Result<(), WorkspaceError> {
+        self.inner.store.publish_image_output(job_id)?;
         self.inner.store.update_summary(job_id, |summary| {
             summary.status = JobStatus::Completed;
             summary.progress_percent = 100;
@@ -382,6 +437,46 @@ impl JobOrchestrator {
     }
 }
 
+fn validate_capabilities(
+    stored: &crate::domain::StoredJob,
+    capabilities: &RunnerCapabilities,
+    launch: &RunnerLaunchSpec,
+) -> Result<(), BackendError> {
+    let expected_task = match stored.progress.summary.kind {
+        JobKind::FakeValidation => RunnerTask::FakeValidation,
+        JobKind::ImageUpscale => RunnerTask::ImageUpscale,
+    };
+    if !capabilities.tasks.contains(&expected_task) {
+        return Err(BackendError::ProbeFailed(format!(
+            "runner {} does not support {expected_task:?}",
+            launch.runner_id
+        )));
+    }
+
+    let StoredRunnerRequest::ImageUpscale(request) = &stored.runner_request else {
+        return Ok(());
+    };
+    let model_id = match request.parameters.model_id {
+        ImageModelId::RealEsrganX4plus => "realesrgan-x4plus",
+        ImageModelId::RealEsrganX4plusAnime => "realesrgan-x4plus-anime",
+    };
+    let model_supported = capabilities
+        .models
+        .iter()
+        .any(|model| model.id == model_id && model.scales.contains(&request.parameters.scale));
+    let scale_supported = capabilities.scales.contains(&request.parameters.scale);
+    let device_supported = capabilities.devices.iter().any(|device| {
+        device.index == request.parameters.gpu_id && device.backend.eq_ignore_ascii_case("vulkan")
+    });
+    if !model_supported || !scale_supported || !device_supported {
+        return Err(BackendError::ProbeFailed(format!(
+            "runner {} does not support model {model_id}, scale {}, Vulkan device {}",
+            launch.runner_id, request.parameters.scale, request.parameters.gpu_id
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum OrchestratorError {
     #[error(transparent)]
@@ -402,6 +497,108 @@ pub enum OrchestratorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{ImageFormat, Rgb, RgbImage};
+    use zoos_runner_protocol::{DeviceCapability, ModelCapability, UpstreamInfo};
+
+    #[test]
+    fn image_safety_failure_keeps_its_structured_error_code() {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let input_directory = tempfile::tempdir().expect("input directory must be created");
+        let input = input_directory.path().join("input.png");
+        RgbImage::from_pixel(2, 2, Rgb([1, 2, 3]))
+            .save_with_format(&input, ImageFormat::Png)
+            .expect("input fixture must save");
+        let orchestrator = JobOrchestrator::new(
+            directory.path(),
+            directory.path().join("missing-runner"),
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+        )
+        .expect("orchestrator must be created");
+        let job = orchestrator
+            .create_image_job(&input, ImagePreset::Photo, 2)
+            .expect("image job must be created");
+
+        orchestrator
+            .finish_with_workspace_error_locked(
+                &job.job_id,
+                &WorkspaceError::Image(crate::ImageSafetyError::InputChanged),
+                now_ms(),
+            )
+            .expect("image failure must persist");
+
+        let failed = orchestrator
+            .list_jobs()
+            .expect("jobs must list")
+            .into_iter()
+            .next()
+            .expect("job must remain");
+        assert_eq!(failed.status, JobStatus::Failed);
+        assert_eq!(
+            failed.error.expect("error must be structured").code,
+            "INPUT_CHANGED"
+        );
+    }
+
+    #[test]
+    fn image_probe_requires_the_planned_model_scale_and_vulkan_device() {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let input_directory = tempfile::tempdir().expect("input directory must be created");
+        let input = input_directory.path().join("input.png");
+        RgbImage::from_pixel(2, 2, Rgb([1, 2, 3]))
+            .save_with_format(&input, ImageFormat::Png)
+            .expect("input fixture must save");
+        let orchestrator = JobOrchestrator::new(
+            directory.path(),
+            directory.path().join("fake-runner"),
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+        )
+        .expect("orchestrator must be created");
+        let job = orchestrator
+            .create_image_job(&input, ImagePreset::Photo, 2)
+            .expect("image job must be created");
+        let stored = orchestrator
+            .inner
+            .store
+            .load_stored_job(&job.job_id)
+            .expect("stored image job must load");
+        let launch = RunnerLaunchSpec::new(
+            "zoos-runner-realesrgan",
+            directory.path().join("image-runner"),
+        )
+        .expect("absolute launch path must validate");
+        let mut capabilities = RunnerCapabilities {
+            protocol_version: 1,
+            runner_id: "zoos-runner-realesrgan".into(),
+            runner_version: "0.1.0".into(),
+            tasks: vec![RunnerTask::ImageUpscale],
+            upstream: Some(UpstreamInfo {
+                name: "Real-ESRGAN-ncnn-vulkan".into(),
+                version: "0.2.0".into(),
+                source_commit: None,
+            }),
+            models: vec![ModelCapability {
+                id: "realesrgan-x4plus".into(),
+                scales: vec![2, 4],
+            }],
+            scales: vec![2, 4],
+            devices: vec![DeviceCapability {
+                index: 0,
+                name: "Apple M5".into(),
+                backend: "vulkan".into(),
+            }],
+            test_behaviors: Vec::new(),
+        };
+
+        validate_capabilities(&stored, &capabilities, &launch)
+            .expect("matching capabilities must pass");
+        capabilities.devices.clear();
+        assert!(matches!(
+            validate_capabilities(&stored, &capabilities, &launch),
+            Err(BackendError::ProbeFailed(_))
+        ));
+    }
 
     #[tokio::test]
     async fn missing_runner_becomes_a_structured_failure() {

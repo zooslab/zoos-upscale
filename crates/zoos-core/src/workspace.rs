@@ -10,12 +10,18 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 use zoos_runner_protocol::{
-    FakeBehavior, FakeJobRequest, FakeParameters, FakeTask, RunnerEvent, RunnerInput, RunnerOutput,
+    FakeBehavior, FakeJobRequest, FakeParameters, FakeTask, ImageModelId, ImageOutputFormat,
+    ImagePreset as ProtocolImagePreset, ImageRunnerInput, ImageRunnerOutput, ImageTask,
+    ImageUpscaleJobRequest, ImageUpscaleParameters, RunnerEvent, RunnerInput, RunnerOutput,
 };
 
 use crate::domain::{
-    JobKind, JobManifest, JobPlan, JobProgress, JobStatus, JobSummary, ProductJobSpec, StoredJob,
-    StoredRunnerRequest,
+    ImagePreset, ImageSettings, JobKind, JobManifest, JobPlan, JobProgress, JobStatus, JobSummary,
+    ProductJobSpec, StoredJob, StoredRunnerRequest,
+};
+use crate::image_safety::{
+    ImageOutputPlan, ImageSafetyError, ImageVerification, cleanup_owned_output, plan_image_output,
+    publish_verified_output, recheck_input,
 };
 
 const JOB_SPEC_FILE: &str = "job-spec.json";
@@ -25,6 +31,7 @@ const PROGRESS_FILE: &str = "progress.json";
 const MANIFEST_FILE: &str = "manifest.json";
 const LOGS_FILE: &str = "logs.jsonl";
 const PLAN_REVISIONS_FILE: &str = "plan-revisions.jsonl";
+const VERIFICATION_FILE: &str = "verification.json";
 const LOCK_FILE: &str = ".workspace.lock";
 const STAGING_DIR: &str = "staging";
 const QUARANTINE_DIR: &str = "quarantine";
@@ -160,6 +167,120 @@ impl WorkspaceStore {
         Ok(summary)
     }
 
+    pub fn create_image_job(
+        &self,
+        input_path: &Path,
+        settings: ImageSettings,
+    ) -> Result<JobSummary, WorkspaceError> {
+        let job_id = Uuid::new_v4().to_string();
+        let output_plan = plan_image_output(input_path, settings.scale, &job_id)?;
+        let job_dir = self.staging_dir().join(&job_id);
+        let published_dir = self.root.join(&job_id);
+        fs::create_dir(&job_dir)?;
+
+        let created_at_ms = now_ms();
+        let input_name = output_plan
+            .input
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(ImageSafetyError::InvalidInputPath)?
+            .to_owned();
+        let job_spec = ProductJobSpec {
+            schema_version: 2,
+            job_id: job_id.clone(),
+            kind: JobKind::ImageUpscale,
+            input_name: Some(input_name.clone()),
+            output_path: Some(output_plan.final_path.clone()),
+            image_settings: Some(settings),
+            scenario: None,
+            created_at_ms,
+        };
+        let plan = JobPlan {
+            schema_version: 1,
+            job_id: job_id.clone(),
+            execution_backend: "process".into(),
+            runner_id: "zoos-runner-realesrgan".into(),
+        };
+        let (preset, model_id) = match settings.preset {
+            ImagePreset::Photo => (ProtocolImagePreset::Photo, ImageModelId::RealEsrganX4plus),
+            ImagePreset::Anime => (
+                ProtocolImagePreset::Anime,
+                ImageModelId::RealEsrganX4plusAnime,
+            ),
+        };
+        let runner_request = ImageUpscaleJobRequest {
+            protocol_version: 1,
+            job_id: job_id.clone(),
+            task: ImageTask::ImageUpscale,
+            input: ImageRunnerInput {
+                path: output_plan.input.path.clone(),
+                sha256: output_plan.input.sha256.clone(),
+                width: output_plan.input.width,
+                height: output_plan.input.height,
+                format: output_plan.input.format,
+            },
+            output: ImageRunnerOutput {
+                path: output_plan.partial_path.clone(),
+                format: ImageOutputFormat::Png,
+            },
+            parameters: ImageUpscaleParameters {
+                preset,
+                model_id,
+                scale: settings.scale,
+                tile_size: 256,
+                gpu_id: 0,
+                threads: "1:2:2".into(),
+            },
+        };
+        runner_request
+            .validate()
+            .map_err(|error| WorkspaceError::InvalidRunnerContract(error.to_string()))?;
+
+        let summary = JobSummary {
+            job_id: job_id.clone(),
+            kind: JobKind::ImageUpscale,
+            input_name: Some(input_name),
+            output_path: Some(output_plan.final_path),
+            image_settings: Some(settings),
+            scenario: None,
+            status: JobStatus::Created,
+            progress_percent: 0,
+            stage: None,
+            message: "Ready to start".into(),
+            error: None,
+            created_at_ms,
+            updated_at_ms: created_at_ms,
+        };
+        let progress = JobProgress {
+            schema_version: 1,
+            summary: summary.clone(),
+        };
+        let manifest = JobManifest {
+            schema_version: 1,
+            job_id: job_id.clone(),
+            runner_id: "zoos-runner-realesrgan".into(),
+            runner_version: env!("CARGO_PKG_VERSION").into(),
+            result: None,
+            exit_code: None,
+            started_at_ms: None,
+            finished_at_ms: None,
+        };
+
+        write_json_atomic(&job_dir.join(JOB_SPEC_FILE), &job_spec)?;
+        write_json_atomic(&job_dir.join(PLAN_FILE), &plan)?;
+        write_json_atomic(&job_dir.join(RUNNER_JOB_FILE), &runner_request)?;
+        write_json_atomic(&job_dir.join(PROGRESS_FILE), &progress)?;
+        write_json_atomic(&job_dir.join(MANIFEST_FILE), &manifest)?;
+        create_empty_file(&job_dir.join(LOGS_FILE))?;
+        create_empty_file(&job_dir.join(PLAN_REVISIONS_FILE))?;
+        sync_directory(&job_dir)?;
+        fs::rename(&job_dir, &published_dir)?;
+        sync_directory(&self.staging_dir())?;
+        sync_directory(&self.root)?;
+        Ok(summary)
+    }
+
     pub fn list_jobs(&self) -> Result<Vec<JobSummary>, WorkspaceError> {
         let mut jobs = Vec::new();
         for entry in fs::read_dir(&self.root)? {
@@ -198,19 +319,11 @@ impl WorkspaceStore {
     pub fn load_stored_job(&self, job_id: &str) -> Result<StoredJob, WorkspaceError> {
         let job_dir = self.job_dir(job_id)?;
         let progress: JobProgress = read_json(&job_dir.join(PROGRESS_FILE))?;
-        let runner_request: FakeJobRequest = read_json(&job_dir.join(RUNNER_JOB_FILE))?;
-        runner_request
-            .validate()
-            .map_err(|error| WorkspaceError::InvalidRunnerContract(error.to_string()))?;
-
-        let expected_output = job_dir.join("final/result.txt");
-        if runner_request.job_id != job_id || runner_request.output.path != expected_output {
-            return Err(WorkspaceError::UnsafeRunnerRequest);
-        }
+        let runner_request = self.read_runner_request(&job_dir, &progress.summary)?;
 
         Ok(StoredJob {
             progress,
-            runner_request: StoredRunnerRequest::Fake(runner_request),
+            runner_request,
             runner_job_path: job_dir.join(RUNNER_JOB_FILE),
         })
     }
@@ -250,14 +363,50 @@ impl WorkspaceStore {
 
     pub fn cleanup_unverified_output(&self, job_id: &str) -> Result<(), WorkspaceError> {
         let job_dir = self.job_dir(job_id)?;
-        remove_if_exists(&job_dir.join("final/result.txt"))?;
-        remove_if_exists(&job_dir.join("final").join(format!(".{job_id}.partial")))?;
+        let stored = self.load_stored_job(job_id)?;
+        match stored.runner_request {
+            StoredRunnerRequest::Fake(_) => {
+                remove_if_exists(&job_dir.join("final/result.txt"))?;
+                remove_if_exists(&job_dir.join("final").join(format!(".{job_id}.partial")))?;
+            }
+            StoredRunnerRequest::ImageUpscale(request) => {
+                let plan = image_plan_from_request(job_id, &stored.progress.summary, request)?;
+                cleanup_owned_output(&plan, &job_dir.join(VERIFICATION_FILE))?;
+            }
+        }
         Ok(())
+    }
+
+    pub fn recheck_image_input(&self, job_id: &str) -> Result<(), WorkspaceError> {
+        let stored = self.load_stored_job(job_id)?;
+        let StoredRunnerRequest::ImageUpscale(request) = stored.runner_request else {
+            return Ok(());
+        };
+        let plan = image_plan_from_request(job_id, &stored.progress.summary, request)?;
+        recheck_input(&plan.input)?;
+        Ok(())
+    }
+
+    pub fn publish_image_output(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<ImageVerification>, WorkspaceError> {
+        let job_dir = self.job_dir(job_id)?;
+        let stored = self.load_stored_job(job_id)?;
+        let StoredRunnerRequest::ImageUpscale(request) = stored.runner_request else {
+            return Ok(None);
+        };
+        let plan = image_plan_from_request(job_id, &stored.progress.summary, request)?;
+        Ok(Some(publish_verified_output(
+            &plan,
+            &job_dir.join(VERIFICATION_FILE),
+        )?))
     }
 
     pub fn recover_interrupted(&self) -> Result<(), WorkspaceError> {
         for job in self.list_jobs()? {
             if job.status.is_active() {
+                self.cleanup_unverified_output(&job.job_id)?;
                 self.update_summary(&job.job_id, |summary| {
                     summary.status = JobStatus::Interrupted;
                     summary.stage = None;
@@ -337,24 +486,64 @@ impl WorkspaceStore {
         let plan: JobPlan = read_json(&job_dir.join(PLAN_FILE))?;
         let progress: JobProgress = read_json(&job_dir.join(PROGRESS_FILE))?;
         let manifest: JobManifest = read_json(&job_dir.join(MANIFEST_FILE))?;
-        let runner_request: FakeJobRequest = read_json(&job_dir.join(RUNNER_JOB_FILE))?;
-        runner_request
-            .validate()
-            .map_err(|error| WorkspaceError::InvalidRunnerContract(error.to_string()))?;
+        let runner_request = self.read_runner_request(job_dir, &progress.summary)?;
 
         if spec.job_id != job_id
             || plan.job_id != job_id
             || progress.summary.job_id != job_id
             || manifest.job_id != job_id
-            || runner_request.job_id != job_id
-            || runner_request.output.path != job_dir.join("final/result.txt")
+            || spec.kind != progress.summary.kind
         {
             return Err(WorkspaceError::UnsafeRunnerRequest);
+        }
+        match runner_request {
+            StoredRunnerRequest::Fake(request)
+                if request.job_id == job_id
+                    && request.output.path == job_dir.join("final/result.txt") => {}
+            StoredRunnerRequest::ImageUpscale(request)
+                if request.job_id == job_id
+                    && progress.summary.output_path.as_ref() != Some(&request.output.path)
+                    && is_safe_image_request(&progress.summary, &request) => {}
+            _ => return Err(WorkspaceError::UnsafeRunnerRequest),
         }
 
         recover_jsonl(&job_dir.join(LOGS_FILE))?;
         recover_jsonl(&job_dir.join(PLAN_REVISIONS_FILE))?;
         Ok(())
+    }
+
+    fn read_runner_request(
+        &self,
+        job_dir: &Path,
+        summary: &JobSummary,
+    ) -> Result<StoredRunnerRequest, WorkspaceError> {
+        match summary.kind {
+            JobKind::FakeValidation => {
+                let request: FakeJobRequest = read_json(&job_dir.join(RUNNER_JOB_FILE))?;
+                request
+                    .validate()
+                    .map_err(|error| WorkspaceError::InvalidRunnerContract(error.to_string()))?;
+                if request.job_id != summary.job_id
+                    || request.output.path != job_dir.join("final/result.txt")
+                {
+                    return Err(WorkspaceError::UnsafeRunnerRequest);
+                }
+                Ok(StoredRunnerRequest::Fake(request))
+            }
+            JobKind::ImageUpscale => {
+                let request: ImageUpscaleJobRequest = read_json(&job_dir.join(RUNNER_JOB_FILE))?;
+                request
+                    .validate()
+                    .map_err(|error| WorkspaceError::InvalidRunnerContract(error.to_string()))?;
+                if request.job_id != summary.job_id
+                    || summary.image_settings.is_none()
+                    || !is_safe_image_request(summary, &request)
+                {
+                    return Err(WorkspaceError::UnsafeRunnerRequest);
+                }
+                Ok(StoredRunnerRequest::ImageUpscale(request))
+            }
+        }
     }
 
     fn quarantine(&self, path: &Path, reason: &str) -> Result<(), WorkspaceError> {
@@ -413,6 +602,74 @@ impl WorkspaceStore {
         }
         Ok(canonical)
     }
+}
+
+fn image_plan_from_request(
+    job_id: &str,
+    summary: &JobSummary,
+    request: ImageUpscaleJobRequest,
+) -> Result<ImageOutputPlan, WorkspaceError> {
+    let final_path = summary
+        .output_path
+        .clone()
+        .ok_or(WorkspaceError::UnsafeRunnerRequest)?;
+    let scale = request.parameters.scale;
+    let output_width = request
+        .input
+        .width
+        .checked_mul(u32::from(scale))
+        .ok_or(WorkspaceError::UnsafeRunnerRequest)?;
+    let output_height = request
+        .input
+        .height
+        .checked_mul(u32::from(scale))
+        .ok_or(WorkspaceError::UnsafeRunnerRequest)?;
+    Ok(ImageOutputPlan {
+        job_id: job_id.into(),
+        input: crate::image_safety::ValidatedImageInput {
+            path: request.input.path,
+            sha256: request.input.sha256,
+            format: request.input.format,
+            width: request.input.width,
+            height: request.input.height,
+        },
+        scale,
+        output_width,
+        output_height,
+        final_path,
+        partial_path: request.output.path,
+    })
+}
+
+fn is_safe_image_request(summary: &JobSummary, request: &ImageUpscaleJobRequest) -> bool {
+    let Some(final_path) = summary.output_path.as_deref() else {
+        return false;
+    };
+    let Some(input_parent) = request.input.path.parent() else {
+        return false;
+    };
+    if final_path.parent() != Some(input_parent.join("Upscaled").as_path()) {
+        return false;
+    }
+    let Some(stem) = request
+        .input
+        .path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+    else {
+        return false;
+    };
+    let Some(final_name) = final_path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let base = format!("{stem}_upscaled_{}x", request.parameters.scale);
+    let name_is_valid = final_name == format!("{base}.png")
+        || (2..=999).any(|suffix| final_name == format!("{base}_{suffix}.png"));
+    if !name_is_valid {
+        return false;
+    }
+    request.output.path
+        == final_path.with_file_name(format!(".{final_name}.zoos-{}.partial.png", summary.job_id))
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), WorkspaceError> {
@@ -557,6 +814,8 @@ pub enum WorkspaceError {
     UnsafeRunnerRequest,
     #[error("invalid runner contract: {0}")]
     InvalidRunnerContract(String),
+    #[error(transparent)]
+    Image(#[from] ImageSafetyError),
     #[error("workspace I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("workspace JSON failed: {0}")]
@@ -566,12 +825,79 @@ pub enum WorkspaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{ImageFormat, Rgb, RgbImage};
 
     fn quarantine_entries(root: &Path) -> Vec<PathBuf> {
         fs::read_dir(root.join(QUARANTINE_DIR))
             .expect("quarantine directory must be readable")
             .map(|entry| entry.expect("quarantine entry must be readable").path())
             .collect()
+    }
+
+    fn rgb_png(path: &Path, width: u32, height: u32, pixel: [u8; 3]) {
+        RgbImage::from_pixel(width, height, Rgb(pixel))
+            .save_with_format(path, ImageFormat::Png)
+            .expect("RGB PNG fixture must save");
+    }
+
+    #[test]
+    fn image_workspace_round_trips_and_publishes_verified_output() {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let input_directory = tempfile::tempdir().expect("input directory must be created");
+        let input = input_directory.path().join("원본 사진.png");
+        rgb_png(&input, 2, 3, [1, 2, 3]);
+        let store = WorkspaceStore::new(directory.path()).expect("store must be created");
+        let created = store
+            .create_image_job(
+                &input,
+                ImageSettings {
+                    preset: ImagePreset::Photo,
+                    scale: 2,
+                },
+            )
+            .expect("image job must be created");
+
+        assert_eq!(created.kind, JobKind::ImageUpscale);
+        assert_eq!(created.input_name.as_deref(), Some("원본 사진.png"));
+        assert_eq!(created.scenario, None);
+        let stored = store
+            .load_stored_job(&created.job_id)
+            .expect("image job must load");
+        let StoredRunnerRequest::ImageUpscale(request) = stored.runner_request else {
+            panic!("image request must retain its kind")
+        };
+        assert_eq!(request.input.path, input);
+        assert_eq!(request.parameters.scale, 2);
+        assert_eq!(request.output.format, ImageOutputFormat::Png);
+        let final_path = created
+            .output_path
+            .as_ref()
+            .expect("summary must expose final output");
+        assert_ne!(&request.output.path, final_path);
+        let final_name = final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("final name must be UTF-8");
+        assert_eq!(
+            request.output.path,
+            final_path.with_file_name(format!(".{final_name}.zoos-{}.partial.png", created.job_id))
+        );
+        rgb_png(&request.output.path, 4, 6, [8, 9, 10]);
+
+        let verification = store
+            .publish_image_output(&created.job_id)
+            .expect("publish must succeed")
+            .expect("image publish must return verification");
+        assert_eq!(verification.output_path.as_path(), final_path.as_path());
+        assert!(verification.output_path.is_file());
+        assert!(
+            directory
+                .path()
+                .join(&created.job_id)
+                .join(VERIFICATION_FILE)
+                .is_file()
+        );
+        assert_eq!(store.list_jobs().expect("jobs must list").len(), 1);
     }
 
     #[test]
@@ -689,6 +1015,53 @@ mod tests {
             store
                 .load_summary(&created.job_id)
                 .expect("progress must load")
+                .status,
+            JobStatus::Interrupted
+        );
+    }
+
+    #[test]
+    fn image_recovery_removes_owned_partial_but_preserves_raced_final() {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let input_directory = tempfile::tempdir().expect("input directory must be created");
+        let input = input_directory.path().join("input.png");
+        rgb_png(&input, 2, 2, [1, 2, 3]);
+        let store = WorkspaceStore::new(directory.path()).expect("store must be created");
+        let created = store
+            .create_image_job(
+                &input,
+                ImageSettings {
+                    preset: ImagePreset::Anime,
+                    scale: 2,
+                },
+            )
+            .expect("image job must be created");
+        let stored = store
+            .load_stored_job(&created.job_id)
+            .expect("image job must load");
+        let StoredRunnerRequest::ImageUpscale(request) = stored.runner_request else {
+            panic!("image runner request must load")
+        };
+        rgb_png(&request.output.path, 4, 4, [4, 5, 6]);
+        let final_path = created.output_path.expect("final output must be planned");
+        fs::write(&final_path, b"raced final").expect("raced final must save");
+        store
+            .update_summary(&created.job_id, |summary| {
+                summary.status = JobStatus::Running;
+            })
+            .expect("job must become active");
+
+        store.recover_interrupted().expect("recovery must complete");
+
+        assert!(!request.output.path.exists());
+        assert_eq!(
+            fs::read(final_path).expect("raced final must remain"),
+            b"raced final"
+        );
+        assert_eq!(
+            store
+                .load_summary(&created.job_id)
+                .expect("summary must load")
                 .status,
             JobStatus::Interrupted
         );

@@ -7,8 +7,10 @@ use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, watch};
 use zoos_runner_protocol::{FakeBehavior, RunnerEvent, RunnerEventPayload};
 
-use crate::domain::{ExecutionRequest, JobErrorView, JobStatus, JobSummary};
-use crate::process::{BackendError, ExecutionBackend, ProcessExecutionBackend};
+use crate::domain::{ExecutionRequest, JobErrorView, JobKind, JobStatus, JobSummary};
+use crate::process::{
+    BackendError, ExecutionBackend, ProcessExecutionBackend, RunnerLaunchSpec, RunnerRegistry,
+};
 use crate::workspace::{WorkspaceError, WorkspaceStore, now_ms};
 
 #[derive(Clone)]
@@ -19,6 +21,7 @@ pub struct JobOrchestrator {
 struct Inner {
     store: WorkspaceStore,
     backend: Arc<dyn ExecutionBackend>,
+    runners: RunnerRegistry,
     active_jobs: Mutex<HashMap<String, watch::Sender<bool>>>,
     progress_updates: Mutex<()>,
 }
@@ -30,14 +33,18 @@ impl JobOrchestrator {
         activity_timeout: Duration,
         termination_grace: Duration,
     ) -> Result<Self, OrchestratorError> {
-        let backend =
-            ProcessExecutionBackend::new(runner_path, activity_timeout, termination_grace)?;
+        let backend = ProcessExecutionBackend::new(activity_timeout, termination_grace);
+        let runners = RunnerRegistry::with_runner(
+            JobKind::FakeValidation,
+            RunnerLaunchSpec::new("zoos-runner-fake", runner_path)?,
+        );
         let store = WorkspaceStore::new(workspace_root)?;
         store.recover_interrupted()?;
         Ok(Self {
             inner: Arc::new(Inner {
                 store,
                 backend: Arc::new(backend),
+                runners,
                 active_jobs: Mutex::new(HashMap::new()),
                 progress_updates: Mutex::new(()),
             }),
@@ -65,6 +72,8 @@ impl JobOrchestrator {
         if !active_jobs.is_empty() {
             return Err(OrchestratorError::AnotherJobActive);
         }
+
+        self.inner.runners.resolve(stored.progress.summary.kind)?;
 
         let progress_guard = self.inner.progress_updates.lock().await;
         self.inner.store.update_summary(job_id, |summary| {
@@ -140,17 +149,32 @@ impl JobOrchestrator {
                 return;
             }
         };
+        let launch = match self.inner.runners.resolve(stored.progress.summary.kind) {
+            Ok(launch) => launch.clone(),
+            Err(error) => {
+                self.finish_with_internal_error(&job_id, error.to_string(), started_at_ms)
+                    .await;
+                return;
+            }
+        };
+        if let Err(error) = self.inner.backend.probe(&launch).await {
+            let _progress_guard = self.inner.progress_updates.lock().await;
+            if let Err(reporting_error) = self.finalize_failed(&job_id, &error, started_at_ms) {
+                eprintln!("could not persist probe failure for job {job_id}: {reporting_error}");
+            }
+            return;
+        }
         let request = ExecutionRequest {
             job_id: job_id.clone(),
             runner_job_path: stored.runner_job_path,
-            expected_output_path: stored.runner_request.output.path,
+            expected_output_path: stored.runner_request.output_path().clone(),
         };
 
         let (event_sender, mut event_receiver) = mpsc::channel(32);
         let backend = Arc::clone(&self.inner.backend);
         let backend_task = tokio::spawn(async move {
             backend
-                .execute(request, event_sender, cancel_receiver)
+                .execute(&launch, request, event_sender, cancel_receiver)
                 .await
         });
 

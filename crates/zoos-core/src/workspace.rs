@@ -13,7 +13,8 @@ use zoos_runner_protocol::{
 };
 
 use crate::domain::{
-    JobManifest, JobPlan, JobProgress, JobStatus, JobSummary, ProductJobSpec, StoredJob,
+    JobKind, JobManifest, JobPlan, JobProgress, JobStatus, JobSummary, ProductJobSpec, StoredJob,
+    StoredRunnerRequest,
 };
 
 const JOB_SPEC_FILE: &str = "job-spec.json";
@@ -52,10 +53,13 @@ impl WorkspaceStore {
         fs::write(&input_path, b"Zoos Upscale fake input\n")?;
 
         let job_spec = ProductJobSpec {
-            schema_version: 1,
+            schema_version: 2,
             job_id: job_id.clone(),
-            kind: "fake_validation".into(),
-            scenario: behavior,
+            kind: JobKind::FakeValidation,
+            input_name: Some("input.txt".into()),
+            output_path: Some(output_path.clone()),
+            image_settings: None,
+            scenario: Some(behavior),
             created_at_ms,
         };
         let plan = JobPlan {
@@ -69,7 +73,9 @@ impl WorkspaceStore {
             job_id: job_id.clone(),
             task: FakeTask::Fake,
             input: RunnerInput { path: input_path },
-            output: RunnerOutput { path: output_path },
+            output: RunnerOutput {
+                path: output_path.clone(),
+            },
             parameters: FakeParameters {
                 steps: 20,
                 step_delay_ms: 80,
@@ -82,7 +88,11 @@ impl WorkspaceStore {
 
         let summary = JobSummary {
             job_id: job_id.clone(),
-            scenario: behavior,
+            kind: JobKind::FakeValidation,
+            input_name: Some("input.txt".into()),
+            output_path: Some(output_path),
+            image_settings: None,
+            scenario: Some(behavior),
             status: JobStatus::Created,
             progress_percent: 0,
             stage: None,
@@ -158,7 +168,7 @@ impl WorkspaceStore {
 
         Ok(StoredJob {
             progress,
-            runner_request,
+            runner_request: StoredRunnerRequest::Fake(runner_request),
             runner_job_path: job_dir.join(RUNNER_JOB_FILE),
         })
     }
@@ -333,6 +343,27 @@ mod tests {
             .expect("progress must load");
         assert_eq!(loaded.status, JobStatus::Running);
         assert_eq!(loaded.progress_percent, 45);
+    }
+
+    #[test]
+    fn v1_fake_progress_is_upgraded_in_memory() {
+        let progress: JobProgress = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "job_id": "fcd11d64-7a52-4aa2-915f-0dd0ea345868",
+            "scenario": "success",
+            "status": "CREATED",
+            "progress_percent": 0,
+            "stage": null,
+            "message": "Ready to start",
+            "error": null,
+            "created_at_ms": 1,
+            "updated_at_ms": 1
+        }))
+        .expect("v1 fake progress must deserialize");
+
+        assert_eq!(progress.summary.kind, JobKind::FakeValidation);
+        assert_eq!(progress.summary.scenario, Some(FakeBehavior::Success));
+        assert_eq!(progress.summary.image_settings, None);
     }
 
     #[test]

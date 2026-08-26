@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -8,17 +9,20 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
-use zoos_runner_protocol::{RunnerEvent, RunnerEventPayload};
+use zoos_runner_protocol::{RunnerCapabilities, RunnerEvent, RunnerEventPayload};
 
-use crate::domain::{ExecutionReport, ExecutionRequest};
+use crate::domain::{ExecutionReport, ExecutionRequest, JobKind};
 
 const MAX_EVENT_LINE_BYTES: usize = 64 * 1024;
 const MAX_STDERR_BYTES: u64 = 64 * 1024;
 
 #[async_trait]
 pub(crate) trait ExecutionBackend: Send + Sync {
+    async fn probe(&self, launch: &RunnerLaunchSpec) -> Result<RunnerCapabilities, BackendError>;
+
     async fn execute(
         &self,
+        launch: &RunnerLaunchSpec,
         request: ExecutionRequest,
         events: mpsc::Sender<RunnerEvent>,
         cancellation: watch::Receiver<bool>,
@@ -27,36 +31,96 @@ pub(crate) trait ExecutionBackend: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct ProcessExecutionBackend {
-    runner_path: PathBuf,
     activity_timeout: Duration,
     termination_grace: Duration,
 }
 
 impl ProcessExecutionBackend {
-    pub fn new(
-        runner_path: PathBuf,
-        activity_timeout: Duration,
-        termination_grace: Duration,
-    ) -> Result<Self, BackendError> {
-        if !runner_path.is_absolute() {
+    pub fn new(activity_timeout: Duration, termination_grace: Duration) -> Self {
+        Self {
+            activity_timeout,
+            termination_grace,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RunnerLaunchSpec {
+    pub runner_id: String,
+    pub executable: PathBuf,
+}
+
+impl RunnerLaunchSpec {
+    pub fn new(runner_id: impl Into<String>, executable: PathBuf) -> Result<Self, BackendError> {
+        let runner_id = runner_id.into();
+        if runner_id.trim().is_empty() || !executable.is_absolute() {
             return Err(BackendError::InvalidRunnerPath);
         }
         Ok(Self {
-            runner_path,
-            activity_timeout,
-            termination_grace,
+            runner_id,
+            executable,
         })
     }
+}
 
-    pub fn runner_path(&self) -> &PathBuf {
-        &self.runner_path
+#[derive(Debug, Clone, Default)]
+pub struct RunnerRegistry {
+    runners: HashMap<JobKind, RunnerLaunchSpec>,
+}
+
+impl RunnerRegistry {
+    pub fn with_runner(kind: JobKind, launch: RunnerLaunchSpec) -> Self {
+        Self {
+            runners: HashMap::from([(kind, launch)]),
+        }
+    }
+
+    pub fn register(&mut self, kind: JobKind, launch: RunnerLaunchSpec) {
+        self.runners.insert(kind, launch);
+    }
+
+    pub fn resolve(&self, kind: JobKind) -> Result<&RunnerLaunchSpec, BackendError> {
+        self.runners
+            .get(&kind)
+            .ok_or(BackendError::RunnerNotRegistered(kind))
     }
 }
 
 #[async_trait]
 impl ExecutionBackend for ProcessExecutionBackend {
+    async fn probe(&self, launch: &RunnerLaunchSpec) -> Result<RunnerCapabilities, BackendError> {
+        let output = timeout(
+            self.activity_timeout,
+            Command::new(&launch.executable)
+                .args(["--capabilities", "--json"])
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await
+        .map_err(|_| BackendError::RunnerTimedOut)?
+        .map_err(|error| BackendError::SpawnFailed(error.to_string()))?;
+        if !output.status.success() {
+            return Err(BackendError::ProbeFailed(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        let capabilities: RunnerCapabilities = serde_json::from_slice(&output.stdout)
+            .map_err(|error| BackendError::ProbeFailed(error.to_string()))?;
+        capabilities
+            .validate()
+            .map_err(|error| BackendError::ProbeFailed(error.to_string()))?;
+        if capabilities.runner_id != launch.runner_id {
+            return Err(BackendError::ProbeFailed(format!(
+                "expected runner {}, got {}",
+                launch.runner_id, capabilities.runner_id
+            )));
+        }
+        Ok(capabilities)
+    }
+
     async fn execute(
         &self,
+        launch: &RunnerLaunchSpec,
         request: ExecutionRequest,
         events: mpsc::Sender<RunnerEvent>,
         mut cancellation: watch::Receiver<bool>,
@@ -65,7 +129,7 @@ impl ExecutionBackend for ProcessExecutionBackend {
             return Err(BackendError::Cancelled);
         }
 
-        let mut command = Command::new(&self.runner_path);
+        let mut command = Command::new(&launch.executable);
         command
             .args(["run", "--job"])
             .arg(&request.runner_job_path)
@@ -469,6 +533,10 @@ fn process_group_exists(child_id: u32) -> bool {
 pub enum BackendError {
     #[error("runner path must be absolute")]
     InvalidRunnerPath,
+    #[error("no runner is registered for {0:?}")]
+    RunnerNotRegistered(JobKind),
+    #[error("runner capability probe failed: {0}")]
+    ProbeFailed(String),
     #[error("runner could not start: {0}")]
     SpawnFailed(String),
     #[error("runner protocol violation: {0}")]
@@ -499,7 +567,10 @@ pub enum BackendError {
 impl BackendError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
-            Self::InvalidRunnerPath | Self::SpawnFailed(_) => "SPAWN_FAILED",
+            Self::InvalidRunnerPath | Self::RunnerNotRegistered(_) | Self::SpawnFailed(_) => {
+                "SPAWN_FAILED"
+            }
+            Self::ProbeFailed(_) => "CAPABILITY_PROBE_FAILED",
             Self::ProtocolViolation(_) => "PROTOCOL_VIOLATION",
             Self::RunnerCrashed { .. } => "RUNNER_CRASHED",
             Self::RunnerFailed { .. } => "RUNNER_FAILED",
@@ -512,8 +583,11 @@ impl BackendError {
 
     pub(crate) fn user_message(&self) -> String {
         match self {
-            Self::InvalidRunnerPath | Self::SpawnFailed(_) => {
+            Self::InvalidRunnerPath | Self::RunnerNotRegistered(_) | Self::SpawnFailed(_) => {
                 "The local validation engine could not start.".into()
+            }
+            Self::ProbeFailed(_) => {
+                "The local validation engine did not report valid capabilities.".into()
             }
             Self::ProtocolViolation(_) => {
                 "The validation engine returned an unexpected response.".into()

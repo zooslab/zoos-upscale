@@ -4,7 +4,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use commands::{ImageRuntime, runtime_asset_directory};
+use commands::{
+    ImageRuntime, cpu_model_asset_directory, cpu_runtime_asset_directory, runtime_asset_directory,
+};
 use tauri::Manager;
 use zoos_core::{JobKind, JobOrchestrator, RunnerLaunchSpec, RunnerRegistry};
 
@@ -22,15 +24,24 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let runtime = resolve_image_runtime(app.handle())?;
-            let image_launch =
-                RunnerLaunchSpec::new("zoos-runner-realesrgan", runtime.wrapper_path.clone())?
+            let gpu_launch =
+                RunnerLaunchSpec::new("zoos-runner-realesrgan", runtime.gpu_wrapper_path.clone())?
                     .with_arguments([
                         OsString::from("--engine"),
-                        runtime.engine_path().into_os_string(),
+                        runtime.gpu_engine_path().into_os_string(),
                         OsString::from("--models"),
-                        runtime.models_path().into_os_string(),
+                        runtime.gpu_models_path().into_os_string(),
                     ])?;
-            let runners = RunnerRegistry::with_runner(JobKind::ImageUpscale, image_launch);
+            let cpu_launch =
+                RunnerLaunchSpec::new("zoos-runner-ort", runtime.cpu_wrapper_path.clone())?
+                    .with_arguments([
+                        OsString::from("--runtime"),
+                        runtime.cpu_runtime_path().into_os_string(),
+                        OsString::from("--models"),
+                        runtime.cpu_models_path().into_os_string(),
+                    ])?;
+            let mut runners = RunnerRegistry::with_runner(JobKind::ImageUpscale, gpu_launch);
+            runners.register_runner(cpu_launch);
 
             #[cfg(debug_assertions)]
             let runners = {
@@ -58,9 +69,11 @@ pub fn run() {
     let builder = builder.invoke_handler(tauri::generate_handler![
         commands::get_image_engine_status,
         commands::pick_and_create_image_job,
+        commands::pick_and_create_image_batch,
         commands::list_jobs,
         commands::start_job,
         commands::cancel_job,
+        commands::cancel_batch,
         commands::create_fake_job,
     ]);
 
@@ -68,9 +81,11 @@ pub fn run() {
     let builder = builder.invoke_handler(tauri::generate_handler![
         commands::get_image_engine_status,
         commands::pick_and_create_image_job,
+        commands::pick_and_create_image_batch,
         commands::list_jobs,
         commands::start_job,
         commands::cancel_job,
+        commands::cancel_batch,
     ]);
 
     builder
@@ -81,10 +96,11 @@ pub fn run() {
 fn resolve_image_runtime<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> Result<ImageRuntime, Box<dyn std::error::Error>> {
-    let wrapper_path = resolve_sibling_or_development_runner("zoos-runner-realesrgan")?;
+    let gpu_wrapper_path = resolve_sibling_or_development_runner("zoos-runner-realesrgan")?;
+    let cpu_wrapper_path = resolve_sibling_or_development_runner("zoos-runner-ort")?;
 
     #[cfg(debug_assertions)]
-    let install_directory = match std::env::var_os("ZOOS_RUNTIME_ASSETS_DIR") {
+    let gpu_install_directory = match std::env::var_os("ZOOS_RUNTIME_ASSETS_DIR") {
         Some(value) => {
             let path = PathBuf::from(value);
             if !path.is_absolute() {
@@ -95,16 +111,42 @@ fn resolve_image_runtime<R: tauri::Runtime>(
         None => runtime_asset_directory(&workspace_root()?.join(".cache/runtime-assets")),
     };
 
+    #[cfg(debug_assertions)]
+    let (cpu_runtime_directory, cpu_model_directory) = {
+        let root = workspace_root()?;
+        let runtime = std::env::var_os("ZOOS_ORT_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cpu_runtime_asset_directory(&root.join(".cache/runtime-assets")));
+        let models = std::env::var_os("ZOOS_ORT_MODEL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cpu_model_asset_directory(&root.join(".cache/model-assets")));
+        if !runtime.is_absolute() || !models.is_absolute() {
+            return Err("Goal 1B asset directories must be absolute".into());
+        }
+        (runtime, models)
+    };
+
     #[cfg(not(debug_assertions))]
-    let install_directory =
+    let gpu_install_directory =
         runtime_asset_directory(&app.path().app_cache_dir()?.join("runtime-assets"));
+
+    #[cfg(not(debug_assertions))]
+    let cpu_runtime_directory =
+        cpu_runtime_asset_directory(&app.path().app_cache_dir()?.join("runtime-assets"));
+
+    #[cfg(not(debug_assertions))]
+    let cpu_model_directory =
+        cpu_model_asset_directory(&app.path().app_cache_dir()?.join("model-assets"));
 
     #[cfg(debug_assertions)]
     let _ = app;
 
     Ok(ImageRuntime {
-        wrapper_path,
-        install_directory,
+        gpu_wrapper_path,
+        gpu_install_directory,
+        cpu_wrapper_path,
+        cpu_runtime_directory,
+        cpu_model_directory,
     })
 }
 
@@ -154,30 +196,59 @@ mod tests {
             runtime_asset_directory(root),
             root.join("realesrgan-ncnn-vulkan-macos/0.2.5.0/macos-universal")
         );
+        assert_eq!(
+            cpu_runtime_asset_directory(root),
+            root.join("onnxruntime-macos-arm64/1.29.0")
+        );
+        assert_eq!(
+            cpu_model_asset_directory(Path::new("/tmp/model-cache")),
+            Path::new("/tmp/model-cache/realesrgan-onnx/goal1b-v1")
+        );
     }
 
     #[test]
     fn image_runner_arguments_are_explicit_absolute_paths() {
         let runtime = ImageRuntime {
-            wrapper_path: PathBuf::from("/tmp/wrapper"),
-            install_directory: PathBuf::from("/tmp/assets"),
+            gpu_wrapper_path: PathBuf::from("/tmp/gpu-wrapper"),
+            gpu_install_directory: PathBuf::from("/tmp/gpu-assets"),
+            cpu_wrapper_path: PathBuf::from("/tmp/cpu-wrapper"),
+            cpu_runtime_directory: PathBuf::from("/tmp/cpu-runtime"),
+            cpu_model_directory: PathBuf::from("/tmp/cpu-models"),
         };
-        let launch = RunnerLaunchSpec::new("zoos-runner-realesrgan", runtime.wrapper_path.clone())
+        let gpu = RunnerLaunchSpec::new("zoos-runner-realesrgan", runtime.gpu_wrapper_path.clone())
             .expect("absolute wrapper")
             .with_arguments([
                 OsString::from("--engine"),
-                runtime.engine_path().into_os_string(),
+                runtime.gpu_engine_path().into_os_string(),
                 OsString::from("--models"),
-                runtime.models_path().into_os_string(),
+                runtime.gpu_models_path().into_os_string(),
             ])
             .expect("fixed arguments");
         assert_eq!(
-            launch.arguments,
+            gpu.arguments,
             vec![
                 OsString::from("--engine"),
-                OsString::from("/tmp/assets/bin/realesrgan-ncnn-vulkan"),
+                OsString::from("/tmp/gpu-assets/bin/realesrgan-ncnn-vulkan"),
                 OsString::from("--models"),
-                OsString::from("/tmp/assets/models"),
+                OsString::from("/tmp/gpu-assets/models"),
+            ]
+        );
+        let cpu = RunnerLaunchSpec::new("zoos-runner-ort", runtime.cpu_wrapper_path.clone())
+            .expect("absolute wrapper")
+            .with_arguments([
+                OsString::from("--runtime"),
+                runtime.cpu_runtime_path().into_os_string(),
+                OsString::from("--models"),
+                runtime.cpu_models_path().into_os_string(),
+            ])
+            .expect("fixed arguments");
+        assert_eq!(
+            cpu.arguments,
+            vec![
+                OsString::from("--runtime"),
+                OsString::from("/tmp/cpu-runtime/lib/libonnxruntime.1.29.0.dylib"),
+                OsString::from("--models"),
+                OsString::from("/tmp/cpu-models/models"),
             ]
         );
     }

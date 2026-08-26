@@ -172,6 +172,31 @@ impl JobOrchestrator {
         Ok(cancelling)
     }
 
+    /// Cancels a job that has been created but has not started yet.
+    ///
+    /// Active jobs must continue to use [`Self::cancel_job`] so the runner process tree is
+    /// terminated before the workspace reaches a terminal state.
+    pub fn cancel_created_job(&self, job_id: &str) -> Result<JobSummary, OrchestratorError> {
+        let current = self.inner.store.load_summary(job_id)?;
+        if current.status != JobStatus::Created {
+            return Err(OrchestratorError::InvalidState {
+                expected: JobStatus::Created,
+                actual: current.status,
+            });
+        }
+        let cancelled = self.inner.store.update_summary(job_id, |summary| {
+            summary.status = JobStatus::Cancelled;
+            summary.progress_percent = 0;
+            summary.stage = None;
+            summary.message = "Cancelled before execution".into();
+            summary.error = None;
+        })?;
+        self.inner
+            .store
+            .finish_unstarted_manifest(job_id, "cancelled_before_start")?;
+        Ok(cancelled)
+    }
+
     async fn execute_job(
         &self,
         job_id: String,
@@ -835,6 +860,25 @@ mod tests {
             .expect("launch must validate");
         validate_capabilities(&stored, &capabilities, &launch)
             .expect("native x4 CPU capability must satisfy an x2 Goal 1B request");
+
+        let cancelled = orchestrator
+            .cancel_created_job(&created.job_id)
+            .expect("a pending batch member must cancel without starting a runner");
+        assert_eq!(cancelled.status, JobStatus::Cancelled);
+        assert_eq!(cancelled.stage, None);
+        assert_eq!(cancelled.error, None);
+        let manifest: crate::domain::JobManifest = serde_json::from_slice(
+            &std::fs::read(directory.path().join(&created.job_id).join("manifest.json"))
+                .expect("manifest must remain readable"),
+        )
+        .expect("manifest must remain valid");
+        assert_eq!(manifest.result.as_deref(), Some("cancelled_before_start"));
+        assert_eq!(manifest.started_at_ms, None);
+        assert!(manifest.finished_at_ms.is_some());
+        assert!(matches!(
+            orchestrator.cancel_created_job(&created.job_id),
+            Err(OrchestratorError::InvalidState { .. })
+        ));
     }
 
     #[tokio::test]

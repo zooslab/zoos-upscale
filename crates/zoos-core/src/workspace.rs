@@ -697,6 +697,20 @@ impl WorkspaceStore {
         write_json_atomic(&path, &manifest)
     }
 
+    pub(crate) fn finish_unstarted_manifest(
+        &self,
+        job_id: &str,
+        result: &str,
+    ) -> Result<(), WorkspaceError> {
+        let path = self.job_dir(job_id)?.join(MANIFEST_FILE);
+        let mut manifest: JobManifest = read_json(&path)?;
+        manifest.result = Some(result.into());
+        manifest.exit_code = None;
+        manifest.started_at_ms = None;
+        manifest.finished_at_ms = Some(now_ms());
+        write_json_atomic(&path, &manifest)
+    }
+
     fn record_pipeline_verification(
         &self,
         job_id: &str,

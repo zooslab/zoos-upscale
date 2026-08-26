@@ -49,6 +49,9 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
 
+      - name: Prepare native sidecar
+        run: pnpm sidecar:prepare
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 

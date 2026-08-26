@@ -201,6 +201,222 @@ main {
   padding: 32px;
 }
 
+.lab-body {
+  display: flex;
+  gap: 20px;
+  flex-direction: column;
+}
+
+.lab-heading,
+.lab-actions,
+.job-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.lab-heading h2 {
+  margin-bottom: 0;
+}
+
+.runtime-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border: 1px solid rgba(139, 228, 187, 0.2);
+  border-radius: 999px;
+  color: var(--accent);
+  background: rgba(82, 201, 148, 0.07);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.runtime-state::before {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  content: "";
+}
+
+.runtime-state.offline {
+  border-color: var(--line);
+  color: #778196;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.scenario-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.scenario-grid button,
+.primary-action,
+.cancel-action {
+  border: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.scenario-grid button {
+  display: flex;
+  min-height: 66px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  align-items: flex-start;
+  justify-content: center;
+  flex-direction: column;
+  background: rgba(255, 255, 255, 0.025);
+  text-align: left;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease;
+}
+
+.scenario-grid button:hover:not(:disabled) {
+  border-color: rgba(139, 228, 187, 0.25);
+}
+
+.scenario-grid button.selected {
+  border-color: rgba(139, 228, 187, 0.38);
+  background: rgba(82, 201, 148, 0.09);
+}
+
+.scenario-grid button:disabled,
+.primary-action:disabled,
+.cancel-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.scenario-grid strong {
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.scenario-grid span {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.lab-actions {
+  justify-content: flex-start;
+}
+
+.primary-action,
+.cancel-action {
+  min-height: 40px;
+  padding: 0 17px;
+  border-radius: 11px;
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.primary-action {
+  color: #06130d;
+  background: linear-gradient(135deg, #a2f4ce, #59c995);
+  box-shadow: 0 10px 24px rgba(82, 201, 148, 0.12);
+}
+
+.cancel-action {
+  border: 1px solid rgba(255, 137, 137, 0.24);
+  color: #ffb4b4;
+  background: rgba(255, 91, 91, 0.07);
+}
+
+.command-error {
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 137, 137, 0.18);
+  border-radius: 10px;
+  color: #ffb4b4 !important;
+  background: rgba(255, 91, 91, 0.06);
+}
+
+.job-list {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+}
+
+.job-list article {
+  padding: 13px 14px 12px;
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.job-list article + article {
+  border-top: 1px solid var(--line);
+}
+
+.job-row > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.job-row strong {
+  font-size: 11px;
+}
+
+.job-row div > span {
+  overflow: hidden;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-status {
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.job-list article.failed .job-status {
+  color: #ff9f9f;
+}
+
+.job-list article.completed .job-status {
+  color: var(--accent);
+}
+
+.job-list .progress-track {
+  margin: 11px 0 0;
+}
+
+.empty-job {
+  display: flex;
+  min-height: 72px;
+  align-items: center;
+  gap: 12px;
+  padding: 14px;
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.empty-job > span {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgba(139, 228, 187, 0.18);
+  border-radius: 9px;
+  color: var(--accent);
+  background: rgba(82, 201, 148, 0.06);
+}
+
+.empty-job p {
+  line-height: 1.45;
+}
+
 .status-icon {
   display: grid;
   width: 48px;
@@ -361,6 +577,10 @@ footer {
 
   .status-card__body {
     padding: 26px;
+  }
+
+  .scenario-grid {
+    grid-template-columns: 1fr;
   }
 
   .principles {

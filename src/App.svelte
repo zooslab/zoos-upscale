@@ -1,4 +1,7 @@
 <script lang="ts">
+  import JobLab from './components/JobLab.svelte'
+
+  const showGoal0Lab = import.meta.env.DEV
   const principles = [
     { label: '로컬 처리', detail: '파일을 외부 서버로 보내지 않습니다.' },
     { label: '원본 보호', detail: '결과는 새 파일로만 저장합니다.' },
@@ -38,31 +41,21 @@
         </p>
       </div>
 
-      <div class="status-card" aria-label="현재 개발 상태">
-        <div class="status-card__header">
-          <span class="window-controls" aria-hidden="true">
-            <i></i><i></i><i></i>
-          </span>
-          <span>Goal 0</span>
-        </div>
-        <div class="status-card__body">
-          <div class="status-icon" aria-hidden="true">
-            <span>↗</span>
+      {#if showGoal0Lab}
+        <JobLab />
+      {:else}
+        <div class="status-card" aria-label="현재 개발 상태">
+          <div class="status-card__header">
+            <span class="window-controls" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span>Goal 0</span>
           </div>
-          <div>
+          <div class="status-card__body">
             <span class="status-label">현재 단계</span>
-            <h2>앱 Shell 구성 중</h2>
-            <p>Tauri·Rust·Svelte 기반을 먼저 검증합니다.</p>
-          </div>
-          <div class="progress-track" aria-label="Goal 0 진행 준비 중">
-            <span></span>
-          </div>
-          <div class="next-step">
-            <span>다음 검증</span>
-            <strong>Fake Runner 성공 · 실패 · 취소</strong>
+            <h2>로컬 AI 엔진 준비 중</h2>
+            <p>검증된 이미지 처리 경로를 연결하고 있습니다.</p>
           </div>
         </div>
-      </div>
+      {/if}
     </section>
 
     <section class="principles" aria-label="제품 원칙">

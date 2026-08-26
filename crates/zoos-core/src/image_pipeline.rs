@@ -226,7 +226,7 @@ pub fn render_pipeline_output(
         DynamicImage::ImageRgb8(value) => value,
         _ => return Err(Goal1bImageError::InvalidRunnerOutput),
     };
-    if runner.dimensions() != x4 {
+    if runner.dimensions() != x4 || runner.as_raw().iter().all(|channel| *channel == 0) {
         return Err(Goal1bImageError::InvalidRunnerOutput);
     }
     let target = (
@@ -1248,6 +1248,21 @@ mod tests {
                 &prepared,
                 &runner,
                 &directory.path().join("partial.png"),
+                4,
+                OutputEncoding::Png,
+                MetadataPolicy::Strip,
+                ImagePipelineLimits::default()
+            ),
+            Err(Goal1bImageError::InvalidRunnerOutput)
+        ));
+        RgbImage::new(8, 8)
+            .save_with_format(&runner, ImageFormat::Png)
+            .expect("all-zero RGB runner output must save");
+        assert!(matches!(
+            render_pipeline_output(
+                &prepared,
+                &runner,
+                &directory.path().join("black-partial.png"),
                 4,
                 OutputEncoding::Png,
                 MetadataPolicy::Strip,

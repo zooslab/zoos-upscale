@@ -47,6 +47,14 @@ const LOCK_FILE: &str = ".workspace.lock";
 const STAGING_DIR: &str = "staging";
 const QUARANTINE_DIR: &str = "quarantine";
 const DIAGNOSTIC_SUFFIX: &str = ".diagnostic.json";
+const GPU_RUNTIME_SHA256: &str = "c1c35d92079085de96b9d547fd7e4464bc8a2e9ccf28d7b8c712d72ade91b7cc";
+const PHOTO_PARAM_SHA256: &str = "35330ececcea33b6c397a72548e788d5d53becee4734c50b7fada36e89f10a86";
+const PHOTO_BIN_SHA256: &str = "713ee713b0353afaa27976f0563a64a5043bd70b9bd8936c2e26e25ebcdbcddf";
+const ANIME_PARAM_SHA256: &str = "2b8fb6e0ae4d2d85704ca08c119a2f5ea40add4f2ecd512eb7f4cd44b6127ed4";
+const ANIME_BIN_SHA256: &str = "fe01c269cfd10cdef8e018ab66ebe750cf79c7af4d1f9c16c737e1295229bacc";
+const ORT_RUNTIME_SHA256: &str = "68f6e54e695583adc371aef610ec4abb1ffaa3df656582922de7690f7e2000eb";
+const PHOTO_ONNX_SHA256: &str = "95c08dbcaa58b4fabae771e74ae458d93df59b86cdcb885b85ade5be4e7f826b";
+const ANIME_ONNX_SHA256: &str = "8244ce14b66d7f285f5ed4980ce53d098c9aa7c5533d8782a5deeb7217035eb1";
 
 #[derive(Deserialize)]
 struct RunnerRequestVersion {
@@ -731,12 +739,69 @@ impl WorkspaceStore {
         let path = self.job_dir(job_id)?.join(MANIFEST_FILE);
         let mut manifest: JobManifest = read_json(&path)?;
         manifest.actual_backend = Some(verification.actual_backend);
+        manifest.model_param_sha256 = None;
+        manifest.model_bin_sha256 = None;
+        manifest.model_onnx_sha256 = None;
+        let settings = self
+            .load_summary(job_id)?
+            .image_settings
+            .ok_or(WorkspaceError::UnsafeRunnerRequest)?;
+        match (verification.actual_backend, settings.preset) {
+            (ImageBackend::VulkanGpu, ImagePreset::Photo) => {
+                manifest.runtime_sha256 = Some(GPU_RUNTIME_SHA256.into());
+                manifest.model_param_sha256 = Some(PHOTO_PARAM_SHA256.into());
+                manifest.model_bin_sha256 = Some(PHOTO_BIN_SHA256.into());
+            }
+            (ImageBackend::VulkanGpu, ImagePreset::Anime) => {
+                manifest.runtime_sha256 = Some(GPU_RUNTIME_SHA256.into());
+                manifest.model_param_sha256 = Some(ANIME_PARAM_SHA256.into());
+                manifest.model_bin_sha256 = Some(ANIME_BIN_SHA256.into());
+            }
+            (ImageBackend::OrtCpu, ImagePreset::Photo) => {
+                manifest.runtime_sha256 = Some(ORT_RUNTIME_SHA256.into());
+                manifest.model_onnx_sha256 = Some(PHOTO_ONNX_SHA256.into());
+            }
+            (ImageBackend::OrtCpu, ImagePreset::Anime) => {
+                manifest.runtime_sha256 = Some(ORT_RUNTIME_SHA256.into());
+                manifest.model_onnx_sha256 = Some(ANIME_ONNX_SHA256.into());
+            }
+            (ImageBackend::Auto, _) => return Err(WorkspaceError::InvalidSelectedBackend),
+        }
         manifest.source_sha256 = Some(verification.source_sha256_after.clone());
         manifest.intermediate_sha256 = Some(verification.intermediate_sha256.clone());
         manifest.final_sha256 = Some(verification.output_sha256.clone());
         manifest.icc_preserved = Some(verification.icc_preserved);
         manifest.exif_preserved = Some(verification.exif_preserved);
         manifest.alpha_preserved = Some(verification.alpha_preserved);
+        write_json_atomic(&path, &manifest)
+    }
+
+    pub(crate) fn record_runner_device(
+        &self,
+        job_id: &str,
+        warning_code: &str,
+        message: &str,
+    ) -> Result<(), WorkspaceError> {
+        let path = self.job_dir(job_id)?.join(MANIFEST_FILE);
+        let mut manifest: JobManifest = read_json(&path)?;
+        let valid = matches!(
+            (manifest.runner_id.as_str(), warning_code),
+            ("zoos-runner-realesrgan", "GPU_DEVICE") | ("zoos-runner-ort", "CPU_DEVICE")
+        );
+        if !valid {
+            return Ok(());
+        }
+        let device = message
+            .split_once(" | ")
+            .map_or(message, |(device, _)| device)
+            .trim()
+            .chars()
+            .take(256)
+            .collect::<String>();
+        if device.is_empty() {
+            return Err(WorkspaceError::UnsafeRunnerRequest);
+        }
+        manifest.actual_device = Some(device);
         write_json_atomic(&path, &manifest)
     }
 
@@ -754,14 +819,21 @@ impl WorkspaceStore {
             }
             StoredRunnerRequest::ImageUpscaleV2(request) => {
                 let pipeline: ImagePipelinePlan = read_json(&job_dir.join(IMAGE_PIPELINE_FILE))?;
+                let destination_partial_was_present =
+                    match fs::symlink_metadata(&pipeline.destination_partial) {
+                        Ok(_) => true,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                        Err(error) => return Err(error.into()),
+                    };
                 remove_if_exists(&request.output.path)?;
                 remove_if_exists(&pipeline.destination_partial)?;
                 remove_if_exists(&pipeline.inference_png)?;
                 if let Some(alpha) = pipeline.alpha_png.as_ref() {
                     remove_if_exists(alpha)?;
                 }
-                if let Ok(verification) =
-                    read_json::<ImagePipelineVerification>(&job_dir.join(VERIFICATION_FILE))
+                if !destination_partial_was_present
+                    && let Ok(verification) =
+                        read_json::<ImagePipelineVerification>(&job_dir.join(VERIFICATION_FILE))
                     && verification.job_id == job_id
                     && verification.output_path == pipeline.destination_final
                     && crate::image_safety::sha256_file(&pipeline.destination_final)
@@ -860,19 +932,6 @@ impl WorkspaceStore {
                     remove_if_exists(&pipeline.destination_partial)?;
                     return Err(ImageSafetyError::InputChanged.into());
                 }
-                if let Err(error) = crate::image_safety::no_replace_rename(
-                    &pipeline.destination_partial,
-                    &pipeline.destination_final,
-                ) {
-                    let _ = remove_if_exists(&pipeline.destination_partial);
-                    return Err(error.into());
-                }
-                if let Err(error) =
-                    crate::image_safety::sync_parent_directory(&pipeline.destination_final)
-                {
-                    rollback_pipeline_final(&pipeline.destination_final, &rendered.sha256);
-                    return Err(error.into());
-                }
                 let verification = pipeline_verification(
                     &pipeline,
                     &request,
@@ -883,8 +942,23 @@ impl WorkspaceStore {
                 if let Err(error) =
                     write_json_atomic(&job_dir.join(VERIFICATION_FILE), &verification)
                 {
-                    rollback_pipeline_final(&pipeline.destination_final, &rendered.sha256);
+                    let _ = remove_if_exists(&pipeline.destination_partial);
                     return Err(error);
+                }
+                if let Err(error) = crate::image_safety::no_replace_rename(
+                    &pipeline.destination_partial,
+                    &pipeline.destination_final,
+                ) {
+                    let _ = remove_if_exists(&pipeline.destination_partial);
+                    let _ = remove_if_exists(&job_dir.join(VERIFICATION_FILE));
+                    return Err(error.into());
+                }
+                if let Err(error) =
+                    crate::image_safety::sync_parent_directory(&pipeline.destination_final)
+                {
+                    rollback_pipeline_final(&pipeline.destination_final, &rendered.sha256);
+                    let _ = remove_if_exists(&job_dir.join(VERIFICATION_FILE));
+                    return Err(error.into());
                 }
                 if let Err(error) = self.record_pipeline_verification(job_id, &verification) {
                     rollback_pipeline_final(&pipeline.destination_final, &rendered.sha256);
@@ -2352,6 +2426,13 @@ mod tests {
                     .runner_id,
                 "zoos-runner-ort"
             );
+            store
+                .record_runner_device(
+                    &created.job_id,
+                    "CPU_DEVICE",
+                    "cpu:0 Apple M5 | ONNX Runtime 1.29.0",
+                )
+                .expect("CPU device evidence must record");
 
             store
                 .publish_image_output(&created.job_id)
@@ -2387,6 +2468,14 @@ mod tests {
                 manifest.intermediate_sha256,
                 Some(verification.intermediate_sha256)
             );
+            assert_eq!(manifest.actual_device.as_deref(), Some("cpu:0 Apple M5"));
+            assert_eq!(manifest.runtime_sha256.as_deref(), Some(ORT_RUNTIME_SHA256));
+            assert_eq!(
+                manifest.model_onnx_sha256.as_deref(),
+                Some(PHOTO_ONNX_SHA256)
+            );
+            assert_eq!(manifest.model_param_sha256, None);
+            assert_eq!(manifest.model_bin_sha256, None);
         }
     }
 
@@ -2499,12 +2588,25 @@ mod tests {
         let request = write_native_x4(&store, &created.job_id);
         assert!(request.input.path.with_file_name("alpha.png").is_file());
         store
+            .record_runner_device(&created.job_id, "GPU_DEVICE", "gpu:0 Apple M5")
+            .expect("GPU device evidence must record");
+        store
             .publish_image_output(&created.job_id)
             .expect("alpha output must publish");
         assert!(matches!(
             image::open(created.output_path.unwrap()).expect("output must decode"),
             image::DynamicImage::ImageRgba8(_)
         ));
+        let manifest: JobManifest =
+            read_json(&workspace.path().join(&created.job_id).join(MANIFEST_FILE)).unwrap();
+        assert_eq!(manifest.actual_device.as_deref(), Some("gpu:0 Apple M5"));
+        assert_eq!(manifest.runtime_sha256.as_deref(), Some(GPU_RUNTIME_SHA256));
+        assert_eq!(
+            manifest.model_param_sha256.as_deref(),
+            Some(PHOTO_PARAM_SHA256)
+        );
+        assert_eq!(manifest.model_bin_sha256.as_deref(), Some(PHOTO_BIN_SHA256));
+        assert_eq!(manifest.model_onnx_sha256, None);
     }
 
     #[test]
@@ -2567,6 +2669,84 @@ mod tests {
         assert!(!pipeline.destination_partial.exists());
         assert!(!changed.output_path.unwrap().exists());
         assert!(request.output.path.exists());
+    }
+
+    #[test]
+    fn goal1b_recovery_distinguishes_prepublish_intent_from_completed_rename() {
+        let workspace = tempfile::tempdir().expect("workspace must be created");
+        let sources = tempfile::tempdir().expect("sources must be created");
+        let input = sources.path().join("input.png");
+        rgb_png(&input, 2, 2, [1, 2, 3]);
+        let store = WorkspaceStore::new(workspace.path()).expect("store must open");
+
+        let before_rename = store
+            .create_image_job_v2(
+                &input,
+                goal1b_settings(ProductOutputFormat::Png),
+                ImageBackend::OrtCpu,
+                None,
+            )
+            .unwrap();
+        let pipeline: ImagePipelinePlan = read_json(
+            &workspace
+                .path()
+                .join(&before_rename.job_id)
+                .join(IMAGE_PIPELINE_FILE),
+        )
+        .unwrap();
+        rgb_png(&pipeline.destination_partial, 4, 4, [8, 7, 6]);
+        fs::copy(&pipeline.destination_partial, &pipeline.destination_final)
+            .expect("identical raced final must copy");
+        let output_sha256 = crate::image_safety::sha256_file(&pipeline.destination_final).unwrap();
+        write_json_atomic(
+            &workspace
+                .path()
+                .join(&before_rename.job_id)
+                .join(VERIFICATION_FILE),
+            &ImagePipelineVerification {
+                schema_version: 2,
+                job_id: before_rename.job_id.clone(),
+                actual_backend: ImageBackend::OrtCpu,
+                source_path: input.clone(),
+                source_sha256_before: pipeline.source_sha256.clone(),
+                source_sha256_after: pipeline.source_sha256.clone(),
+                inference_sha256: "0".repeat(64),
+                intermediate_sha256: "1".repeat(64),
+                output_path: pipeline.destination_final.clone(),
+                output_sha256,
+                output_format: ProductOutputFormat::Png,
+                output_width: 4,
+                output_height: 4,
+                alpha_preserved: false,
+                icc_preserved: false,
+                exif_preserved: false,
+            },
+        )
+        .unwrap();
+        store
+            .cleanup_unverified_output(&before_rename.job_id)
+            .expect("pre-rename cleanup must succeed");
+        assert!(pipeline.destination_final.exists());
+        assert!(!pipeline.destination_partial.exists());
+
+        let after_rename = store
+            .create_image_job_v2(
+                &input,
+                goal1b_settings(ProductOutputFormat::Png),
+                ImageBackend::OrtCpu,
+                None,
+            )
+            .unwrap();
+        write_native_x4(&store, &after_rename.job_id);
+        store
+            .publish_image_output(&after_rename.job_id)
+            .expect("second output must publish");
+        let published = after_rename.output_path.unwrap();
+        assert!(published.exists());
+        store
+            .cleanup_unverified_output(&after_rename.job_id)
+            .expect("post-rename cleanup must roll back owned final");
+        assert!(!published.exists());
     }
 
     #[test]

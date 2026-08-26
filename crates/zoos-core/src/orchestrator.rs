@@ -327,6 +327,11 @@ impl JobOrchestrator {
     async fn apply_event(&self, job_id: &str, event: &RunnerEvent) -> Result<(), WorkspaceError> {
         let _progress_guard = self.inner.progress_updates.lock().await;
         self.inner.store.append_event(job_id, event)?;
+        if let RunnerEventPayload::Warning { code, message } = &event.payload {
+            self.inner
+                .store
+                .record_runner_device(job_id, code, message)?;
+        }
         self.inner
             .store
             .update_summary(job_id, |summary| match &event.payload {
@@ -561,6 +566,10 @@ fn image_backend_error_code(error: &BackendError) -> &str {
                 error_code.as_str(),
                 "ENGINE_NOT_INSTALLED"
                     | "ASSET_HASH_MISMATCH"
+                    | "INPUT_CHANGED"
+                    | "UNSUPPORTED_IMAGE_MODE"
+                    | "OUTPUT_TOO_LARGE"
+                    | "INSUFFICIENT_DISK"
                     | "OUTPUT_EXISTS"
                     | "GPU_UNAVAILABLE"
                     | "UPSTREAM_FAILED"
@@ -780,6 +789,14 @@ mod tests {
                 exit_code: Some(30),
             }),
             "GPU_UNAVAILABLE"
+        );
+        assert_eq!(
+            image_backend_error_code(&BackendError::RunnerFailed {
+                error_code: "INPUT_CHANGED".into(),
+                message: "source changed".into(),
+                exit_code: Some(10),
+            }),
+            "INPUT_CHANGED"
         );
     }
 

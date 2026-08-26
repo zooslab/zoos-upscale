@@ -199,14 +199,6 @@ pub fn publish_verified_output(
     let output_hash = verify_partial_output(plan)?;
     // Keep this check immediately adjacent to publication; decoding a large output can take time.
     let input_after = recheck_input(&plan.input)?;
-    no_replace_rename(&plan.partial_path, &plan.final_path)?;
-    if let Err(error) = sync_parent_directory(&plan.final_path) {
-        if sha256_file(&plan.final_path).ok().as_deref() == Some(output_hash.as_str()) {
-            let _ = fs::remove_file(&plan.final_path);
-        }
-        return Err(error);
-    }
-
     let verification = ImageVerification {
         schema_version: 1,
         job_id: plan.job_id.clone(),
@@ -219,11 +211,18 @@ pub fn publish_verified_output(
         output_width: plan.output_width,
         output_height: plan.output_height,
     };
-    if let Err(error) = write_json_atomic(verification_path, &verification) {
-        // We created this name and still have its exact content hash, so rollback is safe.
+    // Persist the exact hash before the atomic rename. On crash recovery, the presence of the
+    // partial distinguishes "intent recorded" from "rename completed", allowing safe rollback.
+    write_json_atomic(verification_path, &verification)?;
+    if let Err(error) = no_replace_rename(&plan.partial_path, &plan.final_path) {
+        let _ = remove_file_if_present(verification_path);
+        return Err(error);
+    }
+    if let Err(error) = sync_parent_directory(&plan.final_path) {
         if sha256_file(&plan.final_path).ok().as_deref() == Some(output_hash.as_str()) {
             let _ = fs::remove_file(&plan.final_path);
         }
+        let _ = remove_file_if_present(verification_path);
         return Err(error);
     }
     Ok(verification)
@@ -233,21 +232,27 @@ pub fn cleanup_owned_output(
     plan: &ImageOutputPlan,
     verification_path: &Path,
 ) -> Result<(), ImageSafetyError> {
+    let partial_was_present = match fs::symlink_metadata(&plan.partial_path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
     remove_file_if_present(&plan.partial_path)?;
     let verification = match File::open(verification_path) {
         Ok(file) => serde_json::from_reader::<_, ImageVerification>(BufReader::new(file)).ok(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    if let Some(verification) = verification
+    if !partial_was_present
+        && let Some(verification) = verification
         && verification.job_id == plan.job_id
         && verification.output_path == plan.final_path
         && sha256_file(&plan.final_path).ok().as_deref()
             == Some(verification.output_sha256.as_str())
     {
         remove_file_if_present(&plan.final_path)?;
-        remove_file_if_present(verification_path)?;
     }
+    remove_file_if_present(verification_path)?;
     Ok(())
 }
 
@@ -821,7 +826,34 @@ mod tests {
             b"pre-existing"
         );
 
+        // A crash after recording publish intent but before rename leaves the partial in place.
+        // Even an independently-created final with identical bytes must not be deleted.
         fs::remove_file(&plan.final_path).expect("existing output must remove for fixture");
+        rgb_png(&plan.partial_path, 4, 4, [4, 5, 6]);
+        fs::copy(&plan.partial_path, &plan.final_path).expect("identical raced final must copy");
+        let input_hash = sha256_file(&input).unwrap();
+        write_json_atomic(
+            &marker,
+            &ImageVerification {
+                schema_version: 1,
+                job_id: plan.job_id.clone(),
+                input_path: input.clone(),
+                input_sha256_before: input_hash.clone(),
+                input_sha256_after: input_hash,
+                output_path: plan.final_path.clone(),
+                output_sha256: sha256_file(&plan.final_path).unwrap(),
+                output_format: "png".into(),
+                output_width: 4,
+                output_height: 4,
+            },
+        )
+        .unwrap();
+        cleanup_owned_output(&plan, &marker).expect("pre-rename cleanup must succeed");
+        assert!(plan.final_path.exists());
+        assert!(!plan.partial_path.exists());
+        assert!(!marker.exists());
+
+        fs::remove_file(&plan.final_path).expect("raced final must remove for owned fixture");
         rgb_png(&plan.partial_path, 4, 4, [4, 5, 6]);
         publish_verified_output(&plan, &marker).expect("owned output must publish");
         cleanup_owned_output(&plan, &marker).expect("owned cleanup must succeed");

@@ -153,7 +153,7 @@ fn capabilities() -> RunnerCapabilities {
         scales: vec![2, 4],
         devices: vec![DeviceCapability {
             index: 0,
-            name: "CPU".into(),
+            name: cpu_device_name(),
             backend: "ort_cpu".into(),
         }],
         test_behaviors: Vec::new(),
@@ -261,7 +261,10 @@ fn run_inference<W: Write>(
     events
         .emit(RunnerEventPayload::Warning {
             code: "CPU_DEVICE".into(),
-            message: format!("cpu ONNX Runtime 1.29.0, {intra_threads} intra-op threads"),
+            message: format!(
+                "cpu:0 {} | ONNX Runtime 1.29.0, {intra_threads} intra-op threads",
+                cpu_device_name()
+            ),
         })
         .map_err(RunnerFailure::io)?;
 
@@ -446,6 +449,50 @@ fn model_for(model: ImageSemanticModelV2) -> (&'static str, &'static str) {
         ImageSemanticModelV2::Photo => PHOTO_MODEL,
         ImageSemanticModelV2::Anime => ANIME_MODEL,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn cpu_device_name() -> String {
+    let key = b"machdep.cpu.brand_string\0";
+    let mut length = 0usize;
+    let first = unsafe {
+        libc::sysctlbyname(
+            key.as_ptr().cast(),
+            std::ptr::null_mut(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if first == 0 && length > 1 && length <= 1024 {
+        let mut value = vec![0u8; length];
+        let second = unsafe {
+            libc::sysctlbyname(
+                key.as_ptr().cast(),
+                value.as_mut_ptr().cast(),
+                &mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if second == 0 {
+            value.truncate(length);
+            while value.last() == Some(&0) {
+                value.pop();
+            }
+            if let Ok(value) = String::from_utf8(value)
+                && !value.trim().is_empty()
+            {
+                return value;
+            }
+        }
+    }
+    "Apple Silicon CPU".into()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cpu_device_name() -> String {
+    format!("{} CPU", std::env::consts::ARCH)
 }
 
 fn verify_assets(assets: &Assets) -> Result<(), String> {

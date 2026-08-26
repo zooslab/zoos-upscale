@@ -20,16 +20,16 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 11.19.0
           run_install: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version-file: .node-version
           cache: pnpm
@@ -62,7 +62,10 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Install uv
-        run: python3 -m pip install uv==0.11.19
+        uses: astral-sh/setup-uv@v10
+        with:
+          version: 0.11.19
+          enable-cache: true
 
       - name: Verify model tools lockfile
         run: uv sync --project tools/model --locked

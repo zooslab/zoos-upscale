@@ -65,23 +65,39 @@ flowchart LR
 
 ## 개발 로드맵
 
+개발은 **Apple Silicon Mac에서 하나의 완성된 경로를 먼저 만든 뒤** 다른 GPU 환경으로 확장합니다.
+
 ```mermaid
-flowchart LR
-    A["1. 제품 설계<br/>완료"] --> B["2. 이미지 업스케일<br/>첫 실행 버전"]
-    B --> C["3. 영상 업스케일<br/>프레임 보간"]
-    C --> D["4. 안정성 · 미리보기<br/>작업 복구"]
-    D --> E["5. macOS<br/>첫 Beta"]
-    E --> F["Windows · Linux<br/>지원 확대"]
+flowchart TB
+    A["1. 제품 설계<br/>완료"] --> B["2. 구현 언어 · 라이선스<br/>개발 기준 확정"]
+    B --> C["3. Mac 개발 환경<br/>Vulkan · FFmpeg 진단"]
+    C --> D["4. Apple M5 호환성 확인<br/>이미지 1장 실제 처리"]
+    D --> E["5. 앱 골격 · Fake Runner<br/>성공 · 실패 · 취소"]
+    E --> F["6. 이미지 MVP<br/>GPU + CPU"]
+    F --> G["7. 영상 처리<br/>FFmpeg + RIFE"]
+    G --> H["8. Queue · 복구 · Preview<br/>macOS 첫 Beta"]
+
+    H --> I["공통 Backend 기준선<br/>ncnn/Vulkan + ORT CPU"]
+    I --> N["NVIDIA 노트북 검증"]
+    I --> M["AMD 노트북 검증"]
+    N -. 성능 부족이 입증될 때 .-> NV["CUDA · TensorRT 후보"]
+    M -. 성능 부족이 입증될 때 .-> AM["Windows ML · ROCm 후보"]
 ```
 
 - [x] 제품 범위와 기본 사용 흐름 설계
 - [x] 이미지·영상 처리 방식 설계
 - [x] 작업 중단·복구 및 원본 보호 정책 설계
+- [ ] 구현 언어와 프로젝트 라이선스 확정
+- [ ] Mac 개발 환경 및 Apple M5 호환성 검증
 - [ ] 데스크톱 앱 기본 화면
 - [ ] 실제 이미지 업스케일
+- [ ] GPU 실패 시 CPU 처리
 - [ ] 영상 프레임 보간과 업스케일
 - [ ] macOS Apple Silicon Beta
-- [ ] Windows 및 Linux 지원
+- [ ] NVIDIA·AMD 노트북에서 공통 Backend 검증
+- [ ] 필요성이 입증된 하드웨어 전용 최적화
+
+NVIDIA 장치가 있어도 처음부터 CUDA 전용 구현을 만들지 않습니다. 먼저 모든 장치에서 같은 ncnn/Vulkan 경로를 검증하고, 실제 benchmark에서 필요성이 확인된 경우에만 제조사별 Backend를 추가합니다.
 
 ## 지원 예정 플랫폼
 

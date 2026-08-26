@@ -72,12 +72,24 @@ flowchart TB
 
 MVP는 **단일 앱 프로세스와 여러 자식 프로세스**로 구성합니다.
 
+### 구현 언어 상태
+
+현재 승인된 설계 기준선은 **C++20 + Qt 6**입니다. 다만 첫 코드 스캐폴딩 전에 다음 선택지를 짧은 spike로 비교하고 최종 확정합니다.
+
+| 선택지 | 장점 | 비용·주의점 | 모델 호환 방식 |
+|---|---|---|---|
+| C++20 + Qt 6 | 현재 설계와 일치, native 배포, ncnn·ORT 직접 연동 용이 | 개발 속도와 메모리 안전성 부담 | native runner + 별도 Python 모델 도구 |
+| Rust + UI toolkit | 가벼운 native core, 안전한 상태·프로세스 관리 | Qt 대체 UI·패키징 방식을 다시 결정해야 함 | ncnn·FFmpeg sidecar + ORT runner + Python 모델 도구 |
+| Python 3.12 + PySide6 | 가장 빠른 1인 MVP, Qt UI 유지, AI 도구 생태계 활용 | Python runtime 번들, 앱 크기·패키징·서명 부담 | native sidecar 또는 Python ONNX Runtime |
+
+모델 변환·품질 평가에는 어떤 메인 앱 언어를 선택하더라도 `uv`로 고정한 Python 도구 체인을 사용합니다. 따라서 **모델 호환성만을 이유로 메인 앱까지 Python으로 정할 필요는 없습니다.** 메인 앱 언어가 바뀌어도 아래 RunnerProtocol과 자식 process 경계는 유지합니다.
+
 ```mermaid
 flowchart LR
-    APP["Qt App<br/>UI + Orchestrator"] -->|"QProcess · 인자 배열"| WR1["zoos-runner-realesrgan"]
-    APP -->|"QProcess · 인자 배열"| WR2["zoos-runner-rife"]
-    APP -->|"QProcess · 인자 배열"| WR3["zoos-runner-ort"]
-    APP -->|"QProcess · 인자 배열"| FF["ffmpeg / ffprobe"]
+    APP["Desktop App<br/>UI + Orchestrator"] -->|"자식 process · 인자 배열"| WR1["zoos-runner-realesrgan"]
+    APP -->|"자식 process · 인자 배열"| WR2["zoos-runner-rife"]
+    APP -->|"자식 process · 인자 배열"| WR3["zoos-runner-ort"]
+    APP -->|"자식 process · 인자 배열"| FF["ffmpeg / ffprobe"]
 
     WR1 --> ESR["Pinned Real-ESRGAN ncnn binary"]
     WR2 --> RIFE["Pinned RIFE ncnn binary"]
@@ -376,17 +388,40 @@ CI에서 빌드에 성공한 것과 실제 하드웨어에서 안정적으로 �
 ## 14. 구현 순서
 
 ```mermaid
-flowchart LR
-    G0["Goal 0<br/>계약 · 신뢰성 · 라이선스"] --> G1["Goal 1<br/>이미지 GPU · CPU"]
-    G1 --> G2["Goal 2<br/>미디어 · RIFE 보간"]
+flowchart TB
+    D["설계 기준선 v0.3.1"] --> S0["사전 결정<br/>언어 · UI · 라이선스"]
+    S0 --> S1["Mac 환경 구축<br/>CMake · UI · FFmpeg · Vulkan"]
+    S1 --> S2["Apple M5 Feasibility Spike<br/>MoltenVK · Real-ESRGAN · FFmpeg"]
+
+    S2 --> G0["Goal 0<br/>계약 · Fake Runner · 신뢰성"]
+    G0 --> G1A["Goal 1A<br/>이미지 ncnn/Vulkan"]
+    G1A --> G1B["Goal 1B<br/>ORT CPU · Batch · Metadata"]
+    G1B --> G2["Goal 2<br/>FFmpeg Baseline · RIFE"]
     G2 --> G3["Goal 3<br/>영상 SR · 결합 처리"]
     G3 --> G4["Goal 4<br/>Queue · 복구 · Preview"]
-    G4 --> G5["Goal 5<br/>macOS Verified Beta"]
-    G5 --> G6["Goal 6<br/>Benchmark Gate"]
-    G6 -. 효과가 입증된 항목만 .-> G7["Goal 7<br/>플랫폼 최적화 · Streaming"]
+    G4 --> G5M["Goal 5M<br/>macOS Verified Beta"]
+
+    G5M --> BASE["공통 Backend 기준선<br/>ncnn/Vulkan + ORT CPU"]
+    BASE --> NV["NVIDIA 노트북<br/>동일 경로 검증"]
+    BASE --> AMD["AMD 노트북<br/>동일 경로 검증"]
+
+    NV --> G6N["NVIDIA Benchmark Gate"]
+    AMD --> G6A["AMD Benchmark Gate"]
+    G6N -. 효과 입증 시 .-> G7N["TensorRT for RTX<br/>또는 Windows ML"]
+    G6A -. 효과 입증 시 .-> G7A["Windows ML MIGraphX<br/>또는 ROCm"]
 ```
 
 각 Goal은 빌드와 테스트가 통과하고 사용자가 확인할 수 있는 실행 상태를 남겨야 완료됩니다.
+
+| 단계 | 사용하는 장치 | 종료 조건 |
+|---|---|---|
+| 언어·라이선스 결정 | 로컬 Mac | 동일한 Fake Runner 시나리오로 개발 속도와 패키징 경로 비교 |
+| Apple M5 spike | 로컬 Mac | Vulkan 장치 탐지, Real-ESRGAN 이미지 1장, FFmpeg probe 성공 |
+| 이미지 MVP | 로컬 Mac | GPU·CPU 결과와 원본 불변·atomic output 검증 |
+| 영상 MVP | 로컬 Mac | 1분 fixture의 FPS·duration·A/V sync·stream 보존 통과 |
+| macOS Beta | 별도 clean Mac 환경 | 설치·서명·장시간 처리·강제 종료 복구 통과 |
+| NVIDIA·AMD 검증 | 각 GPU 노트북 | 먼저 ncnn/Vulkan 공통 경로와 ORT CPU 결과 비교 |
+| 전용 Backend | 해당 GPU 노트북 | 공통 경로 대비 성능·메모리·안정성 개선과 지속 회귀 테스트 확보 |
 
 ## 15. Upstream 참고 자료
 

@@ -2,9 +2,9 @@
 
 [← 프로젝트 소개로 돌아가기](README.md)
 
-> 이 문서는 Zoos Upscale의 공개 기술 개요입니다. 아직 구현 전이므로 실제 성능 검증과 라이선스 검토 결과에 따라 세부 선택은 달라질 수 있습니다.
+> 이 문서는 Zoos Upscale의 공개 기술 개요입니다. 초기 구현 단계이므로 실제 성능 검증과 라이선스 검토 결과에 따라 세부 선택은 달라질 수 있습니다.
 
-**문서 상태:** 설계 기준선 · **최종 갱신:** 2026-08-26
+**문서 상태:** 설계 기준선 v0.3.2 · **최종 갱신:** 2026-08-26
 
 ## 1. 설계 목표
 
@@ -23,10 +23,11 @@ Zoos Upscale은 이미지 업스케일링, 영상 업스케일링, 프레임 보
 
 ```mermaid
 flowchart TB
-    USER["사용자"] --> UI["Qt 6 데스크톱 UI<br/>기본 화면 · 고급 설정"]
+    USER["사용자"] --> UI["System WebView<br/>Svelte · TypeScript UI"]
 
     subgraph APP["Zoos Upscale 애플리케이션"]
-        UI --> ORCH["Job Orchestrator<br/>Queue · 상태 · 재시도 · 복구"]
+        UI --> CMD["Typed Tauri Commands<br/>최소 권한 경계"]
+        CMD --> ORCH["Rust Job Orchestrator<br/>Queue · 상태 · 재시도 · 복구"]
         ORCH --> EXEC["IExecutionBackend<br/>AI 실행 논리 계약"]
         ORCH --> MEDIA["Media Probe / Selector<br/>미디어 분석 · Codec 선택"]
         ORCH --> STORE["Job Workspace<br/>JSON 권위 원본"]
@@ -46,7 +47,7 @@ flowchart TB
     PARTIAL --> OUTPUT["Atomic Rename<br/>최종 결과 공개"]
 
     subgraph LATER["Benchmark 통과 후 선택적 확장"]
-        NATIVE["C++ In-process Streaming"]
+        NATIVE["Rust / C ABI In-process Streaming"]
         VENDOR["Core ML · TensorRT for RTX<br/>Windows ML"]
         WORKER["UI / Worker 분리 · IPC"]
     end
@@ -61,6 +62,7 @@ flowchart TB
 | 구성요소 | 책임 | 직접 알지 않아야 하는 것 |
 |---|---|---|
 | UI | 파일 선택, 결과 설정, 진행률, 오류·복구 안내 | 개별 실행 파일의 명령행 인자 |
+| Typed Tauri Commands | UI 요청 검증, 최소 기능만 Rust에 전달 | 범용 shell 실행과 sidecar 경로 |
 | Job Orchestrator | 작업 계획, Queue, 상태 전이, Fallback, 재개 | 모델별 네이티브 API 세부사항 |
 | IExecutionBackend | AI 작업의 공통 실행 계약 | process runner의 전송 형식 |
 | ProcessExecutionBackend | runner 실행, 이벤트 수집, 취소와 오류 정규화 | 사용자 화면 구성 |
@@ -74,22 +76,23 @@ MVP는 **단일 앱 프로세스와 여러 자식 프로세스**로 구성합니
 
 ### 구현 언어 상태
 
-현재 승인된 설계 기준선은 **C++20 + Qt 6**입니다. 다만 첫 코드 스캐폴딩 전에 다음 선택지를 짧은 spike로 비교하고 최종 확정합니다.
+승인된 생산 기준선은 **Tauri v2 + Rust Orchestrator + Svelte·TypeScript·Vite UI**입니다. 프로젝트 코드는 Apache-2.0으로 공개하고 앱 식별자는 `com.zooslab.zoosupscale`을 사용합니다.
 
-| 선택지 | 장점 | 비용·주의점 | 모델 호환 방식 |
-|---|---|---|---|
-| C++20 + Qt 6 | 현재 설계와 일치, native 배포, ncnn·ORT 직접 연동 용이 | 개발 속도와 메모리 안전성 부담 | native runner + 별도 Python 모델 도구 |
-| Rust + UI toolkit | 가벼운 native core, 안전한 상태·프로세스 관리 | Qt 대체 UI·패키징 방식을 다시 결정해야 함 | ncnn·FFmpeg sidecar + ORT runner + Python 모델 도구 |
-| Python 3.12 + PySide6 | 가장 빠른 1인 MVP, Qt UI 유지, AI 도구 생태계 활용 | Python runtime 번들, 앱 크기·패키징·서명 부담 | native sidecar 또는 Python ONNX Runtime |
+| 영역 | 관리 도구 | 제품 포함 여부 |
+|---|---|---|
+| Rust core·runner | Cargo + `Cargo.lock` | 포함 |
+| Svelte UI | pnpm + `pnpm-lock.yaml` | 정적 자산으로 포함 |
+| 모델 export·변환·품질 평가 | Python 3.12+ + uv + `uv.lock` | **개발 도구 전용, 제품에 미포함** |
 
-모델 변환·품질 평가에는 어떤 메인 앱 언어를 선택하더라도 `uv`로 고정한 Python 도구 체인을 사용합니다. 따라서 **모델 호환성만을 이유로 메인 앱까지 Python으로 정할 필요는 없습니다.** 메인 앱 언어가 바뀌어도 아래 RunnerProtocol과 자식 process 경계는 유지합니다.
+Svelte frontend에는 범용 shell 권한을 주지 않습니다. UI는 좁은 typed Tauri command만 호출하고, sidecar 경로·인자·실행·취소·출력 검증은 Rust Orchestrator가 전담합니다.
 
 ```mermaid
 flowchart LR
-    APP["Desktop App<br/>UI + Orchestrator"] -->|"자식 process · 인자 배열"| WR1["zoos-runner-realesrgan"]
-    APP -->|"자식 process · 인자 배열"| WR2["zoos-runner-rife"]
-    APP -->|"자식 process · 인자 배열"| WR3["zoos-runner-ort"]
-    APP -->|"자식 process · 인자 배열"| FF["ffmpeg / ffprobe"]
+    UI["Svelte UI"] -->|"typed invoke"| APP["Rust Orchestrator"]
+    APP -->|"절대 경로 · 인자 배열"| WR1["zoos-runner-realesrgan"]
+    APP -->|"절대 경로 · 인자 배열"| WR2["zoos-runner-rife"]
+    APP -->|"절대 경로 · 인자 배열"| WR3["zoos-runner-ort"]
+    APP -->|"절대 경로 · 인자 배열"| FF["ffmpeg / ffprobe"]
 
     WR1 --> ESR["Pinned Real-ESRGAN ncnn binary"]
     WR2 --> RIFE["Pinned RIFE ncnn binary"]
@@ -97,6 +100,7 @@ flowchart LR
 ```
 
 - 실행 파일은 앱이 알고 있는 절대 경로로만 호출합니다.
+- Tauri capability는 window와 typed command 단위로 최소화하며 frontend에 shell 실행 권한을 주지 않습니다.
 - 셸, `system()`, `cmd.exe /c`, PowerShell을 경유하지 않습니다.
 - runner의 stdout은 구조화된 NDJSON 이벤트 전용입니다.
 - 취소 시 자식과 손자 프로세스까지 함께 종료합니다.
@@ -133,7 +137,7 @@ flowchart LR
 
 | 단계 | MVP 선택 | 대체·후속 후보 | 비고 |
 |---|---|---|---|
-| Decode·Encode | Qt 이미지 계층 또는 검증된 codec 라이브러리 | 플랫폼별 이미지 codec | 알파·ICC·EXIF 정책을 앱이 통제 |
+| Decode·Encode | 검증된 Rust/native codec 경로 | 플랫폼별 이미지 codec | 알파·ICC·EXIF 정책을 앱이 통제 |
 | 일반 사진 SR | RealESRGAN x4plus | RealESRGAN x2plus, realesr-general-x4v3 | 직접 2배 모델과 저메모리 모델은 별도 검증 |
 | 애니·일러스트 SR | RealESRGAN x4plus anime | realesr-animevideov3 | 콘텐츠 오분류 시 사용자 변경 가능 |
 | GPU 추론 | ncnn / Vulkan | Core ML, TensorRT for RTX, Windows ML | Benchmark Gate 통과 시에만 추가 |
@@ -224,7 +228,7 @@ AI 모델과 실행 엔진은 분리합니다. 동일한 작업도 장치에 따
 | Windows ML MIGraphX EP | AMD GPU | Windows AMD 경로 | Benchmark 통과 시 |
 | Windows ML OpenVINO EP | Intel GPU | Windows Intel 경로 | Benchmark 통과 시 |
 | 직접 ROCm / MIGraphX | AMD GPU | Linux AMD 경로 | 실제 목표 장치 확보 후 |
-| C++ In-process ncnn | 여러 장치 | process·중간 파일 병목 제거 | 병목이 측정된 경우 |
+| Rust / C ABI In-process ncnn | 여러 장치 | process·중간 파일 병목 제거 | 병목이 측정된 경우 |
 
 ### Backend 선택 과정
 
@@ -359,7 +363,9 @@ models/<model-id>/<version>/
 | ncnn | BSD 3-Clause | [LICENSE](https://github.com/Tencent/ncnn/blob/master/LICENSE.txt) |
 | RIFE ncnn Vulkan | MIT | [LICENSE](https://github.com/nihui/rife-ncnn-vulkan/blob/master/LICENSE) |
 | ONNX Runtime | MIT | [LICENSE](https://github.com/microsoft/onnxruntime/blob/main/LICENSE) |
-| Qt · FFmpeg | 사용 모듈·빌드 옵션에 따라 검토 | Goal 0 배포·라이선스 게이트 |
+| Zoos Upscale | Apache-2.0 | [LICENSE](LICENSE) |
+| Tauri · Svelte · Rust crate | 각 upstream 라이선스 | lockfile·SBOM·`THIRD_PARTY_NOTICES.md`로 관리 |
+| FFmpeg | 빌드 옵션에 따라 별도 검토 | Goal 0 배포·라이선스 게이트 |
 
 이 표는 코드 저장소의 라이선스만 요약합니다. 모델 가중치, 변환 artifact, codec과 전이 의존성의 재배포 조건은 별도로 확인합니다.
 
@@ -389,12 +395,11 @@ CI에서 빌드에 성공한 것과 실제 하드웨어에서 안정적으로 �
 
 ```mermaid
 flowchart TB
-    D["설계 기준선 v0.3.1"] --> S0["사전 결정<br/>언어 · UI · 라이선스"]
-    S0 --> S1["Mac 환경 구축<br/>CMake · UI · FFmpeg · Vulkan"]
+    D["설계 기준선 v0.3.2<br/>Tauri · Rust · Svelte"] --> G0["Goal 0<br/>앱 Shell · 계약 · Fake Runner"]
+    G0 --> S1["Mac 환경 구축<br/>Cargo · pnpm · FFmpeg · Vulkan"]
     S1 --> S2["Apple M5 Feasibility Spike<br/>MoltenVK · Real-ESRGAN · FFmpeg"]
 
-    S2 --> G0["Goal 0<br/>계약 · Fake Runner · 신뢰성"]
-    G0 --> G1A["Goal 1A<br/>이미지 ncnn/Vulkan"]
+    S2 --> G1A["Goal 1A<br/>이미지 ncnn/Vulkan"]
     G1A --> G1B["Goal 1B<br/>ORT CPU · Batch · Metadata"]
     G1B --> G2["Goal 2<br/>FFmpeg Baseline · RIFE"]
     G2 --> G3["Goal 3<br/>영상 SR · 결합 처리"]
@@ -415,7 +420,7 @@ flowchart TB
 
 | 단계 | 사용하는 장치 | 종료 조건 |
 |---|---|---|
-| 언어·라이선스 결정 | 로컬 Mac | 동일한 Fake Runner 시나리오로 개발 속도와 패키징 경로 비교 |
+| Tauri shell·Fake Runner | 로컬 Mac | 정상·실패·취소·비정상 protocol을 UI에서 재현 |
 | Apple M5 spike | 로컬 Mac | Vulkan 장치 탐지, Real-ESRGAN 이미지 1장, FFmpeg probe 성공 |
 | 이미지 MVP | 로컬 Mac | GPU·CPU 결과와 원본 불변·atomic output 검증 |
 | 영상 MVP | 로컬 Mac | 1분 fixture의 FPS·duration·A/V sync·stream 보존 통과 |
@@ -431,6 +436,8 @@ flowchart TB
 - [ncnn](https://github.com/Tencent/ncnn) — CPU·Vulkan GPU 추론 프레임워크
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime) — ONNX 기반 CPU 대체 경로
 - [FFmpeg](https://ffmpeg.org/documentation.html) — 미디어 probe·decode·encode·mux
-- [Qt](https://doc.qt.io/qt-6/) — 데스크톱 UI와 process 실행 계층
+- [Tauri](https://tauri.app/) — 데스크톱 shell·command·capability 경계
+- [Svelte](https://svelte.dev/) — System WebView에 렌더링하는 사용자 UI
+- [Rust](https://www.rust-lang.org/) — 작업 Orchestrator와 native sidecar 구현
 
 > 위 프로젝트의 코드 라이선스와 개별 모델 가중치의 라이선스는 동일하다고 가정하지 않습니다. 실제 배포 전 구성요소별 inventory와 고지 의무를 별도로 검토합니다.

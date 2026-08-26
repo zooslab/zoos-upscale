@@ -2,10 +2,10 @@
 
 > 사진과 영상을 더 선명하고 부드럽게 만드는 로컬 AI 업스케일러
 
-**현재 상태: 설계 완료 · 구현 준비 중**
+**현재 상태: 구현 기준 확정 · 첫 개발 진행 중**
 
 > [!IMPORTANT]
-> 아직 다운로드하거나 실행할 수 있는 버전은 없습니다. 현재는 제품 설계를 마치고 첫 번째 구현을 준비하는 단계입니다.
+> 아직 다운로드할 수 있는 배포본은 없습니다. 현재는 제품 설계를 마치고 첫 구현을 진행하는 단계입니다.
 
 ## 어떤 프로그램인가요?
 
@@ -28,6 +28,20 @@ Zoos Upscale은 사진과 영상을 내 컴퓨터에서 직접 개선하는 데�
 - 작업 중단·복구와 안전한 출력 방식
 - AI 모델 및 하드웨어 백엔드 후보군
 - 후보 기술을 실제 지원으로 승격하는 검증 기준
+
+## 어떻게 만들어지나요?
+
+화면과 AI 엔진을 분리해, 화면이 멈추거나 엔진 하나가 실패해도 앱 전체가 함께 망가지지 않도록 만듭니다.
+
+```mermaid
+flowchart LR
+    UI["가볍고 단순한 화면<br/>Tauri · Svelte"] --> CMD["허용된 요청만 전달"]
+    CMD --> CORE["Rust 작업 관리자<br/>진행 · 취소 · 복구"]
+    CORE --> ENGINE["검증된 로컬 엔진<br/>FFmpeg · ncnn · ONNX Runtime"]
+    TOOLS["Python · uv<br/>모델 준비 도구"] -. 개발할 때만 사용 .-> ENGINE
+```
+
+사용자에게 배포하는 앱에는 Python을 포함하지 않습니다. AI 모델을 준비하고 품질을 검사하는 개발 도구에서만 Python과 `uv`를 사용합니다.
 
 ## 사용 흐름
 
@@ -69,15 +83,14 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    A["1. 제품 설계<br/>완료"] --> B["2. 구현 언어 · 라이선스<br/>개발 기준 확정"]
-    B --> C["3. Mac 개발 환경<br/>Vulkan · FFmpeg 진단"]
-    C --> D["4. Apple M5 호환성 확인<br/>이미지 1장 실제 처리"]
-    D --> E["5. 앱 골격 · Fake Runner<br/>성공 · 실패 · 취소"]
-    E --> F["6. 이미지 MVP<br/>GPU + CPU"]
-    F --> G["7. 영상 처리<br/>FFmpeg + RIFE"]
-    G --> H["8. Queue · 복구 · Preview<br/>macOS 첫 Beta"]
+    A["1. 제품 설계<br/>완료"] --> B["2. Tauri · Rust · Svelte<br/>Apache-2.0 확정"]
+    B --> C["3. Apple M5 엔진 확인<br/>Real-ESRGAN · RIFE 완료"]
+    C --> D["4. Tauri 앱 · Fake Runner<br/>성공 · 실패 · 취소"]
+    D --> E["5. 이미지 MVP<br/>GPU + CPU"]
+    E --> F["6. 영상 처리<br/>FFmpeg + RIFE"]
+    F --> G["7. Queue · 복구 · Preview<br/>macOS 첫 Beta"]
 
-    H --> I["공통 Backend 기준선<br/>ncnn/Vulkan + ORT CPU"]
+    G --> I["공통 Backend 기준선<br/>ncnn/Vulkan + ORT CPU"]
     I --> N["NVIDIA 노트북 검증"]
     I --> M["AMD 노트북 검증"]
     N -. 성능 부족이 입증될 때 .-> NV["CUDA · TensorRT 후보"]
@@ -87,8 +100,9 @@ flowchart TB
 - [x] 제품 범위와 기본 사용 흐름 설계
 - [x] 이미지·영상 처리 방식 설계
 - [x] 작업 중단·복구 및 원본 보호 정책 설계
-- [ ] 구현 언어와 프로젝트 라이선스 확정
-- [ ] Mac 개발 환경 및 Apple M5 호환성 검증
+- [x] Tauri·Rust·Svelte 생산 스택과 Apache-2.0 라이선스 확정
+- [x] Apple M5에서 Real-ESRGAN·RIFE native 엔진 1차 검증
+- [ ] FFmpeg를 포함한 Mac 개발 환경 완성
 - [ ] 데스크톱 앱 기본 화면
 - [ ] 실제 이미지 업스케일
 - [ ] GPU 실패 시 CPU 처리
@@ -123,4 +137,4 @@ NVIDIA 장치가 있어도 처음부터 CUDA 전용 구현을 만들지 않습�
 
 ## 라이선스
 
-프로젝트와 배포 구성요소의 라이선스는 첫 구현 단계에서 확정할 예정입니다.
+Zoos Upscale의 자체 소스 코드는 [Apache License 2.0](LICENSE)으로 공개합니다. 함께 배포되는 FFmpeg, AI 실행기와 모델 가중치는 각각의 별도 라이선스와 고지 조건을 따릅니다.

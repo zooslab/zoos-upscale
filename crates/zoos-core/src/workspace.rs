@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -422,6 +423,7 @@ impl WorkspaceStore {
                 return Err(Goal1bImageError::AlphaJpegUnsupported.into());
             }
 
+            let reserved_outputs = self.active_output_reservations()?;
             let (final_path, destination_partial) = plan_pipeline_destination(
                 input_path,
                 settings.scale,
@@ -429,6 +431,7 @@ impl WorkspaceStore {
                 &job_id,
                 staged.width,
                 staged.height,
+                &reserved_outputs,
             )?;
             let input_name = input_path
                 .file_name()
@@ -638,6 +641,15 @@ impl WorkspaceStore {
         }
         jobs.sort_by_key(|job| std::cmp::Reverse(job.created_at_ms));
         Ok(jobs)
+    }
+
+    fn active_output_reservations(&self) -> Result<HashSet<PathBuf>, WorkspaceError> {
+        Ok(self
+            .list_jobs()?
+            .into_iter()
+            .filter(|job| !job.status.is_terminal())
+            .filter_map(|job| job.output_path)
+            .collect())
     }
 
     pub fn load_summary(&self, job_id: &str) -> Result<JobSummary, WorkspaceError> {
@@ -1166,6 +1178,7 @@ fn plan_pipeline_destination(
     job_id: &str,
     width: u32,
     height: u32,
+    reserved_outputs: &HashSet<PathBuf>,
 ) -> Result<(PathBuf, PathBuf), WorkspaceError> {
     let parent = input.parent().ok_or(ImageSafetyError::InvalidInputPath)?;
     let destination_dir = parent.join("Upscaled");
@@ -1206,7 +1219,7 @@ fn plan_pipeline_destination(
             format!("{base}_{suffix}.{extension}")
         };
         let candidate = destination_dir.join(name);
-        if !candidate.exists() {
+        if !candidate.exists() && !reserved_outputs.contains(&candidate) {
             final_path = Some(candidate);
             break;
         }
@@ -1470,6 +1483,32 @@ fn is_safe_image_request_v2(
             final_name == format!("{base}.{extension}")
                 || (2..=999).any(|suffix| final_name == format!("{base}_{suffix}.{extension}"))
         });
+    let model_matches = matches!(
+        (settings.preset, request.parameters.semantic_model),
+        (ImagePreset::Photo, ImageSemanticModelV2::Photo)
+            | (ImagePreset::Anime, ImageSemanticModelV2::Anime)
+    );
+    let backend_matches = match (
+        pipeline.selected_backend,
+        &request.parameters.device,
+        &request.parameters.backend_settings,
+    ) {
+        (
+            ImageBackend::VulkanGpu,
+            ImageDeviceV2::Vulkan { index: 0 },
+            ImageBackendSettingsV2::Vulkan { tile_size, threads },
+        ) => *tile_size == 256 && threads == "1:2:2",
+        (
+            ImageBackend::OrtCpu,
+            ImageDeviceV2::Cpu,
+            ImageBackendSettingsV2::OrtCpu {
+                tile_size,
+                intra_threads,
+                inter_threads,
+            },
+        ) => *tile_size == 128 && *intra_threads == 4 && *inter_threads == 1,
+        _ => false,
+    };
     pipeline.schema_version == 1
         && pipeline.job_id == summary.job_id
         && pipeline.destination_final == final_path
@@ -1488,6 +1527,11 @@ fn is_safe_image_request_v2(
                 .is_some_and(|source_parent| final_parent == source_parent.join("Upscaled"))
         })
         && pipeline.scale == settings.scale
+        && request.parameters.requested_scale == settings.scale
+        && model_matches
+        && backend_matches
+        && (matches!(settings.backend, ImageBackend::Auto)
+            || settings.backend == pipeline.selected_backend)
         && pipeline.output_format == settings.output_format
         && pipeline.metadata_policy == settings.metadata
         && Some(pipeline.selected_backend) == summary.selected_backend
@@ -2367,13 +2411,59 @@ mod tests {
         let output_dir = sources.path().join("Upscaled");
         fs::create_dir(&output_dir).unwrap();
         fs::write(output_dir.join("photo_upscaled_2x.jpg"), b"existing").unwrap();
-        let (final_path, partial_path) =
-            plan_pipeline_destination(&input, 2, ProductOutputFormat::Jpeg, "job-id", 2, 2)
-                .expect("second JPEG name must plan");
+        let (final_path, partial_path) = plan_pipeline_destination(
+            &input,
+            2,
+            ProductOutputFormat::Jpeg,
+            "job-id",
+            2,
+            2,
+            &HashSet::new(),
+        )
+        .expect("second JPEG name must plan");
         assert_eq!(final_path.file_name().unwrap(), "photo_upscaled_2x_2.jpg");
         assert_eq!(
             partial_path.file_name().unwrap(),
             ".photo_upscaled_2x_2.jpg.zoos-job-id.partial.jpg"
+        );
+    }
+
+    #[test]
+    fn goal1b_pending_jobs_reserve_same_stem_output_names() {
+        let workspace = tempfile::tempdir().expect("workspace must be created");
+        let sources = tempfile::tempdir().expect("sources must be created");
+        let png = sources.path().join("photo.png");
+        let jpeg = sources.path().join("photo.jpg");
+        rgb_png(&png, 2, 2, [1, 2, 3]);
+        RgbImage::from_pixel(2, 2, Rgb([4, 5, 6]))
+            .save_with_format(&jpeg, ImageFormat::Jpeg)
+            .expect("JPEG fixture must save");
+        let store = WorkspaceStore::new(workspace.path()).expect("store must open");
+
+        let first = store
+            .create_image_job_v2(
+                &png,
+                goal1b_settings(ProductOutputFormat::Png),
+                ImageBackend::OrtCpu,
+                None,
+            )
+            .expect("first output must plan");
+        let second = store
+            .create_image_job_v2(
+                &jpeg,
+                goal1b_settings(ProductOutputFormat::Png),
+                ImageBackend::OrtCpu,
+                None,
+            )
+            .expect("second output must plan around the pending reservation");
+
+        assert_eq!(
+            first.output_path.unwrap().file_name().unwrap(),
+            "photo_upscaled_2x.png"
+        );
+        assert_eq!(
+            second.output_path.unwrap().file_name().unwrap(),
+            "photo_upscaled_2x_2.png"
         );
     }
 
@@ -2570,6 +2660,62 @@ mod tests {
         let reopened = WorkspaceStore::new(workspace.path()).expect("startup must continue");
         assert!(reopened.list_jobs().unwrap().is_empty());
         assert_eq!(fs::read(external).unwrap(), expected);
+    }
+
+    #[test]
+    fn goal1b_runner_request_must_match_product_settings_and_selected_backend() {
+        let workspace = tempfile::tempdir().expect("workspace must be created");
+        let sources = tempfile::tempdir().expect("sources must be created");
+        let input = sources.path().join("input.png");
+        rgb_png(&input, 2, 2, [1, 2, 3]);
+        let store = WorkspaceStore::new(workspace.path()).expect("store must open");
+        let created = store
+            .create_image_job_v2(
+                &input,
+                goal1b_settings(ProductOutputFormat::Png),
+                ImageBackend::OrtCpu,
+                None,
+            )
+            .expect("job must create");
+        let job_dir = store
+            .job_dir(&created.job_id)
+            .expect("job directory must resolve safely");
+        let StoredRunnerRequest::ImageUpscaleV2(request) = store
+            .load_stored_job(&created.job_id)
+            .expect("original request must load")
+            .runner_request
+        else {
+            panic!("expected v2 request")
+        };
+        assert!(is_safe_image_request_v2(&job_dir, &created, &request));
+
+        let mut wrong_model = request.clone();
+        wrong_model.parameters.semantic_model = ImageSemanticModelV2::Anime;
+        assert!(!is_safe_image_request_v2(&job_dir, &created, &wrong_model));
+
+        let mut wrong_scale = request.clone();
+        wrong_scale.parameters.requested_scale = 4;
+        assert!(!is_safe_image_request_v2(&job_dir, &created, &wrong_scale));
+
+        let mut wrong_device = request.clone();
+        wrong_device.parameters.device = ImageDeviceV2::Vulkan { index: 0 };
+        wrong_device.parameters.backend_settings = ImageBackendSettingsV2::Vulkan {
+            tile_size: 256,
+            threads: "1:2:2".into(),
+        };
+        assert!(!is_safe_image_request_v2(&job_dir, &created, &wrong_device));
+
+        let mut wrong_cpu_settings = request;
+        wrong_cpu_settings.parameters.backend_settings = ImageBackendSettingsV2::OrtCpu {
+            tile_size: 64,
+            intra_threads: 4,
+            inter_threads: 1,
+        };
+        assert!(!is_safe_image_request_v2(
+            &job_dir,
+            &created,
+            &wrong_cpu_settings
+        ));
     }
 
     #[cfg(unix)]

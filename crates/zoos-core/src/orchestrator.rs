@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -29,6 +29,7 @@ struct Inner {
     store: WorkspaceStore,
     backend: Arc<dyn ExecutionBackend>,
     runners: RunnerRegistry,
+    job_creation: StdMutex<()>,
     active_jobs: Mutex<HashMap<String, watch::Sender<bool>>>,
     progress_updates: Mutex<()>,
 }
@@ -61,6 +62,7 @@ impl JobOrchestrator {
                 store,
                 backend: Arc::new(backend),
                 runners,
+                job_creation: StdMutex::new(()),
                 active_jobs: Mutex::new(HashMap::new()),
                 progress_updates: Mutex::new(()),
             }),
@@ -96,6 +98,14 @@ impl JobOrchestrator {
         selected_backend: ImageBackend,
         batch: Option<ImageBatchMetadata>,
     ) -> Result<JobSummary, OrchestratorError> {
+        // Planning a no-replace destination and publishing the workspace must be one
+        // process-local critical section so concurrent picker commands cannot reserve
+        // the same filename.
+        let _creation_guard = self
+            .inner
+            .job_creation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(self.inner.store.create_image_job_v2(
             input_path.as_ref(),
             settings,
@@ -184,6 +194,7 @@ impl JobOrchestrator {
                 actual: current.status,
             });
         }
+        self.inner.store.cleanup_unverified_output(job_id)?;
         let cancelled = self.inner.store.update_summary(job_id, |summary| {
             summary.status = JobStatus::Cancelled;
             summary.progress_percent = 0;
@@ -875,6 +886,13 @@ mod tests {
         assert_eq!(manifest.result.as_deref(), Some("cancelled_before_start"));
         assert_eq!(manifest.started_at_ms, None);
         assert!(manifest.finished_at_ms.is_some());
+        assert_eq!(
+            std::fs::read_dir(directory.path().join(&created.job_id).join("work"))
+                .expect("cancelled work directory must remain readable")
+                .count(),
+            0,
+            "cancelling a pending batch member must remove normalized image data"
+        );
         assert!(matches!(
             orchestrator.cancel_created_job(&created.job_id),
             Err(OrchestratorError::InvalidState { .. })

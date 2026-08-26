@@ -10,15 +10,23 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 use zoos_runner_protocol::{
-    FakeBehavior, FakeJobRequest, FakeParameters, FakeTask, ImageModelId, ImageOutputFormat,
-    ImagePreset as ProtocolImagePreset, ImageRunnerInput, ImageRunnerOutput, ImageTask,
-    ImageUpscaleJobRequest, ImageUpscaleJobRequestV2, ImageUpscaleParameters, RunnerEvent,
-    RunnerInput, RunnerOutput,
+    FakeBehavior, FakeJobRequest, FakeParameters, FakeTask, IMAGE_PROTOCOL_VERSION_V2,
+    ImageBackendSettingsV2, ImageDeviceV2, ImageInferenceFormatV2, ImageInferenceInputV2,
+    ImageIntermediateOutputV2, ImageModelId, ImageOutputFormat, ImagePixelFormatV2,
+    ImagePreset as ProtocolImagePreset, ImageRunnerInput, ImageRunnerOutput, ImageSemanticModelV2,
+    ImageTask, ImageUpscaleJobRequest, ImageUpscaleJobRequestV2, ImageUpscaleParameters,
+    ImageUpscaleParametersV2, RunnerEvent, RunnerInput, RunnerOutput,
 };
 
 use crate::domain::{
-    ImagePreset, ImageSettings, JobKind, JobManifest, JobPlan, JobProgress, JobStatus, JobSummary,
-    ProductJobSpec, StoredJob, StoredRunnerRequest,
+    ImageBackend, ImageBatchMetadata, ImageOutputFormat as ProductOutputFormat, ImagePreset,
+    ImageSettings, JobKind, JobManifest, JobPlan, JobProgress, JobStatus, JobSummary,
+    MetadataPolicy, ProductJobSpec, StoredJob, StoredRunnerRequest,
+};
+use crate::image_pipeline::{
+    Goal1bImageError, ImageMetadata, ImagePipelineLimits, MetadataPolicy as PipelineMetadataPolicy,
+    OutputEncoding, PreparedImage, VerifiedPipelineOutput, prepare_image_input,
+    render_pipeline_output,
 };
 use crate::image_safety::{
     ImageOutputPlan, ImageSafetyError, ImageVerification, cleanup_owned_output, plan_image_output,
@@ -33,6 +41,7 @@ const MANIFEST_FILE: &str = "manifest.json";
 const LOGS_FILE: &str = "logs.jsonl";
 const PLAN_REVISIONS_FILE: &str = "plan-revisions.jsonl";
 const VERIFICATION_FILE: &str = "verification.json";
+const IMAGE_PIPELINE_FILE: &str = "image-pipeline.json";
 const LOCK_FILE: &str = ".workspace.lock";
 const STAGING_DIR: &str = "staging";
 const QUARANTINE_DIR: &str = "quarantine";
@@ -41,6 +50,48 @@ const DIAGNOSTIC_SUFFIX: &str = ".diagnostic.json";
 #[derive(Deserialize)]
 struct RunnerRequestVersion {
     protocol_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImagePipelinePlan {
+    schema_version: u32,
+    job_id: String,
+    source_path: PathBuf,
+    source_sha256: String,
+    inference_png: PathBuf,
+    alpha_png: Option<PathBuf>,
+    native_x4_png: PathBuf,
+    destination_partial: PathBuf,
+    destination_final: PathBuf,
+    width: u32,
+    height: u32,
+    had_alpha: bool,
+    orientation: u16,
+    metadata: ImageMetadata,
+    scale: u8,
+    output_format: ProductOutputFormat,
+    metadata_policy: MetadataPolicy,
+    selected_backend: ImageBackend,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImagePipelineVerification {
+    pub schema_version: u32,
+    pub job_id: String,
+    pub actual_backend: ImageBackend,
+    pub source_path: PathBuf,
+    pub source_sha256_before: String,
+    pub source_sha256_after: String,
+    pub inference_sha256: String,
+    pub intermediate_sha256: String,
+    pub output_path: PathBuf,
+    pub output_sha256: String,
+    pub output_format: ProductOutputFormat,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub alpha_preserved: bool,
+    pub icc_preserved: bool,
+    pub exif_preserved: bool,
 }
 
 #[derive(Debug)]
@@ -169,6 +220,12 @@ impl WorkspaceStore {
             model_bin_sha256: None,
             model_onnx_sha256: None,
             fallback_reason: None,
+            source_sha256: None,
+            intermediate_sha256: None,
+            final_sha256: None,
+            icc_preserved: None,
+            exif_preserved: None,
+            alpha_preserved: None,
         };
 
         write_json_atomic(&job_dir.join(JOB_SPEC_FILE), &job_spec)?;
@@ -301,6 +358,12 @@ impl WorkspaceStore {
             model_bin_sha256: None,
             model_onnx_sha256: None,
             fallback_reason: None,
+            source_sha256: None,
+            intermediate_sha256: None,
+            final_sha256: None,
+            icc_preserved: None,
+            exif_preserved: None,
+            alpha_preserved: None,
         };
 
         write_json_atomic(&job_dir.join(JOB_SPEC_FILE), &job_spec)?;
@@ -315,6 +378,236 @@ impl WorkspaceStore {
         sync_directory(&self.staging_dir())?;
         sync_directory(&self.root)?;
         Ok(summary)
+    }
+
+    pub fn create_image_job_v2(
+        &self,
+        input_path: &Path,
+        settings: ImageSettings,
+        selected_backend: ImageBackend,
+        batch: Option<ImageBatchMetadata>,
+    ) -> Result<JobSummary, WorkspaceError> {
+        if selected_backend == ImageBackend::Auto {
+            return Err(WorkspaceError::InvalidSelectedBackend);
+        }
+        if settings.backend != ImageBackend::Auto && settings.backend != selected_backend {
+            return Err(WorkspaceError::InvalidSelectedBackend);
+        }
+        if let Some(batch) = batch.as_ref()
+            && (batch.batch_id.trim().is_empty()
+                || batch.total == 0
+                || batch.index == 0
+                || batch.index > batch.total)
+        {
+            return Err(WorkspaceError::InvalidBatchMetadata);
+        }
+
+        let job_id = Uuid::new_v4().to_string();
+        let job_dir = self.staging_dir().join(&job_id);
+        let published_dir = self.root.join(&job_id);
+        let staging_work = job_dir.join("work");
+        let published_work = published_dir.join("work");
+        fs::create_dir(&job_dir)?;
+
+        let create = (|| -> Result<JobSummary, WorkspaceError> {
+            let source_sha256 = checked_source_sha256(input_path)?;
+            let staged =
+                prepare_image_input(input_path, &staging_work, ImagePipelineLimits::default())?;
+            if checked_source_sha256(input_path)? != source_sha256 {
+                return Err(ImageSafetyError::InputChanged.into());
+            }
+            validate_pipeline_dimensions(staged.width, staged.height, settings.scale)?;
+            ensure_pipeline_workspace_space(&staging_work, staged.width, staged.height)?;
+            if staged.had_alpha && settings.output_format == ProductOutputFormat::Jpeg {
+                return Err(Goal1bImageError::AlphaJpegUnsupported.into());
+            }
+
+            let (final_path, destination_partial) = plan_pipeline_destination(
+                input_path,
+                settings.scale,
+                settings.output_format,
+                &job_id,
+                staged.width,
+                staged.height,
+            )?;
+            let input_name = input_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or(ImageSafetyError::InvalidInputPath)?
+                .to_owned();
+            let inference_png = published_work.join("inference-rgb.png");
+            let alpha_png = staged
+                .alpha_png
+                .as_ref()
+                .map(|_| published_work.join("alpha.png"));
+            let native_x4_png = published_work.join("sr-native-x4.png");
+            let inference_sha256 = crate::image_safety::sha256_file(&staged.inference_png)?;
+            let pipeline = ImagePipelinePlan {
+                schema_version: 1,
+                job_id: job_id.clone(),
+                source_path: input_path.to_owned(),
+                source_sha256: source_sha256.clone(),
+                inference_png: inference_png.clone(),
+                alpha_png,
+                native_x4_png: native_x4_png.clone(),
+                destination_partial: destination_partial.clone(),
+                destination_final: final_path.clone(),
+                width: staged.width,
+                height: staged.height,
+                had_alpha: staged.had_alpha,
+                orientation: staged.orientation,
+                metadata: staged.metadata,
+                scale: settings.scale,
+                output_format: settings.output_format,
+                metadata_policy: settings.metadata,
+                selected_backend,
+            };
+            let (device, backend_settings, runner_id) = match selected_backend {
+                ImageBackend::VulkanGpu => (
+                    ImageDeviceV2::Vulkan { index: 0 },
+                    ImageBackendSettingsV2::Vulkan {
+                        tile_size: 256,
+                        threads: "1:2:2".into(),
+                    },
+                    "zoos-runner-realesrgan",
+                ),
+                ImageBackend::OrtCpu => (
+                    ImageDeviceV2::Cpu,
+                    ImageBackendSettingsV2::OrtCpu {
+                        tile_size: 128,
+                        intra_threads: 4,
+                        inter_threads: 1,
+                    },
+                    "zoos-runner-ort",
+                ),
+                ImageBackend::Auto => unreachable!("validated above"),
+            };
+            let runner_request = ImageUpscaleJobRequestV2 {
+                protocol_version: IMAGE_PROTOCOL_VERSION_V2,
+                job_id: job_id.clone(),
+                task: ImageTask::ImageUpscale,
+                input: ImageInferenceInputV2 {
+                    path: inference_png,
+                    sha256: inference_sha256,
+                    width: staged.width,
+                    height: staged.height,
+                    format: ImageInferenceFormatV2::Png,
+                    pixel_format: ImagePixelFormatV2::Rgb8,
+                },
+                output: ImageIntermediateOutputV2 {
+                    path: native_x4_png,
+                    format: ImageInferenceFormatV2::Png,
+                    pixel_format: ImagePixelFormatV2::Rgb8,
+                },
+                parameters: ImageUpscaleParametersV2 {
+                    semantic_model: match settings.preset {
+                        ImagePreset::Photo => ImageSemanticModelV2::Photo,
+                        ImagePreset::Anime => ImageSemanticModelV2::Anime,
+                    },
+                    requested_scale: settings.scale,
+                    native_scale: 4,
+                    device,
+                    backend_settings,
+                },
+            };
+            runner_request
+                .validate()
+                .map_err(|error| WorkspaceError::InvalidRunnerContract(error.to_string()))?;
+
+            let created_at_ms = now_ms();
+            let batch_id = batch.as_ref().map(|batch| batch.batch_id.clone());
+            let batch_index = batch.as_ref().map(|batch| batch.index);
+            let batch_total = batch.as_ref().map(|batch| batch.total);
+            let job_spec = ProductJobSpec {
+                schema_version: 3,
+                job_id: job_id.clone(),
+                kind: JobKind::ImageUpscale,
+                input_name: Some(input_name.clone()),
+                output_path: Some(final_path.clone()),
+                image_settings: Some(settings),
+                batch_id: batch_id.clone(),
+                batch_index,
+                batch_total,
+                selected_backend: Some(selected_backend),
+                scenario: None,
+                created_at_ms,
+            };
+            let plan = JobPlan {
+                schema_version: 2,
+                job_id: job_id.clone(),
+                execution_backend: "process".into(),
+                runner_id: runner_id.into(),
+            };
+            let summary = JobSummary {
+                job_id: job_id.clone(),
+                kind: JobKind::ImageUpscale,
+                input_name: Some(input_name),
+                output_path: Some(final_path),
+                image_settings: Some(settings),
+                batch_id,
+                batch_index,
+                batch_total,
+                selected_backend: Some(selected_backend),
+                scenario: None,
+                status: JobStatus::Created,
+                progress_percent: 0,
+                stage: None,
+                message: "Ready to start".into(),
+                error: None,
+                created_at_ms,
+                updated_at_ms: created_at_ms,
+            };
+            let progress = JobProgress {
+                schema_version: 1,
+                summary: summary.clone(),
+            };
+            let manifest = JobManifest {
+                schema_version: 2,
+                job_id: job_id.clone(),
+                runner_id: runner_id.into(),
+                runner_version: env!("CARGO_PKG_VERSION").into(),
+                result: None,
+                exit_code: None,
+                started_at_ms: None,
+                finished_at_ms: None,
+                actual_backend: Some(selected_backend),
+                actual_device: None,
+                runtime_sha256: None,
+                model_param_sha256: None,
+                model_bin_sha256: None,
+                model_onnx_sha256: None,
+                fallback_reason: None,
+                source_sha256: Some(source_sha256),
+                intermediate_sha256: None,
+                final_sha256: None,
+                icc_preserved: None,
+                exif_preserved: None,
+                alpha_preserved: None,
+            };
+
+            write_json_atomic(&job_dir.join(JOB_SPEC_FILE), &job_spec)?;
+            write_json_atomic(&job_dir.join(PLAN_FILE), &plan)?;
+            write_json_atomic(&job_dir.join(RUNNER_JOB_FILE), &runner_request)?;
+            write_json_atomic(&job_dir.join(IMAGE_PIPELINE_FILE), &pipeline)?;
+            write_json_atomic(&job_dir.join(PROGRESS_FILE), &progress)?;
+            write_json_atomic(&job_dir.join(MANIFEST_FILE), &manifest)?;
+            create_empty_file(&job_dir.join(LOGS_FILE))?;
+            create_empty_file(&job_dir.join(PLAN_REVISIONS_FILE))?;
+            sync_directory(&staging_work)?;
+            sync_directory(&job_dir)?;
+            fs::rename(&job_dir, &published_dir)?;
+            sync_directory(&self.staging_dir())?;
+            sync_directory(&self.root)?;
+            Ok(summary)
+        })();
+
+        if create.is_err()
+            && job_dir.exists()
+            && let Err(error) = self.quarantine(&job_dir, "Goal 1B image job creation failed")
+        {
+            eprintln!("could not quarantine failed Goal 1B staging job: {error}");
+        }
+        create
     }
 
     pub fn list_jobs(&self) -> Result<Vec<JobSummary>, WorkspaceError> {
@@ -404,6 +697,23 @@ impl WorkspaceStore {
         write_json_atomic(&path, &manifest)
     }
 
+    fn record_pipeline_verification(
+        &self,
+        job_id: &str,
+        verification: &ImagePipelineVerification,
+    ) -> Result<(), WorkspaceError> {
+        let path = self.job_dir(job_id)?.join(MANIFEST_FILE);
+        let mut manifest: JobManifest = read_json(&path)?;
+        manifest.actual_backend = Some(verification.actual_backend);
+        manifest.source_sha256 = Some(verification.source_sha256_after.clone());
+        manifest.intermediate_sha256 = Some(verification.intermediate_sha256.clone());
+        manifest.final_sha256 = Some(verification.output_sha256.clone());
+        manifest.icc_preserved = Some(verification.icc_preserved);
+        manifest.exif_preserved = Some(verification.exif_preserved);
+        manifest.alpha_preserved = Some(verification.alpha_preserved);
+        write_json_atomic(&path, &manifest)
+    }
+
     pub fn cleanup_unverified_output(&self, job_id: &str) -> Result<(), WorkspaceError> {
         let job_dir = self.job_dir(job_id)?;
         let stored = self.load_stored_job(job_id)?;
@@ -417,7 +727,24 @@ impl WorkspaceStore {
                 cleanup_owned_output(&plan, &job_dir.join(VERIFICATION_FILE))?;
             }
             StoredRunnerRequest::ImageUpscaleV2(request) => {
+                let pipeline: ImagePipelinePlan = read_json(&job_dir.join(IMAGE_PIPELINE_FILE))?;
                 remove_if_exists(&request.output.path)?;
+                remove_if_exists(&pipeline.destination_partial)?;
+                remove_if_exists(&pipeline.inference_png)?;
+                if let Some(alpha) = pipeline.alpha_png.as_ref() {
+                    remove_if_exists(alpha)?;
+                }
+                if let Ok(verification) =
+                    read_json::<ImagePipelineVerification>(&job_dir.join(VERIFICATION_FILE))
+                    && verification.job_id == job_id
+                    && verification.output_path == pipeline.destination_final
+                    && crate::image_safety::sha256_file(&pipeline.destination_final)
+                        .ok()
+                        .as_deref()
+                        == Some(verification.output_sha256.as_str())
+                {
+                    remove_if_exists(&pipeline.destination_final)?;
+                }
                 remove_if_exists(&job_dir.join(VERIFICATION_FILE))?;
             }
         }
@@ -433,8 +760,13 @@ impl WorkspaceStore {
                 Ok(())
             }
             StoredRunnerRequest::ImageUpscaleV2(request) => {
-                let actual = crate::image_safety::sha256_file(&request.input.path)?;
-                if actual == request.input.sha256 {
+                let pipeline: ImagePipelinePlan =
+                    read_json(&self.job_dir(job_id)?.join(IMAGE_PIPELINE_FILE))?;
+                let source = checked_source_sha256(&pipeline.source_path)
+                    .map_err(|_| ImageSafetyError::InputChanged)?;
+                let inference = crate::image_safety::sha256_file(&request.input.path)
+                    .map_err(|_| ImageSafetyError::InputChanged)?;
+                if source == pipeline.source_sha256 && inference == request.input.sha256 {
                     Ok(())
                 } else {
                     Err(ImageSafetyError::InputChanged.into())
@@ -458,7 +790,88 @@ impl WorkspaceStore {
                     &job_dir.join(VERIFICATION_FILE),
                 )?))
             }
-            StoredRunnerRequest::ImageUpscaleV2(_) => Err(WorkspaceError::UnsafeRunnerRequest),
+            StoredRunnerRequest::ImageUpscaleV2(request) => {
+                let pipeline: ImagePipelinePlan = read_json(&job_dir.join(IMAGE_PIPELINE_FILE))?;
+                if request.output.path != pipeline.native_x4_png {
+                    return Err(WorkspaceError::UnsafeRunnerRequest);
+                }
+                require_safe_destination_directory(
+                    &pipeline.source_path,
+                    &pipeline.destination_final,
+                )?;
+                require_regular_file(&pipeline.inference_png)?;
+                require_regular_file(&pipeline.native_x4_png)?;
+                if let Some(alpha) = pipeline.alpha_png.as_ref() {
+                    require_regular_file(alpha)?;
+                }
+                if pipeline.destination_partial.exists() {
+                    return Err(ImageSafetyError::OutputExists(
+                        pipeline.destination_partial.clone(),
+                    )
+                    .into());
+                }
+                let intermediate_sha256 =
+                    crate::image_safety::sha256_file(&pipeline.native_x4_png)?;
+                let prepared = prepared_from_pipeline(&pipeline);
+                let rendered = match render_pipeline_output(
+                    &prepared,
+                    &pipeline.native_x4_png,
+                    &pipeline.destination_partial,
+                    pipeline.scale,
+                    pipeline_encoding(pipeline.output_format),
+                    pipeline_metadata_policy(pipeline.metadata_policy),
+                    ImagePipelineLimits::default(),
+                ) {
+                    Ok(rendered) => rendered,
+                    Err(error) => {
+                        let _ = remove_if_exists(&pipeline.destination_partial);
+                        return Err(error.into());
+                    }
+                };
+                let source_after = checked_source_sha256(&pipeline.source_path)
+                    .map_err(|_| ImageSafetyError::InputChanged)?;
+                if source_after != pipeline.source_sha256 {
+                    remove_if_exists(&pipeline.destination_partial)?;
+                    return Err(ImageSafetyError::InputChanged.into());
+                }
+                if let Err(error) = crate::image_safety::no_replace_rename(
+                    &pipeline.destination_partial,
+                    &pipeline.destination_final,
+                ) {
+                    let _ = remove_if_exists(&pipeline.destination_partial);
+                    return Err(error.into());
+                }
+                if let Err(error) =
+                    crate::image_safety::sync_parent_directory(&pipeline.destination_final)
+                {
+                    rollback_pipeline_final(&pipeline.destination_final, &rendered.sha256);
+                    return Err(error.into());
+                }
+                let verification = pipeline_verification(
+                    &pipeline,
+                    &request,
+                    &rendered,
+                    source_after,
+                    intermediate_sha256,
+                )?;
+                if let Err(error) =
+                    write_json_atomic(&job_dir.join(VERIFICATION_FILE), &verification)
+                {
+                    rollback_pipeline_final(&pipeline.destination_final, &rendered.sha256);
+                    return Err(error);
+                }
+                if let Err(error) = self.record_pipeline_verification(job_id, &verification) {
+                    rollback_pipeline_final(&pipeline.destination_final, &rendered.sha256);
+                    let _ = remove_if_exists(&job_dir.join(VERIFICATION_FILE));
+                    return Err(error);
+                }
+                remove_if_exists(&pipeline.native_x4_png)?;
+                remove_if_exists(&pipeline.inference_png)?;
+                if let Some(alpha) = pipeline.alpha_png.as_ref() {
+                    remove_if_exists(alpha)?;
+                }
+                Ok(None)
+            }
             StoredRunnerRequest::Fake(_) => Ok(None),
         }
     }
@@ -556,6 +969,16 @@ impl WorkspaceStore {
         {
             return Err(WorkspaceError::UnsafeRunnerRequest);
         }
+        if spec.input_name != progress.summary.input_name
+            || spec.output_path != progress.summary.output_path
+            || spec.image_settings != progress.summary.image_settings
+            || spec.batch_id != progress.summary.batch_id
+            || spec.batch_index != progress.summary.batch_index
+            || spec.batch_total != progress.summary.batch_total
+            || spec.selected_backend != progress.summary.selected_backend
+        {
+            return Err(WorkspaceError::UnsafeRunnerRequest);
+        }
         match runner_request {
             StoredRunnerRequest::Fake(request)
                 if request.job_id == job_id
@@ -567,7 +990,13 @@ impl WorkspaceStore {
             StoredRunnerRequest::ImageUpscaleV2(request)
                 if request.job_id == job_id
                     && progress.summary.output_path.as_ref() != Some(&request.output.path)
-                    && is_safe_image_request_v2(&progress.summary, &request) => {}
+                    && is_safe_image_request_v2(job_dir, &progress.summary, &request)
+                    && (matches!(
+                        (progress.summary.selected_backend, plan.runner_id.as_str()),
+                        (Some(ImageBackend::VulkanGpu), "zoos-runner-realesrgan")
+                            | (Some(ImageBackend::OrtCpu), "zoos-runner-ort")
+                    ) || (progress.summary.selected_backend.is_none()
+                        && !job_dir.join(IMAGE_PIPELINE_FILE).exists())) => {}
             _ => return Err(WorkspaceError::UnsafeRunnerRequest),
         }
 
@@ -619,7 +1048,7 @@ impl WorkspaceStore {
                         })?;
                         if request.job_id != summary.job_id
                             || summary.image_settings.is_none()
-                            || !is_safe_image_request_v2(summary, &request)
+                            || !is_safe_image_request_v2(job_dir, summary, &request)
                         {
                             return Err(WorkspaceError::UnsafeRunnerRequest);
                         }
@@ -688,6 +1117,217 @@ impl WorkspaceStore {
             return Err(WorkspaceError::UnsafeRunnerRequest);
         }
         Ok(canonical)
+    }
+}
+
+fn validate_pipeline_dimensions(
+    width: u32,
+    height: u32,
+    requested_scale: u8,
+) -> Result<(), WorkspaceError> {
+    if !matches!(requested_scale, 2 | 4) {
+        return Err(ImageSafetyError::UnsupportedScale(requested_scale).into());
+    }
+    for scale in [requested_scale, 4] {
+        let output_width = u64::from(width) * u64::from(scale);
+        let output_height = u64::from(height) * u64::from(scale);
+        if output_width > 32_000
+            || output_height > 32_000
+            || output_width.saturating_mul(output_height) > 100_000_000
+        {
+            return Err(ImageSafetyError::OutputTooLarge {
+                width: u32::try_from(output_width).unwrap_or(u32::MAX),
+                height: u32::try_from(output_height).unwrap_or(u32::MAX),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn plan_pipeline_destination(
+    input: &Path,
+    scale: u8,
+    format: ProductOutputFormat,
+    job_id: &str,
+    width: u32,
+    height: u32,
+) -> Result<(PathBuf, PathBuf), WorkspaceError> {
+    let parent = input.parent().ok_or(ImageSafetyError::InvalidInputPath)?;
+    let destination_dir = parent.join("Upscaled");
+    fs::create_dir_all(&destination_dir)?;
+    require_safe_destination_directory(input, &destination_dir.join("placeholder"))?;
+    let native_pixels = u64::from(width)
+        .saturating_mul(4)
+        .saturating_mul(u64::from(height).saturating_mul(4));
+    let final_pixels = u64::from(width)
+        .saturating_mul(u64::from(scale))
+        .saturating_mul(u64::from(height).saturating_mul(u64::from(scale)));
+    let required = (1024 * 1024 * 1024_u64).max(
+        native_pixels
+            .saturating_mul(3)
+            .saturating_mul(2)
+            .saturating_add(final_pixels.saturating_mul(4).saturating_mul(2)),
+    );
+    let available = fs4::available_space(&destination_dir)?;
+    if available < required {
+        return Err(ImageSafetyError::InsufficientDisk {
+            required,
+            available,
+        }
+        .into());
+    }
+    let stem = input
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .ok_or(ImageSafetyError::InvalidInputPath)?;
+    let extension = output_extension(format);
+    let base = format!("{stem}_upscaled_{scale}x");
+    let mut final_path = None;
+    for suffix in 1..=999 {
+        let name = if suffix == 1 {
+            format!("{base}.{extension}")
+        } else {
+            format!("{base}_{suffix}.{extension}")
+        };
+        let candidate = destination_dir.join(name);
+        if !candidate.exists() {
+            final_path = Some(candidate);
+            break;
+        }
+    }
+    let final_path = final_path.ok_or(ImageSafetyError::NoOutputNameAvailable)?;
+    let final_name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(ImageSafetyError::InvalidInputPath)?;
+    let partial = destination_dir.join(format!(".{final_name}.zoos-{job_id}.partial.{extension}"));
+    if partial.exists() {
+        return Err(ImageSafetyError::OutputExists(partial).into());
+    }
+    Ok((final_path, partial))
+}
+
+fn ensure_pipeline_workspace_space(
+    work: &Path,
+    width: u32,
+    height: u32,
+) -> Result<(), WorkspaceError> {
+    let native_raw = u64::from(width)
+        .saturating_mul(4)
+        .saturating_mul(u64::from(height).saturating_mul(4))
+        .saturating_mul(3);
+    let required = (1024 * 1024 * 1024_u64).max(native_raw.saturating_mul(2));
+    let available = fs4::available_space(work)?;
+    if available < required {
+        return Err(ImageSafetyError::InsufficientDisk {
+            required,
+            available,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn require_safe_destination_directory(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), WorkspaceError> {
+    let expected = source
+        .parent()
+        .ok_or(ImageSafetyError::InvalidInputPath)?
+        .join("Upscaled");
+    if destination.parent() != Some(expected.as_path()) {
+        return Err(WorkspaceError::UnsafeRunnerRequest);
+    }
+    let metadata = fs::symlink_metadata(&expected)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(WorkspaceError::UnsafeRunnerRequest);
+    }
+    Ok(())
+}
+
+fn output_extension(format: ProductOutputFormat) -> &'static str {
+    match format {
+        ProductOutputFormat::Png => "png",
+        ProductOutputFormat::Jpeg => "jpg",
+        ProductOutputFormat::Webp => "webp",
+    }
+}
+
+fn checked_source_sha256(path: &Path) -> Result<String, WorkspaceError> {
+    if !path.is_absolute() {
+        return Err(ImageSafetyError::InvalidInputPath.into());
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ImageSafetyError::InvalidInputPath.into());
+    }
+    if metadata.len() > 512 * 1024 * 1024 {
+        return Err(Goal1bImageError::InputTooLarge.into());
+    }
+    Ok(crate::image_safety::sha256_file(path)?)
+}
+
+fn pipeline_encoding(format: ProductOutputFormat) -> OutputEncoding {
+    match format {
+        ProductOutputFormat::Png => OutputEncoding::Png,
+        ProductOutputFormat::Jpeg => OutputEncoding::Jpeg,
+        ProductOutputFormat::Webp => OutputEncoding::Webp,
+    }
+}
+
+fn pipeline_metadata_policy(policy: MetadataPolicy) -> PipelineMetadataPolicy {
+    match policy {
+        MetadataPolicy::Preserve => PipelineMetadataPolicy::Preserve,
+        MetadataPolicy::Strip => PipelineMetadataPolicy::Strip,
+    }
+}
+
+fn prepared_from_pipeline(plan: &ImagePipelinePlan) -> PreparedImage {
+    PreparedImage {
+        input_path: plan.source_path.clone(),
+        inference_png: plan.inference_png.clone(),
+        alpha_png: plan.alpha_png.clone(),
+        width: plan.width,
+        height: plan.height,
+        had_alpha: plan.had_alpha,
+        orientation: plan.orientation,
+        metadata: plan.metadata.clone(),
+    }
+}
+
+fn pipeline_verification(
+    plan: &ImagePipelinePlan,
+    request: &ImageUpscaleJobRequestV2,
+    rendered: &VerifiedPipelineOutput,
+    source_after: String,
+    intermediate_sha256: String,
+) -> Result<ImagePipelineVerification, WorkspaceError> {
+    Ok(ImagePipelineVerification {
+        schema_version: 2,
+        job_id: plan.job_id.clone(),
+        actual_backend: plan.selected_backend,
+        source_path: plan.source_path.clone(),
+        source_sha256_before: plan.source_sha256.clone(),
+        source_sha256_after: source_after,
+        inference_sha256: request.input.sha256.clone(),
+        intermediate_sha256,
+        output_path: plan.destination_final.clone(),
+        output_sha256: rendered.sha256.clone(),
+        output_format: plan.output_format,
+        output_width: rendered.width,
+        output_height: rendered.height,
+        alpha_preserved: rendered.has_alpha == plan.had_alpha,
+        icc_preserved: rendered.icc_preserved,
+        exif_preserved: rendered.exif_preserved,
+    })
+}
+
+fn rollback_pipeline_final(path: &Path, expected_sha256: &str) {
+    if crate::image_safety::sha256_file(path).ok().as_deref() == Some(expected_sha256) {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -766,19 +1406,86 @@ fn is_safe_image_request(summary: &JobSummary, request: &ImageUpscaleJobRequest)
         == final_path.with_file_name(format!(".{final_name}.zoos-{}.partial.png", summary.job_id))
 }
 
-fn is_safe_image_request_v2(summary: &JobSummary, request: &ImageUpscaleJobRequestV2) -> bool {
+fn is_safe_image_request_v2(
+    job_dir: &Path,
+    summary: &JobSummary,
+    request: &ImageUpscaleJobRequestV2,
+) -> bool {
     let Some(final_path) = summary.output_path.as_deref() else {
         return false;
     };
     let Some(final_name) = final_path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    request.input.path != request.output.path
-        && request.output.path
-            == final_path.with_file_name(format!(
-                ".{final_name}.zoos-{}.native-x4.partial.png",
-                summary.job_id
-            ))
+    let Some(settings) = summary.image_settings else {
+        return false;
+    };
+    let Ok(pipeline) = read_json::<ImagePipelinePlan>(&job_dir.join(IMAGE_PIPELINE_FILE)) else {
+        return request.input.path != request.output.path
+            && request.output.path
+                == final_path.with_file_name(format!(
+                    ".{final_name}.zoos-{}.native-x4.partial.png",
+                    summary.job_id
+                ));
+    };
+    let work = job_dir.join("work");
+    let extension = output_extension(settings.output_format);
+    let expected_partial = final_path.with_file_name(format!(
+        ".{final_name}.zoos-{}.partial.{extension}",
+        summary.job_id
+    ));
+    let work_is_safe = fs::symlink_metadata(&work)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+    let managed_files_safe = [
+        Some(request.input.path.as_path()),
+        pipeline.alpha_png.as_deref(),
+        Some(request.output.path.as_path()),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|path| {
+        !path.exists()
+            || fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    });
+    let final_name_is_safe = pipeline
+        .source_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| {
+            let base = format!("{stem}_upscaled_{}x", settings.scale);
+            final_name == format!("{base}.{extension}")
+                || (2..=999).any(|suffix| final_name == format!("{base}_{suffix}.{extension}"))
+        });
+    pipeline.schema_version == 1
+        && pipeline.job_id == summary.job_id
+        && pipeline.destination_final == final_path
+        && pipeline.destination_partial == expected_partial
+        && pipeline.inference_png == work.join("inference-rgb.png")
+        && pipeline
+            .alpha_png
+            .as_ref()
+            .is_none_or(|path| path == &work.join("alpha.png"))
+        && pipeline.native_x4_png == work.join("sr-native-x4.png")
+        && pipeline.source_path != final_path
+        && final_path.parent().is_some_and(|final_parent| {
+            pipeline
+                .source_path
+                .parent()
+                .is_some_and(|source_parent| final_parent == source_parent.join("Upscaled"))
+        })
+        && pipeline.scale == settings.scale
+        && pipeline.output_format == settings.output_format
+        && pipeline.metadata_policy == settings.metadata
+        && Some(pipeline.selected_backend) == summary.selected_backend
+        && request.input.path == pipeline.inference_png
+        && request.input.width == pipeline.width
+        && request.input.height == pipeline.height
+        && request.output.path == pipeline.native_x4_png
+        && request.input.path != request.output.path
+        && work_is_safe
+        && managed_files_safe
+        && final_name_is_safe
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), WorkspaceError> {
@@ -923,8 +1630,14 @@ pub enum WorkspaceError {
     UnsafeRunnerRequest,
     #[error("invalid runner contract: {0}")]
     InvalidRunnerContract(String),
+    #[error("selected image backend must be resolved before job creation")]
+    InvalidSelectedBackend,
+    #[error("batch metadata is invalid")]
+    InvalidBatchMetadata,
     #[error(transparent)]
     Image(#[from] ImageSafetyError),
+    #[error(transparent)]
+    Pipeline(#[from] Goal1bImageError),
     #[error("workspace I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("workspace JSON failed: {0}")]
@@ -934,7 +1647,7 @@ pub enum WorkspaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{ImageFormat, Rgb, RgbImage};
+    use image::{ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 
     fn quarantine_entries(root: &Path) -> Vec<PathBuf> {
         fs::read_dir(root.join(QUARANTINE_DIR))
@@ -947,6 +1660,57 @@ mod tests {
         RgbImage::from_pixel(width, height, Rgb(pixel))
             .save_with_format(path, ImageFormat::Png)
             .expect("RGB PNG fixture must save");
+    }
+
+    fn goal1b_settings(format: ProductOutputFormat) -> ImageSettings {
+        ImageSettings {
+            preset: ImagePreset::Photo,
+            scale: 2,
+            backend: ImageBackend::Auto,
+            output_format: format,
+            metadata: MetadataPolicy::Preserve,
+        }
+    }
+
+    fn write_native_x4(store: &WorkspaceStore, job_id: &str) -> ImageUpscaleJobRequestV2 {
+        let StoredRunnerRequest::ImageUpscaleV2(request) = store
+            .load_stored_job(job_id)
+            .expect("Goal 1B job must load")
+            .runner_request
+        else {
+            panic!("Goal 1B job must use v2")
+        };
+        let input = image::open(&request.input.path)
+            .expect("normalized input must decode")
+            .into_rgb8();
+        image::imageops::resize(
+            &input,
+            input.width() * 4,
+            input.height() * 4,
+            image::imageops::FilterType::Nearest,
+        )
+        .save_with_format(&request.output.path, ImageFormat::Png)
+        .expect("native x4 output must save");
+        request
+    }
+
+    fn jpeg_with_orientation(path: &Path, orientation: u16) {
+        RgbImage::from_pixel(3, 2, Rgb([10, 20, 30]))
+            .save_with_format(path, ImageFormat::Jpeg)
+            .expect("JPEG fixture must save");
+        let mut tiff = b"MM\0*\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01".to_vec();
+        tiff.extend_from_slice(&orientation.to_be_bytes());
+        tiff.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend(tiff);
+        let length = u16::try_from(payload.len() + 2)
+            .expect("EXIF fixture must fit")
+            .to_be_bytes();
+        let mut segment = vec![0xff, 0xe1, length[0], length[1]];
+        segment.extend(payload);
+        let mut bytes = fs::read(path).expect("JPEG fixture must read");
+        bytes.splice(2..2, segment);
+        fs::write(path, bytes).expect("oriented JPEG must save");
     }
 
     #[test]
@@ -1488,5 +2252,336 @@ mod tests {
             store.load_summary(&created.job_id),
             Err(WorkspaceError::UnsafeRunnerRequest)
         ));
+    }
+
+    #[test]
+    fn goal1b_jobs_normalize_orientation_and_publish_all_output_formats() {
+        let workspace = tempfile::tempdir().expect("workspace must be created");
+        let sources = tempfile::tempdir().expect("sources must be created");
+        let store = WorkspaceStore::new(workspace.path()).expect("store must open");
+
+        for (index, format) in [
+            ProductOutputFormat::Png,
+            ProductOutputFormat::Jpeg,
+            ProductOutputFormat::Webp,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let input = sources.path().join(format!("oriented-{index}.jpg"));
+            jpeg_with_orientation(&input, 6);
+            let created = store
+                .create_image_job_v2(
+                    &input,
+                    goal1b_settings(format),
+                    ImageBackend::OrtCpu,
+                    Some(ImageBatchMetadata {
+                        batch_id: "batch-a".into(),
+                        index: u32::try_from(index + 1).unwrap(),
+                        total: 3,
+                    }),
+                )
+                .expect("Goal 1B job must be created");
+            assert_eq!(created.batch_id.as_deref(), Some("batch-a"));
+            assert_eq!(created.selected_backend, Some(ImageBackend::OrtCpu));
+            let request = write_native_x4(&store, &created.job_id);
+            assert_eq!((request.input.width, request.input.height), (2, 3));
+            assert_eq!(request.input.path.file_name().unwrap(), "inference-rgb.png");
+            assert_eq!(request.output.path.file_name().unwrap(), "sr-native-x4.png");
+            assert_eq!(
+                store
+                    .load_stored_job(&created.job_id)
+                    .expect("job must load")
+                    .runner_id,
+                "zoos-runner-ort"
+            );
+
+            store
+                .publish_image_output(&created.job_id)
+                .expect("output must publish");
+            let final_path = created.output_path.expect("final path must exist");
+            assert!(final_path.is_file());
+            assert_eq!(
+                final_path.extension().and_then(|value| value.to_str()),
+                Some(output_extension(format))
+            );
+            let verification: ImagePipelineVerification = read_json(
+                &workspace
+                    .path()
+                    .join(&created.job_id)
+                    .join(VERIFICATION_FILE),
+            )
+            .expect("verification must load");
+            assert_eq!(
+                verification.source_sha256_before,
+                verification.source_sha256_after
+            );
+            assert_eq!(verification.output_format, format);
+            assert_eq!(
+                (verification.output_width, verification.output_height),
+                (4, 6)
+            );
+            assert_eq!(verification.actual_backend, ImageBackend::OrtCpu);
+            let manifest: JobManifest =
+                read_json(&workspace.path().join(&created.job_id).join(MANIFEST_FILE))
+                    .expect("manifest must load");
+            assert_eq!(manifest.final_sha256, Some(verification.output_sha256));
+            assert_eq!(
+                manifest.intermediate_sha256,
+                Some(verification.intermediate_sha256)
+            );
+        }
+    }
+
+    #[test]
+    fn goal1b_limits_and_format_neutral_suffixes_are_planned_before_execution() {
+        assert!(matches!(
+            validate_pipeline_dimensions(8_001, 1, 2),
+            Err(WorkspaceError::Image(
+                ImageSafetyError::OutputTooLarge { .. }
+            ))
+        ));
+        assert!(matches!(
+            validate_pipeline_dimensions(2_501, 2_500, 2),
+            Err(WorkspaceError::Image(
+                ImageSafetyError::OutputTooLarge { .. }
+            ))
+        ));
+
+        let sources = tempfile::tempdir().expect("sources must be created");
+        let input = sources.path().join("photo.png");
+        rgb_png(&input, 2, 2, [1, 2, 3]);
+        let output_dir = sources.path().join("Upscaled");
+        fs::create_dir(&output_dir).unwrap();
+        fs::write(output_dir.join("photo_upscaled_2x.jpg"), b"existing").unwrap();
+        let (final_path, partial_path) =
+            plan_pipeline_destination(&input, 2, ProductOutputFormat::Jpeg, "job-id", 2, 2)
+                .expect("second JPEG name must plan");
+        assert_eq!(final_path.file_name().unwrap(), "photo_upscaled_2x_2.jpg");
+        assert_eq!(
+            partial_path.file_name().unwrap(),
+            ".photo_upscaled_2x_2.jpg.zoos-job-id.partial.jpg"
+        );
+    }
+
+    #[test]
+    fn goal1b_alpha_is_recombined_and_alpha_jpeg_is_rejected() {
+        let workspace = tempfile::tempdir().expect("workspace must be created");
+        let sources = tempfile::tempdir().expect("sources must be created");
+        let input = sources.path().join("alpha.png");
+        RgbaImage::from_pixel(2, 3, Rgba([10, 20, 30, 80]))
+            .save_with_format(&input, ImageFormat::Png)
+            .expect("RGBA fixture must save");
+        let store = WorkspaceStore::new(workspace.path()).expect("store must open");
+
+        assert!(matches!(
+            store.create_image_job_v2(
+                &input,
+                goal1b_settings(ProductOutputFormat::Jpeg),
+                ImageBackend::VulkanGpu,
+                None,
+            ),
+            Err(WorkspaceError::Pipeline(
+                Goal1bImageError::AlphaJpegUnsupported
+            ))
+        ));
+        let created = store
+            .create_image_job_v2(
+                &input,
+                goal1b_settings(ProductOutputFormat::Png),
+                ImageBackend::VulkanGpu,
+                None,
+            )
+            .expect("alpha PNG job must create");
+        let request = write_native_x4(&store, &created.job_id);
+        assert!(request.input.path.with_file_name("alpha.png").is_file());
+        store
+            .publish_image_output(&created.job_id)
+            .expect("alpha output must publish");
+        assert!(matches!(
+            image::open(created.output_path.unwrap()).expect("output must decode"),
+            image::DynamicImage::ImageRgba8(_)
+        ));
+    }
+
+    #[test]
+    fn goal1b_publish_race_and_source_change_preserve_existing_files() {
+        let workspace = tempfile::tempdir().expect("workspace must be created");
+        let sources = tempfile::tempdir().expect("sources must be created");
+        let input = sources.path().join("input.png");
+        rgb_png(&input, 2, 2, [1, 2, 3]);
+        let store = WorkspaceStore::new(workspace.path()).expect("store must open");
+        let raced = store
+            .create_image_job_v2(
+                &input,
+                goal1b_settings(ProductOutputFormat::Webp),
+                ImageBackend::OrtCpu,
+                None,
+            )
+            .expect("race job must create");
+        write_native_x4(&store, &raced.job_id);
+        let raced_final = raced.output_path.as_ref().unwrap();
+        fs::write(raced_final, b"existing").expect("raced file must save");
+        assert!(matches!(
+            store.publish_image_output(&raced.job_id),
+            Err(WorkspaceError::Image(ImageSafetyError::OutputExists(_)))
+        ));
+        assert_eq!(fs::read(raced_final).unwrap(), b"existing");
+        let raced_pipeline: ImagePipelinePlan = read_json(
+            &workspace
+                .path()
+                .join(&raced.job_id)
+                .join(IMAGE_PIPELINE_FILE),
+        )
+        .unwrap();
+        assert!(!raced_pipeline.destination_partial.exists());
+
+        let changed = store
+            .create_image_job_v2(
+                &input,
+                goal1b_settings(ProductOutputFormat::Png),
+                ImageBackend::OrtCpu,
+                None,
+            )
+            .expect("changed job must create");
+        let request = write_native_x4(&store, &changed.job_id);
+        rgb_png(&input, 2, 2, [9, 8, 7]);
+        assert!(matches!(
+            store.recheck_image_input(&changed.job_id),
+            Err(WorkspaceError::Image(ImageSafetyError::InputChanged))
+        ));
+        assert!(matches!(
+            store.publish_image_output(&changed.job_id),
+            Err(WorkspaceError::Image(ImageSafetyError::InputChanged))
+        ));
+        let pipeline: ImagePipelinePlan = read_json(
+            &workspace
+                .path()
+                .join(&changed.job_id)
+                .join(IMAGE_PIPELINE_FILE),
+        )
+        .unwrap();
+        assert!(!pipeline.destination_partial.exists());
+        assert!(!changed.output_path.unwrap().exists());
+        assert!(request.output.path.exists());
+    }
+
+    #[test]
+    fn goal1b_recovery_removes_intermediates_and_keeps_independent_jobs() {
+        let workspace = tempfile::tempdir().expect("workspace must be created");
+        let sources = tempfile::tempdir().expect("sources must be created");
+        let input_a = sources.path().join("a.png");
+        let input_b = sources.path().join("b.png");
+        rgb_png(&input_a, 2, 2, [1, 2, 3]);
+        rgb_png(&input_b, 2, 2, [4, 5, 6]);
+        let store = WorkspaceStore::new(workspace.path()).expect("store must open");
+        let a = store
+            .create_image_job_v2(
+                &input_a,
+                goal1b_settings(ProductOutputFormat::Png),
+                ImageBackend::VulkanGpu,
+                Some(ImageBatchMetadata {
+                    batch_id: "batch".into(),
+                    index: 1,
+                    total: 2,
+                }),
+            )
+            .unwrap();
+        let b = store
+            .create_image_job_v2(
+                &input_b,
+                goal1b_settings(ProductOutputFormat::Png),
+                ImageBackend::VulkanGpu,
+                Some(ImageBatchMetadata {
+                    batch_id: "batch".into(),
+                    index: 2,
+                    total: 2,
+                }),
+            )
+            .unwrap();
+        let request = write_native_x4(&store, &a.job_id);
+        let pipeline: ImagePipelinePlan =
+            read_json(&workspace.path().join(&a.job_id).join(IMAGE_PIPELINE_FILE)).unwrap();
+        fs::write(&pipeline.destination_partial, b"partial").unwrap();
+        store
+            .update_summary(&a.job_id, |summary| summary.status = JobStatus::Running)
+            .unwrap();
+        drop(store);
+
+        let reopened = WorkspaceStore::new(workspace.path()).expect("workspace must reopen");
+        reopened
+            .recover_interrupted()
+            .expect("recovery must finish");
+        assert_eq!(
+            reopened.load_summary(&a.job_id).unwrap().status,
+            JobStatus::Interrupted
+        );
+        assert_eq!(
+            reopened.load_summary(&b.job_id).unwrap().status,
+            JobStatus::Created
+        );
+        assert!(!request.input.path.exists());
+        assert!(!request.output.path.exists());
+        assert!(!pipeline.destination_partial.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn goal1b_managed_work_symlink_is_quarantined_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace must be created");
+        let sources = tempfile::tempdir().expect("sources must be created");
+        let input = sources.path().join("input.png");
+        let external = sources.path().join("external.png");
+        rgb_png(&input, 2, 2, [1, 2, 3]);
+        rgb_png(&external, 2, 2, [9, 9, 9]);
+        let expected = fs::read(&external).unwrap();
+        let store = WorkspaceStore::new(workspace.path()).expect("store must open");
+        let created = store
+            .create_image_job_v2(
+                &input,
+                goal1b_settings(ProductOutputFormat::Png),
+                ImageBackend::OrtCpu,
+                None,
+            )
+            .unwrap();
+        let inference = workspace
+            .path()
+            .join(&created.job_id)
+            .join("work/inference-rgb.png");
+        fs::remove_file(&inference).unwrap();
+        symlink(&external, &inference).unwrap();
+        drop(store);
+
+        let reopened = WorkspaceStore::new(workspace.path()).expect("startup must continue");
+        assert!(reopened.list_jobs().unwrap().is_empty());
+        assert_eq!(fs::read(external).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn goal1b_destination_directory_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace must be created");
+        let sources = tempfile::tempdir().expect("sources must be created");
+        let outside = tempfile::tempdir().expect("outside must be created");
+        let input = sources.path().join("input.png");
+        rgb_png(&input, 2, 2, [1, 2, 3]);
+        symlink(outside.path(), sources.path().join("Upscaled"))
+            .expect("destination symlink must create");
+        let store = WorkspaceStore::new(workspace.path()).expect("store must open");
+
+        assert!(matches!(
+            store.create_image_job_v2(
+                &input,
+                goal1b_settings(ProductOutputFormat::Png),
+                ImageBackend::OrtCpu,
+                None,
+            ),
+            Err(WorkspaceError::UnsafeRunnerRequest)
+        ));
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
     }
 }

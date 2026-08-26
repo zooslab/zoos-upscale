@@ -11,8 +11,9 @@ use zoos_runner_protocol::{
 };
 
 use crate::domain::{
-    ExecutionRequest, ImageBackend, ImageOutputFormat, ImagePreset, ImageSettings, JobErrorView,
-    JobKind, JobStatus, JobSummary, MetadataPolicy, StoredRunnerRequest,
+    ExecutionRequest, ImageBackend, ImageBatchMetadata, ImageOutputFormat, ImagePreset,
+    ImageSettings, JobErrorView, JobKind, JobStatus, JobSummary, MetadataPolicy,
+    StoredRunnerRequest,
 };
 use crate::process::{
     BackendError, ExecutionBackend, ProcessExecutionBackend, RunnerLaunchSpec, RunnerRegistry,
@@ -85,6 +86,21 @@ impl JobOrchestrator {
                 output_format: ImageOutputFormat::Png,
                 metadata: MetadataPolicy::Preserve,
             },
+        )?)
+    }
+
+    pub fn create_image_job_v2(
+        &self,
+        input_path: impl AsRef<Path>,
+        settings: ImageSettings,
+        selected_backend: ImageBackend,
+        batch: Option<ImageBatchMetadata>,
+    ) -> Result<JobSummary, OrchestratorError> {
+        Ok(self.inner.store.create_image_job_v2(
+            input_path.as_ref(),
+            settings,
+            selected_backend,
+            batch,
         )?)
     }
 
@@ -338,16 +354,23 @@ impl JobOrchestrator {
         error: &WorkspaceError,
         started_at_ms: u64,
     ) -> Result<(), WorkspaceError> {
-        let WorkspaceError::Image(image_error) = error else {
-            return self.finish_with_internal_error_locked(
-                job_id,
-                error.to_string(),
-                started_at_ms,
-            );
+        let (code, message) = match error {
+            WorkspaceError::Image(image_error) => {
+                (image_error.code().to_owned(), image_error.to_string())
+            }
+            WorkspaceError::Pipeline(image_error) => (
+                goal1b_image_error_code(image_error).to_owned(),
+                image_error.to_string(),
+            ),
+            _ => {
+                return self.finish_with_internal_error_locked(
+                    job_id,
+                    error.to_string(),
+                    started_at_ms,
+                );
+            }
         };
         let cleanup = self.inner.store.cleanup_unverified_output(job_id);
-        let code = image_error.code().to_owned();
-        let message = image_error.to_string();
         let progress = self.inner.store.update_summary(job_id, |summary| {
             summary.status = JobStatus::Failed;
             summary.stage = None;
@@ -356,7 +379,7 @@ impl JobOrchestrator {
         });
         let manifest = self.inner.store.finish_manifest(
             job_id,
-            &format!("image_error: {image_error}"),
+            &format!("image_error: {error}"),
             None,
             started_at_ms,
         );
@@ -469,6 +492,28 @@ impl JobOrchestrator {
     }
 }
 
+fn goal1b_image_error_code(error: &crate::Goal1bImageError) -> &'static str {
+    match error {
+        crate::Goal1bImageError::ImageTooLarge => "OUTPUT_TOO_LARGE",
+        crate::Goal1bImageError::InvalidRunnerOutput
+        | crate::Goal1bImageError::InvalidAlpha
+        | crate::Goal1bImageError::Encode
+        | crate::Goal1bImageError::InvalidOutput
+        | crate::Goal1bImageError::MetadataMismatch
+        | crate::Goal1bImageError::Io(_) => "UPSTREAM_FAILED",
+        crate::Goal1bImageError::InvalidInput
+        | crate::Goal1bImageError::InputTooLarge
+        | crate::Goal1bImageError::UnsupportedFormat
+        | crate::Goal1bImageError::UnsupportedImageMode
+        | crate::Goal1bImageError::Decode
+        | crate::Goal1bImageError::InvalidExif
+        | crate::Goal1bImageError::InvalidMetadata
+        | crate::Goal1bImageError::MetadataTooLarge
+        | crate::Goal1bImageError::UnsupportedScale
+        | crate::Goal1bImageError::AlphaJpegUnsupported => "UNSUPPORTED_IMAGE_MODE",
+    }
+}
+
 fn image_backend_error_code(error: &BackendError) -> &str {
     match error {
         BackendError::InvalidRunnerPath
@@ -532,12 +577,7 @@ fn validate_capabilities(
                     ImageDeviceV2::Vulkan { index } => (&["vulkan"], Some(index)),
                     ImageDeviceV2::Cpu => (&["cpu", "ort_cpu", "onnxruntime"], None),
                 };
-                (
-                    model_ids,
-                    request.parameters.requested_scale,
-                    backends,
-                    index,
-                )
+                (model_ids, request.parameters.native_scale, backends, index)
             }
             StoredRunnerRequest::Fake(_) => return Ok(()),
         };
@@ -705,6 +745,96 @@ mod tests {
             }),
             "GPU_UNAVAILABLE"
         );
+    }
+
+    #[test]
+    fn goal1b_public_create_api_selects_backend_and_batch_metadata() {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let input_directory = tempfile::tempdir().expect("input directory must be created");
+        let input = input_directory.path().join("input.png");
+        RgbImage::from_pixel(2, 3, Rgb([1, 2, 3]))
+            .save_with_format(&input, ImageFormat::Png)
+            .expect("input fixture must save");
+        let orchestrator = JobOrchestrator::new(
+            directory.path(),
+            directory.path().join("unused-runner"),
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+        )
+        .expect("orchestrator must be created");
+
+        let created = orchestrator
+            .create_image_job_v2(
+                &input,
+                ImageSettings {
+                    preset: ImagePreset::Anime,
+                    scale: 2,
+                    backend: ImageBackend::Auto,
+                    output_format: ImageOutputFormat::Webp,
+                    metadata: MetadataPolicy::Strip,
+                },
+                ImageBackend::OrtCpu,
+                Some(ImageBatchMetadata {
+                    batch_id: "batch-1".into(),
+                    index: 1,
+                    total: 2,
+                }),
+            )
+            .expect("Goal 1B job must create");
+
+        assert_eq!(created.selected_backend, Some(ImageBackend::OrtCpu));
+        assert_eq!(created.batch_id.as_deref(), Some("batch-1"));
+        assert_eq!(created.batch_index, Some(1));
+        assert_eq!(created.batch_total, Some(2));
+        assert_eq!(
+            created
+                .output_path
+                .as_deref()
+                .and_then(Path::extension)
+                .and_then(|value| value.to_str()),
+            Some("webp")
+        );
+        assert_eq!(
+            orchestrator
+                .inner
+                .store
+                .load_stored_job(&created.job_id)
+                .expect("job must load")
+                .runner_id,
+            "zoos-runner-ort"
+        );
+
+        let stored = orchestrator
+            .inner
+            .store
+            .load_stored_job(&created.job_id)
+            .expect("Goal 1B job must load");
+        let capabilities = RunnerCapabilities {
+            protocol_version: 1,
+            runner_id: "zoos-runner-ort".into(),
+            runner_version: "0.1.0".into(),
+            tasks: vec![RunnerTask::ImageUpscale],
+            upstream: Some(UpstreamInfo {
+                name: "ONNX Runtime".into(),
+                version: "test".into(),
+                source_commit: None,
+            }),
+            models: vec![ModelCapability {
+                id: "anime".into(),
+                scales: vec![4],
+            }],
+            scales: vec![4],
+            devices: vec![DeviceCapability {
+                index: 0,
+                name: "CPU".into(),
+                backend: "ort_cpu".into(),
+            }],
+            test_behaviors: Vec::new(),
+        };
+        let launch = RunnerLaunchSpec::new("zoos-runner-ort", directory.path().join("ort-runner"))
+            .expect("launch must validate");
+        validate_capabilities(&stored, &capabilities, &launch)
+            .expect("native x4 CPU capability must satisfy an x2 Goal 1B request");
     }
 
     #[tokio::test]

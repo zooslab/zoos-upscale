@@ -32,7 +32,7 @@ pub enum OutputEncoding {
     Webp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ImageMetadata {
     pub icc: Option<Vec<u8>>,
     /// TIFF bytes without an `Exif\0\0` container prefix.

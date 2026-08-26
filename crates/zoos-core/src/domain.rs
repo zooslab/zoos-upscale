@@ -48,6 +48,13 @@ pub enum MetadataPolicy {
 
 pub const JPEG_OUTPUT_QUALITY: u8 = 95;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageBatchMetadata {
+    pub batch_id: String,
+    pub index: u32,
+    pub total: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageSettings {
     pub preset: ImagePreset,
@@ -191,6 +198,18 @@ pub(crate) struct JobManifest {
     pub model_onnx_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intermediate_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icc_preserved: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exif_preserved: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha_preserved: Option<bool>,
 }
 
 #[derive(Debug, Clone)]

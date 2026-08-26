@@ -416,7 +416,7 @@ fn parse_exif_orientation(tiff: &[u8]) -> Result<Option<u16>, ImageSafetyError> 
 }
 
 #[cfg(target_os = "macos")]
-fn no_replace_rename(source: &Path, destination: &Path) -> Result<(), ImageSafetyError> {
+pub(crate) fn no_replace_rename(source: &Path, destination: &Path) -> Result<(), ImageSafetyError> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -446,7 +446,7 @@ fn no_replace_rename(source: &Path, destination: &Path) -> Result<(), ImageSafet
 }
 
 #[cfg(not(target_os = "macos"))]
-fn no_replace_rename(source: &Path, destination: &Path) -> Result<(), ImageSafetyError> {
+pub(crate) fn no_replace_rename(source: &Path, destination: &Path) -> Result<(), ImageSafetyError> {
     match fs::hard_link(source, destination) {
         Ok(()) => {
             if let Err(error) = fs::remove_file(source) {
@@ -480,7 +480,7 @@ fn remove_file_if_present(path: &Path) -> Result<(), ImageSafetyError> {
     }
 }
 
-fn sync_parent_directory(path: &Path) -> Result<(), ImageSafetyError> {
+pub(crate) fn sync_parent_directory(path: &Path) -> Result<(), ImageSafetyError> {
     File::open(path.parent().ok_or(ImageSafetyError::InvalidInputPath)?)?.sync_all()?;
     Ok(())
 }

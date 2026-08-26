@@ -6,8 +6,8 @@ mod process;
 mod workspace;
 
 pub use domain::{
-    ImageBackend, ImageOutputFormat, ImagePreset, ImageSettings, JPEG_OUTPUT_QUALITY, JobErrorView,
-    JobKind, JobStatus, JobSummary, MetadataPolicy,
+    ImageBackend, ImageBatchMetadata, ImageOutputFormat, ImagePreset, ImageSettings,
+    JPEG_OUTPUT_QUALITY, JobErrorView, JobKind, JobStatus, JobSummary, MetadataPolicy,
 };
 pub use image_pipeline::{
     Goal1bImageError, ImageMetadata, ImagePipelineLimits, MetadataPolicy as PipelineMetadataPolicy,
@@ -21,5 +21,5 @@ pub use image_safety::{
 };
 pub use orchestrator::{JobOrchestrator, OrchestratorError};
 pub use process::{BackendError, ProcessExecutionBackend, RunnerLaunchSpec, RunnerRegistry};
-pub use workspace::WorkspaceError;
+pub use workspace::{ImagePipelineVerification, WorkspaceError};
 pub use zoos_runner_protocol::FakeBehavior;

@@ -173,7 +173,7 @@ main {
 
 .upscale-card {
   display: flex;
-  min-height: 410px;
+  min-height: 560px;
   padding: 30px;
   border: 1px solid rgba(255, 255, 255, 0.11);
   border-radius: 22px;
@@ -257,6 +257,89 @@ main {
   gap: 8px;
   grid-template-columns: repeat(2, 1fr);
 }
+
+.segmented.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.settings-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.backend-status {
+  display: flex;
+  gap: 8px;
+}
+
+.backend-status span {
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: #ffb4b4;
+  font-size: 9px;
+}
+
+.backend-status span.ready {
+  border-color: rgba(139, 228, 187, 0.25);
+  color: var(--accent);
+}
+
+.field-help,
+.rejected-summary {
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.picker-actions {
+  display: grid;
+  gap: 9px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.select-folder {
+  min-height: 48px;
+  border: 1px solid rgba(139, 228, 187, 0.32);
+  border-radius: 12px;
+  color: var(--accent);
+  background: rgba(82, 201, 148, 0.07);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.select-folder:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.batch-panel {
+  padding: 15px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: rgba(0, 0, 0, 0.13);
+}
+
+.batch-heading,
+.batch-list > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.batch-heading strong { font-size: 12px; }
+.batch-heading span { color: var(--muted); font-size: 9px; }
+.batch-list { margin: 12px 0; border-top: 1px solid var(--line); }
+.batch-list > div { padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 10px; }
+.batch-list span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.batch-list b { flex: 0 0 auto; color: var(--accent); font-size: 9px; }
+.batch-list .failed b { color: #ffb4b4; }
+.rejected-summary { color: #ffc7c7; }
 
 .segmented button,
 .select-image {
@@ -757,6 +840,11 @@ footer {
 @media (max-width: 640px) {
   .app-shell {
     padding: 0 18px;
+  }
+
+  .settings-grid,
+  .picker-actions {
+    grid-template-columns: 1fr;
   }
 
   .topbar {

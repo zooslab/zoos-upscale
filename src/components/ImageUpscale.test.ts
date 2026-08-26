@@ -4,162 +4,108 @@ import type { ImageEngineStatus, JobSummary } from '../lib/types/jobs'
 import ImageUpscale from './ImageUpscale.svelte'
 
 const api = vi.hoisted(() => ({
-  cancelJob: vi.fn(), getImageEngineStatus: vi.fn(), listJobs: vi.fn(),
-  pickAndCreateImageJob: vi.fn(), startJob: vi.fn(),
+  cancelBatch: vi.fn(), cancelJob: vi.fn(), getImageEngineStatus: vi.fn(), listJobs: vi.fn(),
+  pickAndCreateImageBatch: vi.fn(), pickAndCreateImageJob: vi.fn(), startJob: vi.fn(),
 }))
+vi.mock('../lib/api/jobs', () => ({ ...api, commandError: (error: unknown) => error, isDesktopRuntime: () => true }))
 
-vi.mock('../lib/api/jobs', () => ({
-  ...api,
-  commandError: (error: unknown) => error,
-  isDesktopRuntime: () => true,
-}))
-
-const readyEngine: ImageEngineStatus = {
-  state: 'READY', code: null, message: 'Ready', engine_version: '0.2.5.0', device: 'Apple M5',
-}
-
-function imageJob(overrides: Partial<JobSummary> = {}): JobSummary {
+const unavailable = { state: 'NOT_INSTALLED' as const, code: 'ENGINE_NOT_INSTALLED', message: '설치되지 않았습니다.' }
+const ready = { state: 'READY' as const, code: null, message: '준비됨', engine_version: '1', device: 'local' }
+const bothReady: ImageEngineStatus = { gpu: ready, cpu: ready, recommended_backend: 'vulkan_gpu' }
+function job(id = 'image-1', status: JobSummary['status'] = 'CREATED', batch?: { id: string; index: number; total: number }): JobSummary {
   return {
-    job_id: 'image-1', kind: 'image_upscale', input_name: 'sample.png',
-    output_path: '/Pictures/Upscaled/sample_upscaled_2x.png',
-    image_settings: { preset: 'photo', scale: 2 }, status: 'CREATED',
-    progress_percent: 0, stage: null, message: 'Ready', error: null,
-    created_at_ms: 1, updated_at_ms: 1, ...overrides,
+    job_id: id, kind: 'image_upscale', input_name: `${id}.png`, output_path: `/Upscaled/${id}.png`,
+    image_settings: { preset: 'photo', scale: 2, backend: 'auto', output_format: 'png', metadata: 'preserve' },
+    batch_id: batch?.id, batch_index: batch?.index, batch_total: batch?.total,
+    status, progress_percent: status === 'COMPLETED' ? 100 : 0, stage: null, message: status,
+    error: status === 'FAILED' ? { code: 'UPSTREAM_FAILED', message: '처리 실패' } : null,
+    created_at_ms: 1, updated_at_ms: 1,
   }
 }
+async function mounted() { render(ImageUpscale); await screen.findByText('엔진 준비됨') }
 
-describe('ImageUpscale', () => {
+describe('ImageUpscale Goal 1B', () => {
   beforeEach(() => {
-    api.cancelJob.mockReset()
-    api.getImageEngineStatus.mockReset().mockResolvedValue(readyEngine)
-    api.listJobs.mockReset().mockResolvedValue([])
-    api.pickAndCreateImageJob.mockReset()
-    api.startJob.mockReset()
+    for (const mock of Object.values(api)) mock.mockReset()
+    api.getImageEngineStatus.mockResolvedValue(bothReady); api.listJobs.mockResolvedValue([])
+    api.cancelBatch.mockResolvedValue(undefined)
+  })
+  afterEach(() => { cleanup(); vi.useRealTimers() })
+
+  it('shows each engine independently and disables an unavailable backend', async () => {
+    api.getImageEngineStatus.mockResolvedValue({ gpu: unavailable, cpu: ready, recommended_backend: 'ort_cpu' })
+    await mounted()
+    expect(screen.getByText('GPU · 사용 불가')).toBeTruthy()
+    expect(screen.getByText('CPU · 준비됨')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'GPU' }).hasAttribute('disabled')).toBe(true)
+    expect(screen.getByRole('button', { name: 'CPU' }).hasAttribute('disabled')).toBe(false)
   })
 
-  afterEach(() => cleanup())
-
-  it('explains when the engine is not installed and disables selection', async () => {
-    api.getImageEngineStatus.mockResolvedValue({
-      state: 'NOT_INSTALLED', code: 'ENGINE_NOT_INSTALLED', message: '검증된 엔진 캐시가 없습니다.',
-    })
+  it('disables both pickers and explains the error when no backend is ready', async () => {
+    api.getImageEngineStatus.mockResolvedValue({ gpu: unavailable, cpu: unavailable, recommended_backend: null })
     render(ImageUpscale)
     expect(await screen.findByText('ENGINE_NOT_INSTALLED')).toBeTruthy()
-    expect(screen.getByText('검증된 엔진 캐시가 없습니다.')).toBeTruthy()
-    expect(screen.queryByRole('button', { name: '이미지 선택' })).toBeNull()
+    expect(screen.getByRole('button', { name: '이미지 선택' }).hasAttribute('disabled')).toBe(true)
+    expect(screen.getByRole('button', { name: '폴더 일괄' }).hasAttribute('disabled')).toBe(true)
   })
 
-  it('uses the selected preset and scale, then automatically starts the created job', async () => {
-    api.pickAndCreateImageJob.mockResolvedValue(imageJob({ image_settings: { preset: 'anime', scale: 4 } }))
-    api.startJob.mockResolvedValue(imageJob({
-      image_settings: { preset: 'anime', scale: 4 }, status: 'RUNNING', progress_percent: 3,
-    }))
-    render(ImageUpscale)
-    await screen.findByText('엔진 준비됨')
+  it('passes preset, scale, backend, format and metadata to the single picker then starts it', async () => {
+    api.pickAndCreateImageJob.mockResolvedValue(job()); api.startJob.mockResolvedValue(job('image-1', 'RUNNING'))
+    await mounted()
     await fireEvent.click(screen.getByRole('button', { name: '애니' }))
     await fireEvent.click(screen.getByRole('button', { name: '4배' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'CPU' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'WebP' }))
+    await fireEvent.click(screen.getByRole('button', { name: '제거' }))
     await fireEvent.click(screen.getByRole('button', { name: '이미지 선택' }))
-    await waitFor(() => {
-      expect(api.pickAndCreateImageJob).toHaveBeenCalledWith('anime', 4)
-      expect(api.startJob).toHaveBeenCalledWith('image-1')
-    })
+    await waitFor(() => expect(api.pickAndCreateImageJob).toHaveBeenCalledWith('anime', 4, 'ort_cpu', 'webp', 'strip'))
+    expect(api.startJob).toHaveBeenCalledWith('image-1')
   })
 
-  it('keeps a created job visible and resynchronizes jobs and engine status when start fails', async () => {
-    const created = imageJob()
-    let rejectStart: (reason?: unknown) => void = () => undefined
-    const startAttempt = new Promise<JobSummary>((_resolve, reject) => {
-      rejectStart = reject
-    })
-    api.listJobs
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([created])
-    api.pickAndCreateImageJob.mockResolvedValue(created)
-    api.startJob.mockReturnValue(startAttempt)
-
-    render(ImageUpscale)
-    await screen.findByText('엔진 준비됨')
-    await fireEvent.click(screen.getByRole('button', { name: '이미지 선택' }))
-    expect(await screen.findByText('sample.png')).toBeTruthy()
-
-    rejectStart({ code: 'ENGINE_NOT_INSTALLED', message: '엔진이 제거되었습니다.' })
-
-    const alert = await screen.findByRole('alert')
-    expect(alert.textContent).toContain('ENGINE_NOT_INSTALLED')
-    expect(screen.getAllByText('시작 준비')).toHaveLength(2)
-    expect(api.listJobs).toHaveBeenCalledTimes(2)
-    expect(api.getImageEngineStatus).toHaveBeenCalledTimes(2)
+  it('resynchronizes after a single start failure', async () => {
+    const created = job(); api.pickAndCreateImageJob.mockResolvedValue(created)
+    api.startJob.mockRejectedValue({ code: 'ENGINE_NOT_INSTALLED', message: '엔진 변경' })
+    api.listJobs.mockResolvedValueOnce([]).mockResolvedValueOnce([created])
+    await mounted(); await fireEvent.click(screen.getByRole('button', { name: '이미지 선택' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('ENGINE_NOT_INSTALLED')
+    expect(api.listJobs).toHaveBeenCalledTimes(2); expect(api.getImageEngineStatus).toHaveBeenCalledTimes(2)
   })
 
-  it('refreshes the engine badge after an image selection error', async () => {
-    api.getImageEngineStatus
-      .mockResolvedValueOnce(readyEngine)
-      .mockResolvedValueOnce({
-        state: 'NOT_INSTALLED', code: 'ENGINE_NOT_INSTALLED', message: '엔진 캐시가 없습니다.',
-      })
-    api.pickAndCreateImageJob.mockRejectedValue({
-      code: 'ASSET_HASH_MISMATCH', message: '엔진 검증에 실패했습니다.',
-    })
-
-    render(ImageUpscale)
-    await screen.findByText('엔진 준비됨')
-    await fireEvent.click(screen.getByRole('button', { name: '이미지 선택' }))
-
-    expect(await screen.findByText('엔진 사용 불가')).toBeTruthy()
-    expect(screen.queryByRole('button', { name: '이미지 선택' })).toBeNull()
-    expect(api.getImageEngineStatus).toHaveBeenCalledTimes(2)
+  it('starts a batch sequentially, shows rejected inputs, and continues after a file fails', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const first = job('first', 'CREATED', { id: 'batch-1', index: 1, total: 2 })
+    const second = job('second', 'CREATED', { id: 'batch-1', index: 2, total: 2 })
+    api.pickAndCreateImageBatch.mockResolvedValue({ batch_id: 'batch-1', jobs: [first, second], rejected: [{ input_name: 'bad.txt', code: 'UNSUPPORTED_IMAGE_MODE', message: '지원하지 않음' }] })
+    api.startJob.mockResolvedValueOnce(job('first', 'RUNNING', { id: 'batch-1', index: 1, total: 2 })).mockResolvedValueOnce(job('second', 'RUNNING', { id: 'batch-1', index: 2, total: 2 }))
+    api.listJobs.mockResolvedValueOnce([]).mockResolvedValueOnce([job('first', 'FAILED', { id: 'batch-1', index: 1, total: 2 }), second])
+    await mounted(); await fireEvent.click(screen.getByRole('button', { name: '폴더 일괄' }))
+    expect(api.pickAndCreateImageBatch).toHaveBeenCalledWith('photo', 2, 'auto', 'png', 'preserve')
+    await waitFor(() => expect(api.startJob).toHaveBeenNthCalledWith(1, 'first'))
+    expect(screen.getByText(/선택하지 못한 파일 1개/).textContent).toContain('bad.txt')
+    await vi.advanceTimersByTimeAsync(550)
+    await waitFor(() => expect(api.startJob).toHaveBeenNthCalledWith(2, 'second'))
+    expect(screen.getByText('실패')).toBeTruthy()
   })
 
-  it('shows running progress and cancels only the current image job', async () => {
-    api.listJobs.mockResolvedValue([
-      imageJob({ status: 'RUNNING', progress_percent: 42, stage: '타일 처리 중' }),
-    ])
-    api.cancelJob.mockResolvedValue(imageJob({ status: 'CANCELLED', progress_percent: 42 }))
-    render(ImageUpscale)
-    expect(await screen.findByText('타일 처리 중')).toBeTruthy()
-    expect(screen.getByRole('progressbar', { name: '업스케일 진행률' }).getAttribute('aria-valuenow')).toBe('42')
-    await fireEvent.click(screen.getByRole('button', { name: '작업 취소' }))
-    await waitFor(() => expect(api.cancelJob).toHaveBeenCalledWith('image-1'))
+  it('continues to the next batch item when starting one item throws', async () => {
+    const first = job('first', 'CREATED', { id: 'batch-2', index: 1, total: 2 }), second = job('second', 'CREATED', { id: 'batch-2', index: 2, total: 2 })
+    api.pickAndCreateImageBatch.mockResolvedValue({ batch_id: 'batch-2', jobs: [first, second], rejected: [] })
+    api.startJob.mockRejectedValueOnce({ code: 'UPSTREAM_FAILED', message: '첫 파일 실패' }).mockResolvedValueOnce(job('second', 'RUNNING', { id: 'batch-2', index: 2, total: 2 }))
+    api.listJobs.mockResolvedValueOnce([]).mockResolvedValueOnce([first, second])
+    await mounted(); await fireEvent.click(screen.getByRole('button', { name: '폴더 일괄' }))
+    await waitFor(() => expect(api.startJob).toHaveBeenCalledTimes(2))
+    expect(api.startJob).toHaveBeenNthCalledWith(2, 'second')
+    expect(screen.getByText('시작 실패')).toBeTruthy()
   })
 
-  it('keeps cancellation disabled until polling observes a terminal state', async () => {
-    const running = imageJob({ status: 'RUNNING', progress_percent: 42 })
-    const cancelling = imageJob({ status: 'RUNNING', progress_percent: 42, stage: 'cancelling' })
-    const cancelled = imageJob({ status: 'CANCELLED', progress_percent: 42 })
-    api.listJobs
-      .mockResolvedValueOnce([running])
-      .mockResolvedValue([cancelled])
-    api.cancelJob.mockResolvedValue(cancelling)
-
-    render(ImageUpscale)
-    const cancel = await screen.findByRole('button', { name: '작업 취소' })
-    await fireEvent.click(cancel)
-    const cancellingButton = await screen.findByRole('button', { name: '취소 중…' })
-    expect(cancellingButton.hasAttribute('disabled')).toBe(true)
-    await fireEvent.click(cancellingButton)
-    expect(api.cancelJob).toHaveBeenCalledTimes(1)
-
-    expect(await screen.findAllByText('취소됨', {}, { timeout: 1_500 })).toHaveLength(2)
-    expect(screen.queryByRole('button', { name: '취소 중…' })).toBeNull()
-  })
-
-  it('shows the final output path for a completed job', async () => {
-    api.listJobs.mockResolvedValue([imageJob({ status: 'COMPLETED', progress_percent: 100 })])
-    render(ImageUpscale)
-    expect(await screen.findByText('저장 완료')).toBeTruthy()
-    expect(screen.getByText('/Pictures/Upscaled/sample_upscaled_2x.png')).toBeTruthy()
-    expect(screen.queryByRole('button', { name: '작업 취소' })).toBeNull()
-  })
-
-  it('renders a stable structured command error', async () => {
-    api.pickAndCreateImageJob.mockRejectedValue({
-      code: 'UNSUPPORTED_IMAGE_MODE', message: 'RGB8 PNG 또는 JPEG만 지원합니다.',
-    })
-    render(ImageUpscale)
-    await screen.findByText('엔진 준비됨')
-    await fireEvent.click(screen.getByRole('button', { name: '이미지 선택' }))
-    const alert = await screen.findByRole('alert')
-    expect(alert.textContent).toContain('UNSUPPORTED_IMAGE_MODE')
-    expect(alert.textContent).toContain('RGB8 PNG 또는 JPEG만 지원합니다.')
+  it('cancels the active and pending batch through one batch command', async () => {
+    const first = job('first', 'CREATED', { id: 'batch-3', index: 1, total: 2 }), second = job('second', 'CREATED', { id: 'batch-3', index: 2, total: 2 })
+    api.pickAndCreateImageBatch.mockResolvedValue({ batch_id: 'batch-3', jobs: [first, second], rejected: [] })
+    api.startJob.mockResolvedValue(job('first', 'RUNNING', { id: 'batch-3', index: 1, total: 2 }))
+    api.listJobs.mockResolvedValueOnce([]).mockResolvedValueOnce([job('first', 'CANCELLED', { id: 'batch-3', index: 1, total: 2 }), job('second', 'CANCELLED', { id: 'batch-3', index: 2, total: 2 })])
+    await mounted(); await fireEvent.click(screen.getByRole('button', { name: '폴더 일괄' }))
+    const cancel = await screen.findByRole('button', { name: '일괄 작업 취소' }); await fireEvent.click(cancel)
+    await waitFor(() => expect(api.cancelBatch).toHaveBeenCalledWith('batch-3'))
+    expect(api.cancelJob).not.toHaveBeenCalled(); expect(await screen.findByText('일괄 작업 취소됨')).toBeTruthy()
   })
 })

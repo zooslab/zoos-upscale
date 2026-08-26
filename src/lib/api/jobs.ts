@@ -1,11 +1,15 @@
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import type {
   FakeScenario,
+  ImageBackend,
+  ImageBatchCreation,
   ImageEngineStatus,
+  ImageOutputFormat,
   ImagePreset,
   ImageScale,
   JobErrorView,
   JobSummary,
+  MetadataPolicy,
 } from '../types/jobs'
 
 export function isDesktopRuntime(): boolean {
@@ -23,8 +27,37 @@ export function getImageEngineStatus(): Promise<ImageEngineStatus> {
 export function pickAndCreateImageJob(
   preset: ImagePreset,
   scale: ImageScale,
+  backend: ImageBackend,
+  outputFormat: ImageOutputFormat,
+  metadata: MetadataPolicy,
 ): Promise<JobSummary | null> {
-  return invoke<JobSummary | null>('pick_and_create_image_job', { preset, scale })
+  return invoke<JobSummary | null>('pick_and_create_image_job', {
+    preset,
+    scale,
+    backend,
+    outputFormat,
+    metadata,
+  })
+}
+
+export function pickAndCreateImageBatch(
+  preset: ImagePreset,
+  scale: ImageScale,
+  backend: ImageBackend,
+  outputFormat: ImageOutputFormat,
+  metadata: MetadataPolicy,
+): Promise<ImageBatchCreation | null> {
+  return invoke<ImageBatchCreation | null>('pick_and_create_image_batch', {
+    preset,
+    scale,
+    backend,
+    outputFormat,
+    metadata,
+  })
+}
+
+export function cancelBatch(batchId: string): Promise<void> {
+  return invoke<void>('cancel_batch', { batchId })
 }
 
 export function listJobs(): Promise<JobSummary[]> {

@@ -10,10 +10,17 @@ export type FakeScenario =
 export type JobKind = 'fake_validation' | 'image_upscale'
 export type ImagePreset = 'photo' | 'anime'
 export type ImageScale = 2 | 4
+export type ImageBackend = 'auto' | 'vulkan_gpu' | 'ort_cpu'
+export type ConcreteImageBackend = Exclude<ImageBackend, 'auto'>
+export type ImageOutputFormat = 'png' | 'jpeg' | 'webp'
+export type MetadataPolicy = 'preserve' | 'strip'
 
 export interface ImageSettings {
   preset: ImagePreset
   scale: ImageScale
+  backend: ImageBackend
+  output_format: ImageOutputFormat
+  metadata: MetadataPolicy
 }
 
 export type JobStatus =
@@ -38,6 +45,10 @@ export interface JobSummary {
   input_name?: string
   output_path?: string
   image_settings?: ImageSettings
+  batch_id?: string
+  batch_index?: number
+  batch_total?: number
+  selected_backend?: ConcreteImageBackend
   scenario?: FakeScenario
   status: JobStatus
   progress_percent: number
@@ -50,12 +61,30 @@ export interface JobSummary {
 
 export type ImageEngineState = 'READY' | 'NOT_INSTALLED' | 'INVALID'
 
-export interface ImageEngineStatus {
+export interface ImageBackendStatus {
   state: ImageEngineState
   code: string | null
   message: string
   engine_version?: string
   device?: string
+}
+
+export interface ImageEngineStatus {
+  gpu: ImageBackendStatus
+  cpu: ImageBackendStatus
+  recommended_backend: ConcreteImageBackend | null
+}
+
+export interface BatchRejectedInput {
+  input_name: string
+  code: string
+  message: string
+}
+
+export interface ImageBatchCreation {
+  batch_id: string
+  jobs: JobSummary[]
+  rejected: BatchRejectedInput[]
 }
 
 export const activeStatuses = new Set<JobStatus>([

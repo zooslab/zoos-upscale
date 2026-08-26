@@ -4,7 +4,12 @@ const tauri = vi.hoisted(() => ({ invoke: vi.fn(), isTauri: vi.fn(() => true) })
 
 vi.mock('@tauri-apps/api/core', () => tauri)
 
-import { commandError, pickAndCreateImageJob } from './jobs'
+import {
+  cancelBatch,
+  commandError,
+  pickAndCreateImageBatch,
+  pickAndCreateImageJob,
+} from './jobs'
 
 describe('image job API', () => {
   beforeEach(() => tauri.invoke.mockReset())
@@ -12,11 +17,28 @@ describe('image job API', () => {
   it('uses camelCase invoke arguments for the native picker command', async () => {
     tauri.invoke.mockResolvedValue(null)
 
-    await expect(pickAndCreateImageJob('anime', 4)).resolves.toBeNull()
+    await expect(
+      pickAndCreateImageJob('anime', 4, 'ort_cpu', 'webp', 'strip'),
+    ).resolves.toBeNull()
     expect(tauri.invoke).toHaveBeenCalledWith('pick_and_create_image_job', {
       preset: 'anime',
       scale: 4,
+      backend: 'ort_cpu',
+      outputFormat: 'webp',
+      metadata: 'strip',
     })
+  })
+
+  it('passes all processing options to batch selection and uses the batch id for cancel', async () => {
+    tauri.invoke.mockResolvedValueOnce(null).mockResolvedValueOnce(undefined)
+
+    await pickAndCreateImageBatch('photo', 2, 'auto', 'jpeg', 'preserve')
+    expect(tauri.invoke).toHaveBeenNthCalledWith(1, 'pick_and_create_image_batch', {
+      preset: 'photo', scale: 2, backend: 'auto', outputFormat: 'jpeg', metadata: 'preserve',
+    })
+
+    await cancelBatch('batch-7')
+    expect(tauri.invoke).toHaveBeenNthCalledWith(2, 'cancel_batch', { batchId: 'batch-7' })
   })
 
   it('preserves structured command errors and parses serialized errors', () => {

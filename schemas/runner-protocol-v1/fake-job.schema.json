@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zoos-upscale.local/schemas/runner-protocol-v1/fake-job.schema.json",
+  "title": "Zoos Upscale Fake Runner Job",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "job_id",
+    "task",
+    "input",
+    "output",
+    "parameters",
+    "test_behavior"
+  ],
+  "properties": {
+    "protocol_version": { "const": 1 },
+    "job_id": { "type": "string", "minLength": 1 },
+    "task": { "const": "fake" },
+    "input": { "$ref": "#/$defs/pathObject" },
+    "output": { "$ref": "#/$defs/pathObject" },
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["steps", "step_delay_ms"],
+      "properties": {
+        "steps": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "step_delay_ms": { "type": "integer", "minimum": 0, "maximum": 60000 }
+      }
+    },
+    "test_behavior": {
+      "enum": [
+        "success",
+        "failed",
+        "malformed_ndjson",
+        "crash",
+        "hang",
+        "completed_then_nonzero",
+        "spawn_grandchild_and_hang"
+      ]
+    }
+  },
+  "$defs": {
+    "pathObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

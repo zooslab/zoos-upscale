@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "sidecars": [
+    {
+      "id": "zoos-runner-fake",
+      "version": "0.1.0",
+      "kind": "development-test-runner",
+      "source": "crates/zoos-runner-fake",
+      "license": "Apache-2.0",
+      "bundled_in_release": false
+    }
+  ]
+}

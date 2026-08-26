@@ -1,4 +1,5 @@
 mod domain;
+mod image_pipeline;
 mod image_safety;
 mod orchestrator;
 mod process;
@@ -7,6 +8,11 @@ mod workspace;
 pub use domain::{
     ImageBackend, ImageOutputFormat, ImagePreset, ImageSettings, JPEG_OUTPUT_QUALITY, JobErrorView,
     JobKind, JobStatus, JobSummary, MetadataPolicy,
+};
+pub use image_pipeline::{
+    Goal1bImageError, ImageMetadata, ImagePipelineLimits, MetadataPolicy as PipelineMetadataPolicy,
+    OutputEncoding, PreparedImage, VerifiedPipelineOutput, prepare_image_input,
+    render_pipeline_output, verify_pipeline_output,
 };
 pub use image_safety::{
     ImageOutputPlan, ImageSafetyError, ImageVerification, ValidatedImageInput,

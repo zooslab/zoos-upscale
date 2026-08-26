@@ -10,6 +10,8 @@ publish = false
 [dependencies]
 async-trait.workspace = true
 atomic-write-file.workspace = true
+crc32fast.workspace = true
+flate2.workspace = true
 fs4.workspace = true
 image.workspace = true
 libc.workspace = true

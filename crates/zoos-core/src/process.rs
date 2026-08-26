@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -48,6 +49,7 @@ impl ProcessExecutionBackend {
 pub struct RunnerLaunchSpec {
     pub runner_id: String,
     pub executable: PathBuf,
+    pub arguments: Vec<OsString>,
 }
 
 impl RunnerLaunchSpec {
@@ -59,7 +61,19 @@ impl RunnerLaunchSpec {
         Ok(Self {
             runner_id,
             executable,
+            arguments: Vec::new(),
         })
+    }
+
+    pub fn with_arguments(
+        mut self,
+        arguments: impl IntoIterator<Item = OsString>,
+    ) -> Result<Self, BackendError> {
+        self.arguments = arguments.into_iter().collect();
+        if self.arguments.iter().any(|argument| argument.is_empty()) {
+            return Err(BackendError::InvalidRunnerPath);
+        }
+        Ok(self)
     }
 }
 
@@ -91,19 +105,66 @@ impl ExecutionBackend for ProcessExecutionBackend {
     async fn probe(&self, launch: &RunnerLaunchSpec) -> Result<RunnerCapabilities, BackendError> {
         let mut command = Command::new(&launch.executable);
         command
+            .args(&launch.arguments)
             .args(["--capabilities", "--json"])
             .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let output = timeout(self.activity_timeout, command.output())
-            .await
-            .map_err(|_| BackendError::RunnerTimedOut)?
+        configure_process_group(&mut command);
+        let mut child = command
+            .spawn()
             .map_err(|error| BackendError::SpawnFailed(error.to_string()))?;
-        if !output.status.success() {
-            return Err(BackendError::ProbeFailed(
-                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            ));
+        let child_id = child.id();
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| BackendError::SpawnFailed("probe stdout was not piped".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| BackendError::SpawnFailed("probe stderr was not piped".into()))?;
+        let stdout_task = tokio::spawn(read_bounded_stream(stdout));
+        let stderr_task = tokio::spawn(read_bounded_stream(stderr));
+        let status = match timeout(self.activity_timeout, child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => return Err(BackendError::SpawnFailed(error.to_string())),
+            Err(_) => {
+                terminate_process_tree(&mut child, child_id, self.termination_grace).await;
+                return Err(BackendError::RunnerTimedOut);
+            }
+        };
+        let stdout = match collect_probe_stream(stdout_task, self.termination_grace).await {
+            Ok(stdout) => stdout,
+            Err(error) => {
+                terminate_process_tree(&mut child, child_id, self.termination_grace).await;
+                return Err(error);
+            }
+        };
+        let stderr = match collect_probe_stream(stderr_task, self.termination_grace).await {
+            Ok(stderr) => stderr,
+            Err(error) => {
+                terminate_process_tree(&mut child, child_id, self.termination_grace).await;
+                return Err(error);
+            }
+        };
+        if !status.success() {
+            let message = String::from_utf8_lossy(&stderr).trim().to_owned();
+            for code in ["ENGINE_NOT_INSTALLED", "ASSET_HASH_MISMATCH"] {
+                if let Some(detail) = message
+                    .strip_prefix(code)
+                    .and_then(|value| value.strip_prefix(':'))
+                {
+                    return Err(BackendError::RunnerFailed {
+                        error_code: code.into(),
+                        message: detail.trim().to_owned(),
+                        exit_code: status.code(),
+                    });
+                }
+            }
+            return Err(BackendError::ProbeFailed(message));
         }
-        let capabilities: RunnerCapabilities = serde_json::from_slice(&output.stdout)
+        let capabilities: RunnerCapabilities = serde_json::from_slice(&stdout)
             .map_err(|error| BackendError::ProbeFailed(error.to_string()))?;
         capabilities
             .validate()
@@ -130,6 +191,7 @@ impl ExecutionBackend for ProcessExecutionBackend {
 
         let mut command = Command::new(&launch.executable);
         command
+            .args(&launch.arguments)
             .args(["run", "--job"])
             .arg(&request.runner_job_path)
             .stdin(Stdio::null())
@@ -441,6 +503,40 @@ where
     }
 }
 
+async fn read_bounded_stream<R>(reader: R) -> Result<Vec<u8>, BackendError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_STDERR_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(BackendError::Io)?;
+    if bytes.len() > MAX_STDERR_BYTES as usize {
+        return Err(BackendError::ProbeFailed(
+            "runner probe output exceeded 64 KiB".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+async fn collect_probe_stream(
+    mut task: tokio::task::JoinHandle<Result<Vec<u8>, BackendError>>,
+    grace: Duration,
+) -> Result<Vec<u8>, BackendError> {
+    match timeout(grace, &mut task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(BackendError::ProbeFailed(error.to_string())),
+        Err(_) => {
+            task.abort();
+            Err(BackendError::ProbeFailed(
+                "runner probe output did not close".into(),
+            ))
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ReadEventError {
     TooLong,
@@ -564,7 +660,7 @@ pub enum BackendError {
 }
 
 impl BackendError {
-    pub(crate) fn code(&self) -> &'static str {
+    pub(crate) fn code(&self) -> &str {
         match self {
             Self::InvalidRunnerPath | Self::RunnerNotRegistered(_) | Self::SpawnFailed(_) => {
                 "SPAWN_FAILED"
@@ -572,7 +668,7 @@ impl BackendError {
             Self::ProbeFailed(_) => "CAPABILITY_PROBE_FAILED",
             Self::ProtocolViolation(_) => "PROTOCOL_VIOLATION",
             Self::RunnerCrashed { .. } => "RUNNER_CRASHED",
-            Self::RunnerFailed { .. } => "RUNNER_FAILED",
+            Self::RunnerFailed { error_code, .. } => error_code,
             Self::RunnerTimedOut => "RUNNER_TIMED_OUT",
             Self::Cancelled => "CANCELLED",
             Self::OutputVerificationFailed(_) => "OUTPUT_VERIFICATION_FAILED",
@@ -635,5 +731,15 @@ mod tests {
 
         assert!(matches!(result, Err(ReadEventError::TooLong)));
         writer_task.await.expect("writer task must finish");
+    }
+
+    #[test]
+    fn runner_failure_preserves_the_protocol_error_code() {
+        let error = BackendError::RunnerFailed {
+            error_code: "GPU_UNAVAILABLE".into(),
+            message: "no Vulkan device".into(),
+            exit_code: Some(30),
+        };
+        assert_eq!(error.code(), "GPU_UNAVAILABLE");
     }
 }

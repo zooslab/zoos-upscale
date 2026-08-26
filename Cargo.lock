@@ -5116,6 +5116,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zoos-runner-realesrgan"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "zoos-runner-protocol",
+]
+
+[[package]]
 name = "zoos-upscale-app"
 version = "0.1.0"
 dependencies = [

@@ -4,6 +4,9 @@
     "beforeDevCommand": "pnpm sidecar:prepare && pnpm dev"
   },
   "bundle": {
-    "externalBin": ["binaries/zoos-runner-fake"]
+    "externalBin": [
+      "binaries/zoos-runner-fake",
+      "binaries/zoos-runner-realesrgan"
+    ]
   }
 }

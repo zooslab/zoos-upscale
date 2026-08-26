@@ -70,7 +70,7 @@ async fn explicit_failure_is_structured_and_has_no_output() {
     let (directory, _, job) = run_scenario(FakeBehavior::Failed, Duration::from_secs(1)).await;
 
     assert_eq!(job.status, JobStatus::Failed);
-    assert_eq!(job.error.expect("error must exist").code, "RUNNER_FAILED");
+    assert_eq!(job.error.expect("error must exist").code, "FAKE_FAILURE");
     assert!(
         !directory
             .path()

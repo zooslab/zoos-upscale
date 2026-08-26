@@ -75,24 +75,13 @@ impl JobOrchestrator {
 
         self.inner.runners.resolve(stored.progress.summary.kind)?;
 
-        let progress_guard = self.inner.progress_updates.lock().await;
-        self.inner.store.update_summary(job_id, |summary| {
+        let _progress_guard = self.inner.progress_updates.lock().await;
+        let probing = self.inner.store.update_summary(job_id, |summary| {
             summary.status = JobStatus::Probing;
             summary.stage = Some("probe".into());
             summary.message = "Checking the local validation engine".into();
             summary.error = None;
         })?;
-        self.inner.store.update_summary(job_id, |summary| {
-            summary.status = JobStatus::Planning;
-            summary.stage = Some("plan".into());
-            summary.message = "Preparing a safe execution plan".into();
-        })?;
-        let running = self.inner.store.update_summary(job_id, |summary| {
-            summary.status = JobStatus::Running;
-            summary.stage = Some("starting".into());
-            summary.message = "Starting the local validation engine".into();
-        })?;
-        drop(progress_guard);
 
         let (cancel_sender, cancel_receiver) = watch::channel(false);
         active_jobs.insert(job_id.to_owned(), cancel_sender.clone());
@@ -107,7 +96,7 @@ impl JobOrchestrator {
             orchestrator.inner.active_jobs.lock().await.remove(&job_id);
         });
 
-        Ok(running)
+        Ok(probing)
     }
 
     pub async fn cancel_job(&self, job_id: &str) -> Result<JobSummary, OrchestratorError> {
@@ -184,6 +173,34 @@ impl JobOrchestrator {
                 eprintln!("could not persist probe failure for job {job_id}: {reporting_error}");
             }
             return;
+        }
+        if *cancel_receiver.borrow() {
+            let _progress_guard = self.inner.progress_updates.lock().await;
+            if let Err(error) = self.finalize_cancelled(&job_id, started_at_ms) {
+                eprintln!("could not persist cancellation for job {job_id}: {error}");
+            }
+            return;
+        }
+        {
+            let _progress_guard = self.inner.progress_updates.lock().await;
+            if let Err(error) = self.inner.store.update_summary(&job_id, |summary| {
+                summary.status = JobStatus::Planning;
+                summary.stage = Some("plan".into());
+                summary.message = "Preparing a safe execution plan".into();
+            }) {
+                self.finish_with_internal_error_locked(&job_id, error.to_string(), started_at_ms)
+                    .ok();
+                return;
+            }
+            if let Err(error) = self.inner.store.update_summary(&job_id, |summary| {
+                summary.status = JobStatus::Running;
+                summary.stage = Some("starting".into());
+                summary.message = "Starting the local validation engine".into();
+            }) {
+                self.finish_with_internal_error_locked(&job_id, error.to_string(), started_at_ms)
+                    .ok();
+                return;
+            }
         }
         let request = ExecutionRequest {
             job_id: job_id.clone(),

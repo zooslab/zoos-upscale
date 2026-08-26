@@ -20,7 +20,12 @@ if (!/^[a-zA-Z0-9_.-]+$/.test(targetTriple)) {
   throw new Error(`Rust returned an invalid host target: ${targetTriple}`)
 }
 
-const cargoArguments = ['build', '--locked', '-p', 'zoos-runner-fake']
+const sidecars = [
+  ['zoos-runner-fake', 'zoos-runner-fake-bin'],
+  ['zoos-runner-realesrgan', 'zoos-runner-realesrgan-bin'],
+]
+const cargoArguments = ['build', '--locked']
+for (const [packageName] of sidecars) cargoArguments.push('-p', packageName)
 if (release) {
   cargoArguments.push('--release')
 }
@@ -33,18 +38,15 @@ if (buildResult.status !== 0) {
 }
 
 const executableSuffix = targetTriple.includes('windows') ? '.exe' : ''
-const buildBinaryName = `zoos-runner-fake-bin${executableSuffix}`
-const source = join(repositoryRoot, 'target', profile, buildBinaryName)
 const binariesDirectory = join(repositoryRoot, 'src-tauri', 'binaries')
-const destination = join(
-  binariesDirectory,
-  `zoos-runner-fake-${targetTriple}${executableSuffix}`,
-)
-
 mkdirSync(binariesDirectory, { recursive: true })
-copyFileSync(source, destination)
-if (!executableSuffix) {
-  chmodSync(destination, 0o755)
+for (const [packageName, binaryName] of sidecars) {
+  const source = join(repositoryRoot, 'target', profile, `${binaryName}${executableSuffix}`)
+  const destination = join(
+    binariesDirectory,
+    `${packageName}-${targetTriple}${executableSuffix}`,
+  )
+  copyFileSync(source, destination)
+  if (!executableSuffix) chmodSync(destination, 0o755)
+  console.log(`Prepared ${relative(repositoryRoot, destination)}`)
 }
-
-console.log(`Prepared ${relative(repositoryRoot, destination)}`)

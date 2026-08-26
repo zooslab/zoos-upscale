@@ -1,8 +1,10 @@
 <script lang="ts">
   import JobLab from './components/JobLab.svelte'
   import ImageUpscale from './components/ImageUpscale.svelte'
+  import VideoInterpolate from './components/VideoInterpolate.svelte'
 
   const showGoal0Lab = import.meta.env.DEV
+  let mode = $state<'image' | 'video'>('image')
   const principles = [
     { label: '로컬 처리', detail: '파일을 외부 서버로 보내지 않습니다.' },
     { label: '원본 보호', detail: '결과는 새 파일로만 저장합니다.' },
@@ -30,18 +32,37 @@
   </header>
 
   <main>
+    <nav class="mode-switch" aria-label="처리할 미디어 선택">
+      <button type="button" class:active={mode === 'image'} aria-pressed={mode === 'image'} onclick={() => (mode = 'image')}>
+        <span aria-hidden="true">▧</span><strong>이미지</strong><small>2배 · 4배 확대</small>
+      </button>
+      <button type="button" class:active={mode === 'video'} aria-pressed={mode === 'video'} onclick={() => (mode = 'video')}>
+        <span aria-hidden="true">▷</span><strong>영상</strong><small>프레임 2배 보간</small>
+      </button>
+    </nav>
     <section class="hero" aria-labelledby="hero-title">
       <div class="hero-copy">
-        <span class="eyebrow">LOCAL IMAGE UPSCALER</span>
-        <h1 id="hero-title" aria-label="이미지를 더 크게, 선명하게.">
-          이미지를 더 크게,<br />선명하게.
-        </h1>
-        <p>
-          사진과 애니 이미지를 GPU 또는 CPU로 2배·4배 키웁니다.
-          한 장이나 폴더를 선택하면 원본은 그대로 두고 결과를 안전하게 저장합니다.
-        </p>
+        {#if mode === 'image'}
+          <span class="eyebrow">LOCAL IMAGE UPSCALER</span>
+          <h1 id="hero-title" aria-label="이미지를 더 크게, 선명하게.">
+            이미지를 더 크게,<br />선명하게.
+          </h1>
+          <p>
+            사진과 애니 이미지를 GPU 또는 CPU로 2배·4배 키웁니다.
+            한 장이나 폴더를 선택하면 원본은 그대로 두고 결과를 안전하게 저장합니다.
+          </p>
+        {:else}
+          <span class="eyebrow">LOCAL VIDEO INTERPOLATION</span>
+          <h1 id="hero-title" aria-label="영상을 더 부드럽게.">
+            영상을 더<br />부드럽게.
+          </h1>
+          <p>
+            25 · 29.97 · 30 fps 영상을 정확히 2배로 보간합니다.
+            오디오와 지원 자막은 보존하고 원본 옆에 새 영상으로 안전하게 저장합니다.
+          </p>
+        {/if}
       </div>
-      <ImageUpscale />
+      {#if mode === 'image'}<ImageUpscale />{:else}<VideoInterpolate />{/if}
     </section>
 
     {#if showGoal0Lab}

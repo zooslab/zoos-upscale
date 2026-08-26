@@ -10,6 +10,8 @@ import type {
   JobErrorView,
   JobSummary,
   MetadataPolicy,
+  VideoBackend,
+  VideoEngineStatus,
 } from '../types/jobs'
 
 export function isDesktopRuntime(): boolean {
@@ -22,6 +24,14 @@ export function createFakeJob(scenario: FakeScenario): Promise<JobSummary> {
 
 export function getImageEngineStatus(): Promise<ImageEngineStatus> {
   return invoke<ImageEngineStatus>('get_image_engine_status')
+}
+
+export function getVideoEngineStatus(): Promise<VideoEngineStatus> {
+  return invoke<VideoEngineStatus>('get_video_engine_status')
+}
+
+export function pickAndCreateVideoJob(backend: VideoBackend): Promise<JobSummary | null> {
+  return invoke<JobSummary | null>('pick_and_create_video_job', { backend })
 }
 
 export function pickAndCreateImageJob(

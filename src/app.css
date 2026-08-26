@@ -129,6 +129,62 @@ main {
   flex: 1;
 }
 
+.mode-switch {
+  display: grid;
+  width: min(430px, 100%);
+  margin: 30px auto -24px;
+  padding: 5px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  gap: 5px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  background: rgba(12, 16, 25, 0.68);
+  backdrop-filter: blur(18px);
+}
+
+.mode-switch button {
+  display: grid;
+  min-height: 58px;
+  padding: 9px 13px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  color: var(--muted);
+  grid-template-columns: 25px 1fr;
+  grid-template-rows: auto auto;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mode-switch button > span {
+  grid-row: 1 / 3;
+  align-self: center;
+  color: #687287;
+  font-size: 17px;
+}
+
+.mode-switch button strong {
+  color: #c8cfdd;
+  font-size: 12px;
+}
+
+.mode-switch button small {
+  margin-top: 2px;
+  color: #687287;
+  font-size: 9px;
+}
+
+.mode-switch button.active {
+  border-color: rgba(139, 228, 187, 0.22);
+  background: rgba(82, 201, 148, 0.08);
+}
+
+.mode-switch button.active > span,
+.mode-switch button.active strong {
+  color: var(--accent);
+}
+
 .hero {
   display: grid;
   min-height: 510px;
@@ -230,6 +286,74 @@ main {
   background: rgba(0, 0, 0, 0.12);
   font-size: 12px;
   line-height: 1.5;
+}
+
+.video-card {
+  min-height: 520px;
+}
+
+.video-engine-status {
+  flex-wrap: wrap;
+}
+
+.select-video {
+  width: 100%;
+}
+
+.video-empty {
+  display: flex;
+  min-height: 104px;
+  padding: 18px;
+  border: 1px dashed rgba(255, 255, 255, 0.1);
+  border-radius: 13px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 7px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.video-empty strong {
+  color: #cbd2df;
+  font-size: 12px;
+}
+
+.video-empty span,
+.progress-caption {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.video-rate {
+  display: flex;
+  margin-top: 15px;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.video-rate i {
+  color: #59647a;
+  font-style: normal;
+}
+
+.video-rate strong {
+  color: var(--accent);
+  font-size: 14px;
+}
+
+.video-rate small {
+  margin-left: auto;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 8px;
+}
+
+.progress-caption {
+  margin: -7px 0 14px;
 }
 
 .engine-notice strong,
@@ -849,6 +973,11 @@ footer {
 
   .topbar {
     height: 76px;
+  }
+
+  .mode-switch {
+    margin-top: 20px;
+    margin-bottom: -12px;
   }
 
   .privacy-badge {

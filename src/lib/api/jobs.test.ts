@@ -9,6 +9,8 @@ import {
   commandError,
   pickAndCreateImageBatch,
   pickAndCreateImageJob,
+  getVideoEngineStatus,
+  pickAndCreateVideoJob,
 } from './jobs'
 
 describe('image job API', () => {
@@ -49,6 +51,16 @@ describe('image job API', () => {
     expect(commandError('{"code":"INPUT_CHANGED","message":"입력이 변경되었습니다."}')).toEqual({
       code: 'INPUT_CHANGED',
       message: '입력이 변경되었습니다.',
+    })
+  })
+
+  it('uses the Goal 2 status and atomic video picker commands', async () => {
+    tauri.invoke.mockResolvedValueOnce({ media: {}, gpu: {}, cpu: {}, recommended_backend: null }).mockResolvedValueOnce(null)
+    await getVideoEngineStatus()
+    await pickAndCreateVideoJob('ncnn_cpu')
+    expect(tauri.invoke).toHaveBeenNthCalledWith(1, 'get_video_engine_status')
+    expect(tauri.invoke).toHaveBeenNthCalledWith(2, 'pick_and_create_video_job', {
+      backend: 'ncnn_cpu',
     })
   })
 })

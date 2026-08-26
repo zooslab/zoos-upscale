@@ -3,6 +3,7 @@ mod image_pipeline;
 mod image_safety;
 mod orchestrator;
 mod process;
+mod video_safety;
 mod workspace;
 
 pub use domain::{
@@ -22,5 +23,11 @@ pub use image_safety::{
 };
 pub use orchestrator::{JobOrchestrator, OrchestratorError};
 pub use process::{BackendError, ProcessExecutionBackend, RunnerLaunchSpec, RunnerRegistry};
+pub use video_safety::{
+    ValidatedVideoFile, VideoOutputPlan, VideoPipelineVerification, VideoSafetyError,
+    cleanup_owned_video_output, cleanup_video_work_directory, plan_video_output,
+    publish_staged_video_output, recheck_video_input, stage_private_video_output,
+    validate_video_file,
+};
 pub use workspace::{ImagePipelineVerification, WorkspaceError};
 pub use zoos_runner_protocol::FakeBehavior;

@@ -774,7 +774,7 @@ impl From<OrchestratorError> for CommandError {
     fn from(error: OrchestratorError) -> Self {
         match error {
             OrchestratorError::AnotherJobActive => {
-                Self::fixed("JOB_BUSY", "Another image job is already running.")
+                Self::fixed("JOB_BUSY", "Another job is already running.")
             }
             OrchestratorError::JobNotActive => {
                 Self::fixed("JOB_NOT_ACTIVE", "This job is no longer running.")
@@ -1179,6 +1179,13 @@ mod tests {
         )));
         assert_eq!(error.code, "UNSUPPORTED_IMAGE_MODE");
         assert!(error.message.contains("JPEG"));
+    }
+
+    #[test]
+    fn busy_error_is_shared_by_image_and_video_jobs() {
+        let error = CommandError::from(OrchestratorError::AnotherJobActive);
+        assert_eq!(error.code, "JOB_BUSY");
+        assert_eq!(error.message, "Another job is already running.");
     }
 
     #[test]

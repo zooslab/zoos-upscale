@@ -1,5 +1,6 @@
 <script lang="ts">
   import JobLab from './components/JobLab.svelte'
+  import ImageUpscale from './components/ImageUpscale.svelte'
 
   const showGoal0Lab = import.meta.env.DEV
   const principles = [
@@ -31,32 +32,24 @@
   <main>
     <section class="hero" aria-labelledby="hero-title">
       <div class="hero-copy">
-        <span class="eyebrow">FIRST VERTICAL SLICE</span>
-        <h1 id="hero-title" aria-label="선명하게 키우고, 더 부드럽게.">
-          선명하게 키우고,<br />더 부드럽게.
+        <span class="eyebrow">LOCAL IMAGE UPSCALER</span>
+        <h1 id="hero-title" aria-label="이미지를 더 크게, 선명하게.">
+          이미지를 더 크게,<br />선명하게.
         </h1>
         <p>
-          사진과 영상을 내 Mac에서 직접 개선하는 가벼운 데스크톱 앱을
-          만들고 있습니다.
+          사진과 애니 이미지를 Mac의 GPU에서 직접 2배 또는 4배로 키웁니다.
+          원본은 그대로 두고 PNG 결과를 옆 폴더에 안전하게 저장합니다.
         </p>
       </div>
-
-      {#if showGoal0Lab}
-        <JobLab />
-      {:else}
-        <div class="status-card" aria-label="현재 개발 상태">
-          <div class="status-card__header">
-            <span class="window-controls" aria-hidden="true"><i></i><i></i><i></i></span>
-            <span>Goal 0</span>
-          </div>
-          <div class="status-card__body">
-            <span class="status-label">현재 단계</span>
-            <h2>로컬 AI 엔진 준비 중</h2>
-            <p>검증된 이미지 처리 경로를 연결하고 있습니다.</p>
-          </div>
-        </div>
-      {/if}
+      <ImageUpscale />
     </section>
+
+    {#if showGoal0Lab}
+      <details class="diagnostics">
+        <summary>개발자 진단 · Runner Lab</summary>
+        <JobLab />
+      </details>
+    {/if}
 
     <section class="principles" aria-label="제품 원칙">
       {#each principles as principle, index}

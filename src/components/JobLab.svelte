@@ -37,21 +37,37 @@
   let jobs = $state<JobSummary[]>([])
   let requestPending = $state(false)
   let errorMessage = $state<string | null>(null)
-  let activeJob = $derived(jobs.find((job) => activeStatuses.has(job.status)) ?? null)
+  let pollTimer: number | null = null
+  let fakeJobs = $derived(jobs.filter((job) => job.kind === 'fake_validation'))
+  let activeJob = $derived(fakeJobs.find((job) => activeStatuses.has(job.status)) ?? null)
 
   onMount(() => {
     if (!runtimeAvailable) return
 
     void refreshJobs()
-    const poller = window.setInterval(() => void refreshJobs(), 300)
-    return () => window.clearInterval(poller)
+    return stopPolling
   })
+
+  function stopPolling(): void {
+    if (pollTimer !== null) {
+      window.clearTimeout(pollTimer)
+      pollTimer = null
+    }
+  }
+
+  function schedulePollIfActive(): void {
+    stopPolling()
+    if (!jobs.some((job) => activeStatuses.has(job.status))) return
+    pollTimer = window.setTimeout(() => void refreshJobs(), 500)
+  }
 
   async function refreshJobs(): Promise<void> {
     try {
       jobs = await listJobs()
     } catch (error) {
       errorMessage = commandErrorMessage(error)
+    } finally {
+      schedulePollIfActive()
     }
   }
 
@@ -60,8 +76,9 @@
     errorMessage = null
     try {
       const created = await createFakeJob(selectedScenario)
-      await startJob(created.job_id)
-      await refreshJobs()
+      const started = await startJob(created.job_id)
+      jobs = [started, ...jobs.filter((job) => job.job_id !== started.job_id)]
+      schedulePollIfActive()
     } catch (error) {
       errorMessage = commandErrorMessage(error)
     } finally {
@@ -83,7 +100,8 @@
     }
   }
 
-  function scenarioLabel(scenario: FakeScenario): string {
+  function scenarioLabel(scenario?: FakeScenario): string {
+    if (!scenario) return '이전 Fake 작업'
     return scenarios.find((item) => item.value === scenario)?.label ?? scenario
   }
 </script>
@@ -145,13 +163,13 @@
     {/if}
 
     <div class="job-list" aria-live="polite">
-      {#if jobs.length === 0}
+      {#if fakeJobs.length === 0}
         <div class="empty-job">
           <span aria-hidden="true">↗</span>
           <p>시나리오를 선택해 Rust 작업 경로를 확인하세요.</p>
         </div>
       {:else}
-        {#each jobs.slice(0, 3) as job (job.job_id)}
+        {#each fakeJobs.slice(0, 3) as job (job.job_id)}
           <article class:failed={job.status === 'FAILED'} class:completed={job.status === 'COMPLETED'}>
             <div class="job-row">
               <div>

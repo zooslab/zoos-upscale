@@ -19,6 +19,7 @@ vi.mock('../lib/api/jobs', () => ({
 function job(overrides: Partial<JobSummary> = {}): JobSummary {
   return {
     job_id: 'job-1',
+    kind: 'fake_validation',
     scenario: 'success',
     status: 'CREATED',
     progress_percent: 0,

@@ -1298,6 +1298,7 @@ impl WorkspaceStore {
         &self,
         job_id: &str,
         output_descriptor: &MediaDescriptor,
+        expected_private_sha256: &str,
     ) -> Result<(), WorkspaceError> {
         let job_dir = self.job_dir(job_id)?;
         let pipeline: VideoPipelinePlan = read_json(&job_dir.join(VIDEO_PIPELINE_FILE))?;
@@ -1316,6 +1317,12 @@ impl WorkspaceStore {
             read_json(&job_dir.join("work").join(VIDEO_RUNNER_EVIDENCE_FILE))?;
         validate_video_runner_evidence(&pipeline, &evidence)?;
         let output_sha256 = stage_private_video_output(&pipeline.output)?;
+        if output_sha256 != expected_private_sha256 {
+            return Err(VideoSafetyError::InvalidOutput(
+                "private output changed during verification",
+            )
+            .into());
+        }
         let source_after = recheck_video_input(&pipeline.output.input)?;
         let audio_streams = u32::try_from(
             output_descriptor
@@ -1363,7 +1370,7 @@ impl WorkspaceStore {
             &verification,
         )?;
         self.record_video_verification(job_id, &verification, &evidence)?;
-        cleanup_video_work_directory(&job_dir.join("work"))?;
+        remove_if_exists(&pipeline.output.private_output_path)?;
         Ok(())
     }
 
@@ -2217,24 +2224,22 @@ fn is_safe_video_request(
             name == format!("{base}.{extension}")
                 || (2..=999).any(|suffix| name == format!("{base}_{suffix}.{extension}"))
         });
-    let managed_paths_safe = [
-        work.as_path(),
-        input_frames.as_path(),
-        output_frames.as_path(),
-    ]
-    .iter()
-    .all(|path| {
-        fs::symlink_metadata(path)
-            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-    }) && [
-        request.output.path.as_path(),
-        work.join(VIDEO_RUNNER_EVIDENCE_FILE).as_path(),
-    ]
-    .iter()
-    .all(|path| match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata.is_file() && !metadata.file_type().is_symlink(),
-        Err(error) => error.kind() == io::ErrorKind::NotFound,
-    });
+    let evidence_path = work.join(VIDEO_RUNNER_EVIDENCE_FILE);
+    let work_safe = fs::symlink_metadata(&work)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+    let optional_directories_safe = [input_frames.as_path(), output_frames.as_path()]
+        .iter()
+        .all(|path| match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata.is_dir() && !metadata.file_type().is_symlink(),
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+        });
+    let optional_files_safe = [request.output.path.as_path(), evidence_path.as_path()]
+        .iter()
+        .all(|path| match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata.is_file() && !metadata.file_type().is_symlink(),
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+        });
+    let managed_paths_safe = work_safe && optional_directories_safe && optional_files_safe;
 
     pipeline.schema_version == 1
         && pipeline.job_id == summary.job_id
@@ -2674,15 +2679,21 @@ mod tests {
             }],
             chapters: Vec::new(),
         };
+        let private_sha256 =
+            crate::image_safety::sha256_file(&request.output.path).expect("private output hash");
         store
-            .publish_verified_video_output(&job.job_id, &output_descriptor)
+            .publish_verified_video_output(&job.job_id, &output_descriptor, &private_sha256)
             .expect("verified publish");
         let final_path = job.output_path.expect("final path");
         assert_eq!(
             fs::read(&final_path).expect("final video"),
             b"verified-video-output"
         );
-        assert!(!root.path().join(&job.job_id).join("work").exists());
+        let work = store.root.join(&job.job_id).join("work");
+        assert!(work.is_dir());
+        assert!(!request.output.path.exists());
+        assert!(work.join(VIDEO_RUNNER_EVIDENCE_FILE).is_file());
+        assert!(store.list_jobs().is_ok());
         let manifest: JobManifest =
             read_json(&root.path().join(&job.job_id).join(MANIFEST_FILE)).expect("manifest");
         assert_eq!(manifest.actual_video_backend, Some(VideoBackend::VulkanGpu));

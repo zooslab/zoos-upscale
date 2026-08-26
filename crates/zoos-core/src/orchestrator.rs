@@ -531,15 +531,32 @@ impl JobOrchestrator {
                 .as_ref()
                 .ok_or(WorkspaceError::MediaVerifierUnavailable)?;
             let output = self.inner.store.video_output_to_probe(job_id)?;
-            Some(probe.probe_output(&output).await?)
+            let container = self
+                .inner
+                .store
+                .load_summary(job_id)?
+                .video_container
+                .ok_or(WorkspaceError::UnsafeRunnerRequest)?;
+            let before = crate::validate_video_file(&output, container)?.sha256;
+            let descriptor = probe.probe_output(&output).await?;
+            let after = crate::validate_video_file(&output, container)?.sha256;
+            if before != after {
+                return Err(crate::VideoSafetyError::InvalidOutput(
+                    "private output changed during ffprobe verification",
+                )
+                .into());
+            }
+            Some((descriptor, after))
         } else {
             None
         };
         let _progress_guard = self.inner.progress_updates.lock().await;
-        if let Some(output_descriptor) = output_descriptor.as_ref() {
-            self.inner
-                .store
-                .publish_verified_video_output(job_id, output_descriptor)?;
+        if let Some((output_descriptor, private_sha256)) = output_descriptor.as_ref() {
+            self.inner.store.publish_verified_video_output(
+                job_id,
+                output_descriptor,
+                private_sha256,
+            )?;
         } else {
             self.inner.store.publish_output(job_id)?;
         }

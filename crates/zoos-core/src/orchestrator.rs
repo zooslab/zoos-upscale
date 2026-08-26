@@ -38,11 +38,20 @@ impl JobOrchestrator {
         activity_timeout: Duration,
         termination_grace: Duration,
     ) -> Result<Self, OrchestratorError> {
-        let backend = ProcessExecutionBackend::new(activity_timeout, termination_grace);
         let runners = RunnerRegistry::with_runner(
             JobKind::FakeValidation,
             RunnerLaunchSpec::new("zoos-runner-fake", runner_path)?,
         );
+        Self::with_runner_registry(workspace_root, runners, activity_timeout, termination_grace)
+    }
+
+    pub fn with_runner_registry(
+        workspace_root: impl AsRef<Path>,
+        runners: RunnerRegistry,
+        activity_timeout: Duration,
+        termination_grace: Duration,
+    ) -> Result<Self, OrchestratorError> {
+        let backend = ProcessExecutionBackend::new(activity_timeout, termination_grace);
         let store = WorkspaceStore::new(workspace_root)?;
         store.recover_interrupted()?;
         Ok(Self {
@@ -392,7 +401,12 @@ impl JobOrchestrator {
         started_at_ms: u64,
     ) -> Result<(), WorkspaceError> {
         let cleanup = self.inner.store.cleanup_unverified_output(job_id);
-        let code = error.code().to_owned();
+        let kind = self.inner.store.load_summary(job_id)?.kind;
+        let code = match kind {
+            JobKind::FakeValidation => error.code(),
+            JobKind::ImageUpscale => image_backend_error_code(error),
+        }
+        .to_owned();
         let message = error.user_message();
         let progress = self.inner.store.update_summary(job_id, |summary| {
             summary.status = JobStatus::Failed;
@@ -416,13 +430,24 @@ impl JobOrchestrator {
         started_at_ms: u64,
     ) -> Result<(), WorkspaceError> {
         let cleanup = self.inner.store.cleanup_unverified_output(job_id);
+        let image_job = self.inner.store.load_summary(job_id)?.kind == JobKind::ImageUpscale;
         let progress = self.inner.store.update_summary(job_id, |summary| {
             summary.status = JobStatus::Failed;
             summary.stage = None;
             summary.message = "Validation failed".into();
             summary.error = Some(JobErrorView {
-                code: "INTERNAL_ERROR".into(),
-                message: "An internal error interrupted the validation run.".into(),
+                code: if image_job {
+                    "UPSTREAM_FAILED"
+                } else {
+                    "INTERNAL_ERROR"
+                }
+                .into(),
+                message: if image_job {
+                    "The local image engine failed unexpectedly."
+                } else {
+                    "An internal error interrupted the validation run."
+                }
+                .into(),
             });
         });
         let manifest = self.inner.store.finish_manifest(
@@ -434,6 +459,30 @@ impl JobOrchestrator {
         cleanup?;
         progress?;
         manifest
+    }
+}
+
+fn image_backend_error_code(error: &BackendError) -> &str {
+    match error {
+        BackendError::InvalidRunnerPath
+        | BackendError::RunnerNotRegistered(_)
+        | BackendError::SpawnFailed(_) => "ENGINE_NOT_INSTALLED",
+        BackendError::ProbeFailed(_) => "ASSET_HASH_MISMATCH",
+        BackendError::RunnerFailed { error_code, .. }
+            if matches!(
+                error_code.as_str(),
+                "ENGINE_NOT_INSTALLED"
+                    | "ASSET_HASH_MISMATCH"
+                    | "OUTPUT_EXISTS"
+                    | "GPU_UNAVAILABLE"
+                    | "UPSTREAM_FAILED"
+                    | "CANCELLED"
+            ) =>
+        {
+            error_code
+        }
+        BackendError::Cancelled => "CANCELLED",
+        _ => "UPSTREAM_FAILED",
     }
 }
 
@@ -598,6 +647,26 @@ mod tests {
             validate_capabilities(&stored, &capabilities, &launch),
             Err(BackendError::ProbeFailed(_))
         ));
+    }
+
+    #[test]
+    fn image_backend_failures_map_to_the_public_error_contract() {
+        assert_eq!(
+            image_backend_error_code(&BackendError::SpawnFailed("missing".into())),
+            "ENGINE_NOT_INSTALLED"
+        );
+        assert_eq!(
+            image_backend_error_code(&BackendError::ProtocolViolation("bad event".into())),
+            "UPSTREAM_FAILED"
+        );
+        assert_eq!(
+            image_backend_error_code(&BackendError::RunnerFailed {
+                error_code: "GPU_UNAVAILABLE".into(),
+                message: "no device".into(),
+                exit_code: Some(30),
+            }),
+            "GPU_UNAVAILABLE"
+        );
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 
 > 이 문서는 Zoos Upscale의 공개 기술 개요입니다. **현재 구현된 범위**와 **후속 설계**를 구분해 기록합니다.
 
-**문서 상태:** 설계 기준선 v0.3.2 · Goal 0/1A/1B 구현 반영 · **최종 갱신:** 2026-08-26
+**문서 상태:** 설계 기준선 v0.3.2 · Goal 0/1/2 구현 반영 · **최종 갱신:** 2026-08-26
 
 ## 1. 설계 목표
 
@@ -15,7 +15,7 @@ Zoos Upscale은 이미지 업스케일링, 영상 업스케일링, 프레임 보
 1. 사용자는 AI 모델이나 GPU 설정 대신 원하는 결과를 선택합니다.
 2. 파일과 AI 추론은 기본적으로 로컬에서 처리합니다.
 3. 원본 파일은 수정하지 않습니다.
-4. 긴 영상은 작은 구간으로 나누어 처리하고 중단된 지점부터 재개합니다.
+4. 긴 영상은 메모리 상한이 있는 작은 구간으로 나눕니다. 중단 지점 재개는 후속 Goal에서 추가합니다.
 5. GPU 실패가 품질 저하로 조용히 이어지지 않도록 모든 대체 경로를 기록합니다.
 6. 첫 제품은 단순하게 만들고, 복잡한 전용 백엔드는 실제 성능 자료가 있을 때만 추가합니다.
 
@@ -26,11 +26,13 @@ Zoos Upscale은 이미지 업스케일링, 영상 업스케일링, 프레임 보
 | Goal 0 | 완료 | 범용 작업 계약, schema 생성, process 생명주기, workspace lock·staging·quarantine, 라이선스 gate |
 | Goal 1A | 완료 | 단일 RGB8 PNG/JPEG, 사진·애니, 2배·4배, Real-ESRGAN ncnn/Vulkan GPU 0, 안전한 PNG 공개 |
 | Goal 1B | 완료 | ORT CPU, 최상위 폴더 batch, RGBA 분리, EXIF 회전, ICC·EXIF 정책, PNG·JPEG·WebP 출력 |
+| Goal 2 | 완료 | FFmpeg/ffprobe 9.0.1, 명시적 MuxPlan, RIFE v4.6 GPU 0·CPU, 25/29.97/30 fps 정확한 2배 CFR, MP4/MOV/MKV |
 | Apple M5 gate | 통과 | 8개 조합×3회, 정확한 크기·RGB8·nonblack·원본 hash 불변, 골든 오차 0, 취소 후 잔존 0 |
 | Apple M5 Goal 1B gate | 통과 | CPU↔GPU 사진·애니 2x/4x PSNR 50 dB 이상, batch·alpha·ICC·EXIF·형식·취소·asset hash 증거 |
-| 공개 배포 | 차단 | 모델 가중치 재배포 권리 미확인으로 엔진·모델·개발 Fake Runner를 release bundle에서 제외 |
+| Apple M5 Goal 2 gate | 통과 | MP4/MOV/MKV, 25/29.97/30 fps 2배, 60초 bounded run, stream metadata·chapter·A/V, CPU↔GPU PSNR 52.25 dB, 취소 잔존 0 |
+| 공개 배포 | 차단 | 모델 가중치·FFmpeg 고지 의무 검토 전까지 FFmpeg·RIFE·Real-ESRGAN·ORT·Fake Runner를 release bundle에서 제외 |
 
-현재 지원 표시는 **Apple M5에서 직접 통과한 Goal 1A·1B 이미지 범위**에만 적용합니다. FFmpeg·RIFE, 본격 queue·checkpoint, Windows Job Object와 NVIDIA·AMD 검증은 아직 후속 단계입니다.
+현재 개발 지원 범위는 Goal 1 이미지와 Goal 2의 제한된 CFR 영상 보간입니다. 영상 업스케일, 24/23.976 fps, VFR·HDR·interlaced, 본격 queue·checkpoint, Windows Job Object와 NVIDIA·AMD 검증은 후속 단계입니다.
 
 ## 2. 전체 시스템 구조
 
@@ -61,14 +63,19 @@ flowchart TB
     PARTIAL --> VERIFY["형식·크기·픽셀·metadata·hash 재검증"]
     VERIFY --> OUTPUT["Atomic Rename<br/>최종 결과 공개"]
 
+    subgraph G2["구현된 Goal 2 영상 실행 계층"]
+        MEDIA["FFmpeg / ffprobe 9.0.1<br/>개발 캐시"]
+        RIFE["RIFE v4.6 ncnn<br/>GPU 0 · CPU"]
+    end
+
     subgraph NEXT["후속 Goal"]
-        MEDIA["FFmpeg / ffprobe<br/>Goal 2"]
-        RIFE["RIFE 프레임 보간<br/>Goal 2"]
+        VIDEOSR["영상 SR · 결합 처리<br/>Goal 3"]
         QUEUE["본격 Queue · Pause · Checkpoint"]
     end
 
-    ORCH -. 영상 단계 .-> MEDIA
-    PROTOCOL -. 영상 단계 .-> RIFE
+    ORCH --> MEDIA
+    PROTOCOL --> RIFE
+    ORCH -. 확장 .-> VIDEOSR
     ORCH -. 확장 .-> QUEUE
 
     subgraph LATER["Benchmark 통과 후 선택적 확장"]
@@ -91,8 +98,8 @@ flowchart TB
 | Job Orchestrator | 작업 계획, 단일 active 작업, 상태 전이, 취소와 시작 복구 | 모델별 네이티브 API 세부사항 |
 | ExecutionBackend | AI 작업의 공통 실행 계약과 capability probe | process runner의 전송 형식 |
 | ProcessExecutionBackend | runner 실행, 이벤트 수집, 취소와 오류 정규화 | 사용자 화면 구성 |
-| Media Probe / Selector | 후속 영상 단계의 stream 분석, decode·encode 경로 선택 | AI 모델 선택 정책 |
-| Job Workspace | 계획, 진행 상태, manifest·로그·이미지 검증 기록 | UI 표현 방식 |
+| Media Probe / Selector | ffprobe JSON, stream 분석, MuxPlan, decode·encode 경로 선택 | AI 모델 선택 정책 |
+| Job Workspace | 계획, 진행 상태, manifest·로그·이미지·영상 검증 기록 | UI 표현 방식 |
 | Runner | 하나의 AI 실행기를 공통 프로토콜로 감싸기 | 전체 작업 Queue와 제품 정책 |
 
 ## 3. 실행 경계와 프로세스 구조
@@ -119,9 +126,9 @@ flowchart LR
     WR1 -->|"고정 CLI · GPU 0"| ESR["Real-ESRGAN ncnn/Vulkan<br/>v0.2.5.0 package"]
     WR3 --> ORT["ONNX Runtime 1.29.0<br/>Real-ESRGAN ONNX FP32"]
 
-    APP -. "Goal 2" .-> WR2["zoos-runner-rife"]
-    APP -. "Goal 2" .-> FF["ffmpeg / ffprobe"]
-    WR2 -.-> RIFE["Pinned RIFE ncnn binary"]
+    APP --> WR2["zoos-runner-rife"]
+    APP --> FF["FFmpeg / ffprobe 9.0.1"]
+    WR2 --> RIFE["Pinned RIFE v4.6 ncnn binary"]
 ```
 
 - 실행 파일은 앱이 알고 있는 절대 경로로만 호출합니다.
@@ -141,7 +148,7 @@ flowchart LR
 | 오류 분류 | 표준 오류 코드 | 입력 오류, 모델 누락, GPU 오류, OOM, 취소 등 구분 |
 | 취소 | Process tree 종료 | 고아 프로세스와 불완전 결과 방지 |
 
-Rust 타입이 runner 계약의 권위 원본이며 `schemars`로 JSON Schema를 생성합니다. Goal 1B의 backend-neutral 이미지 request는 schema version 2이고, NDJSON event envelope는 안정된 version 1을 유지합니다. CI의 `cargo xtask schema --check`가 생성 결과의 drift를 차단합니다. native Fake Runner로 성공·명시 실패·malformed NDJSON·crash·hang·timeout·취소·terminal event와 exit code 충돌을 검증하고, 같은 event 계약으로 GPU·CPU wrapper를 실행합니다. macOS에서는 별도 process group을 사용해 자식·손자 process를 함께 종료합니다.
+Rust 타입이 runner 계약의 권위 원본이며 `schemars`로 JSON Schema를 생성합니다. Goal 1B의 backend-neutral 이미지 request는 schema version 2, Goal 2 영상 request는 protocol version 1이고 NDJSON event envelope는 안정된 version 1을 유지합니다. CI의 `cargo xtask schema --check`가 생성 결과의 drift를 차단합니다. native Fake Runner로 성공·명시 실패·malformed NDJSON·crash·hang·timeout·취소·terminal event와 exit code 충돌을 검증하고, 같은 event 계약으로 이미지 GPU·CPU와 RIFE wrapper를 실행합니다. macOS에서는 별도 process group을 사용해 자식·손자 process를 함께 종료합니다.
 
 ## 4. 이미지 데이터 흐름
 
@@ -182,24 +189,24 @@ flowchart TB
 
 ## 5. 영상 데이터 흐름
 
-이 절은 **Goal 2~3 후속 설계**이며 현재 앱에는 아직 FFmpeg·RIFE 영상 경로가 없습니다.
+이 절의 **프레임 보간 경로는 Goal 2에서 구현**되었고, Real-ESRGAN 영상 SR과 결합 처리는 Goal 3 범위입니다.
 
 ```mermaid
 flowchart TB
     INPUT["MP4 · MOV · MKV 입력"] --> PROBE["ffprobe JSON 분석"]
     PROBE --> MUXPLAN["MuxPlan 확정<br/>Video · Audio · Subtitle · Chapter"]
-    MUXPLAN --> BOUNDARY["Chunk 경계 결정<br/>장면 전환 → Keyframe → 목표 길이"]
+    MUXPLAN --> BOUNDARY["메모리 기준 overlap Chunk<br/>최대 120 interval"]
 
     subgraph LOOP["한 번에 하나의 Bounded Chunk 처리"]
         BOUNDARY --> EXTRACT["FFmpeg 무손실 프레임 추출"]
         EXTRACT --> INTERPOLATE{"FPS 보간?"}
         INTERPOLATE -->|"예"| RIFE["RIFE 프레임 보간"]
-        INTERPOLATE -->|"아니오"| UPSCALE
-        RIFE --> UPSCALE{"해상도 향상?"}
+        INTERPOLATE -->|"아니오"| ENCODE
+        RIFE --> UPSCALE{"Goal 3: 해상도 향상?"}
         UPSCALE -->|"예"| ESR["Real-ESRGAN 프레임별 SR"]
         UPSCALE -->|"아니오"| ENCODE
         ESR --> ENCODE["Chunk Video 인코딩"]
-        ENCODE --> VERIFY["Chunk 검증 · Checkpoint"]
+        ENCODE --> VERIFY["frame 수 · Chunk 파일 검증"]
         VERIFY --> CLEAN["임시 프레임 즉시 정리"]
     end
 
@@ -221,9 +228,9 @@ flowchart TB
 | Audio stream | 0개 이상 | 자동 제거 금지 |
 | Subtitle | 기본 text subtitle | bitmap subtitle·font attachment는 후속 |
 | 프레임 보간 | 25→50, 30→60, 29.97→59.94 | 24→60, 23.976→59.94는 cadence 검증 후 |
-| 영상 SR | 프레임 독립형 Real-ESRGAN | 시간 일관성 VSR은 후속 |
+| 영상 SR | Goal 3에서 프레임 독립형 Real-ESRGAN 추가 | 시간 일관성 VSR은 후속 |
 
-MVP의 영상 SR은 각 프레임을 독립적으로 처리하므로 세밀한 질감이 프레임마다 흔들리는 현상이 생길 수 있습니다. 시간 일관성이 필요한 모델은 별도 연구 단계로 분리합니다.
+Goal 3에서 추가할 첫 영상 SR은 각 프레임을 독립적으로 처리하므로 세밀한 질감이 프레임마다 흔들릴 수 있습니다. 시간 일관성이 필요한 모델은 별도 연구 단계로 분리합니다.
 
 ## 6. 모델 후보군
 
@@ -246,7 +253,7 @@ MVP의 영상 SR은 각 프레임을 독립적으로 처리하므로 세밀한 �
 | 이미지 SR | 저메모리·빠른 처리 | realesr-general-x4v3 | 변환 artifact | 후보 |
 | 영상 SR | 일반 영상 | 이미지 SR 모델의 프레임별 적용 | ncnn / ONNX | Goal 3 계획 |
 | 영상 SR | 애니메이션 | realesr-animevideov3 | ncnn `.param/.bin` | 후보 |
-| 프레임 보간 | 일반·애니 영상 | RIFE, 검증 후 버전 고정 | ncnn model 또는 ONNX | Goal 2 계획 |
+| 프레임 보간 | 일반·애니 영상 | RIFE v4.6 | ncnn `.param/.bin` | **Goal 2 구현됨** |
 | 시간 일관성 영상 SR | 일반 영상 | RealBasicVSR 계열 | 미정 | 연구 |
 | 고급 이미지 SR | 사진·일러스트 | SPAN, HAT 계열 | 미정 | 연구 |
 | 얼굴 복원 | 인물 | GFPGAN 계열 | 미정 | 연구·명시적 선택 |
@@ -263,8 +270,9 @@ AI 모델과 실행 엔진은 분리합니다. 동일한 작업도 장치에 따
 | ncnn / Vulkan | Apple M5 GPU 0 | Goal 1A 이미지 SR | **현재 검증됨** |
 | ncnn / Vulkan | NVIDIA·AMD 등 호환 GPU | 공통 이미지·영상 GPU 경로 | 해당 실장치 검증 전 후보 |
 | ONNX Runtime CPU | Apple M5 CPU | 이미지 SR의 명시적 CPU 호환 경로 | **현재 검증됨** |
-| RIFE ncnn CPU (`-g -1`) | CPU | 프레임 보간 CPU 후보 | Goal 2 실측 후 확정 |
-| RIFE ONNX + ORT CPU | CPU | 프레임 보간 CPU 후보 | Goal 2 실측 후 확정 |
+| RIFE ncnn/Vulkan (`-g 0`) | Apple M5 GPU 0 | 프레임 보간 GPU 경로 | **Goal 2 구현됨** |
+| RIFE ncnn CPU (`-g -1`) | Apple M5 CPU | 프레임 보간 명시적 CPU 경로 | **Goal 2 구현됨** |
+| RIFE ONNX + ORT CPU | CPU | 대체 프레임 보간 경로 | 현재 불필요·미구현 |
 | Core ML | Apple Silicon | macOS 전용 성능·전력 최적화 | Benchmark 통과 시 |
 | TensorRT for RTX | NVIDIA RTX | Windows NVIDIA 최적화 | Benchmark 통과 시 |
 | Windows ML NvTensorRtRtx EP | NVIDIA RTX | Windows 관리형 NVIDIA 경로 | Benchmark 통과 시 |
@@ -275,7 +283,7 @@ AI 모델과 실행 엔진은 분리합니다. 동일한 작업도 장치에 따
 
 ### 목표 Backend 선택 과정
 
-현재 `자동`은 작업 생성 전에 hash 검증된 GPU 실행 cache를 우선하고 그 cache가 없을 때 CPU를 선택합니다. 실제 GPU probe 실패를 CPU로 무음 전환하는 정책은 아직 구현하지 않았습니다.
+현재 이미지와 영상의 `자동`은 작업 생성 전에 hash 검증된 GPU 실행 cache를 우선하고 그 cache가 없을 때 CPU를 선택합니다. 실제 GPU 실행 실패를 CPU로 무음 전환하는 정책은 아직 구현하지 않았습니다.
 
 ```mermaid
 flowchart TB
@@ -297,23 +305,24 @@ flowchart TB
 
 ## 8. FFmpeg 미디어 계층
 
-이 절은 **Goal 2 후속 설계**입니다. FFmpeg는 도입할 때 AI Backend와 별도로 관리합니다.
+Goal 2는 FFmpeg를 AI Backend와 별도인 검증된 미디어 계층으로 구현했습니다.
 
 ```mermaid
 flowchart LR
     INPUT["입력 미디어"] --> PROBE["ffprobe JSON"]
-    PROBE --> CAP["Decoder · Encoder 열거"]
-    CAP --> SMOKE["후보별 짧은 Smoke Test"]
-    SMOKE --> SELECT["검증된 Codec 경로 명시 선택"]
-    SELECT --> DECODE["기본: Software Decode"]
-    SELECT --> ENCODE["검증된 Hardware Encoder 우선"]
-    ENCODE -. 실패와 사용자 정책 허용 .-> SW["동일 Codec Software Encoder"]
+    PROBE --> PLAN["명시적 MuxPlan"]
+    PLAN --> DECODE["Software Decode<br/>무손실 PNG frame"]
+    DECODE --> RIFE["RIFE 2배 보간"]
+    RIFE --> ENCODE["h264_videotoolbox"]
+    ENCODE --> MUX["audio copy · text subtitle · chapter"]
+    MUX --> VERIFY["frame cadence · metadata · chapter<br/>duration · A/V sync 검증"]
 ```
 
-- `-hwaccel auto`에 제품 정책을 맡기지 않습니다.
-- FFmpeg의 자동 stream selection 대신 명시적인 `-map`과 MuxPlan을 사용합니다.
-- Hardware decode는 중간 프레임 복사 비용까지 포함한 benchmark에서 이득이 있을 때만 사용합니다.
-- FFmpeg binary, configure flags, codec 목록과 license 조건을 release manifest에 기록합니다.
+- 공식 FFmpeg 9.0.1 소스를 macOS arm64·minimum 14.0·LGPL 구성으로 offline build합니다. GPL·nonfree·network·device 입력은 비활성화하고 zlib·VideoToolbox만 명시합니다.
+- decode는 software baseline, chunk encode는 `h264_videotoolbox`이며 `-hwaccel auto`에 제품 정책을 맡기지 않습니다.
+- FFmpeg의 자동 stream selection 대신 명시적인 `-map`과 MuxPlan을 사용합니다. 오디오는 copy하고 text subtitle은 컨테이너에 맞게 보존하며 bitmap subtitle은 실행 전에 차단합니다.
+- `-progress pipe:1`만 구조화 진행률로 사용하고 stderr 문자열로 진행률을 추측하지 않습니다.
+- binary hash, configure flags, codec·format inventory와 license 결과를 catalog·build evidence에 고정합니다.
 
 ## 9. 작업 상태와 재개
 
@@ -341,7 +350,7 @@ stateDiagram-v2
     VERIFYING --> FAILED
 ```
 
-현재 앱은 폴더의 각 파일을 독립 workspace로 만들고 한 번에 하나씩 순차 실행합니다. 한 파일의 실패가 다음 파일을 막지 않으며 전체 batch 취소는 active process tree와 아직 시작하지 않은 파일을 함께 정리합니다. 이는 Goal 1B의 작은 batch scheduler이고, 순서 변경·pause/resume·checkpoint를 갖춘 본격 queue는 Goal 4 범위입니다. 앱 재시작 시 이전 active 작업은 `INTERRUPTED`, 시작되지 못한 Goal 1B 작업은 `CANCELLED`로 정리하며 자동 재개하지 않습니다.
+현재 앱은 폴더의 각 파일을 독립 workspace로 만들고 한 번에 하나씩 순차 실행합니다. 한 파일의 실패가 다음 파일을 막지 않으며 전체 batch 취소는 active process tree와 아직 시작하지 않은 파일을 함께 정리합니다. 이는 Goal 1B의 작은 batch scheduler이고, 순서 변경·pause/resume·checkpoint를 갖춘 본격 queue는 Goal 4 범위입니다. 앱 재시작 시 검증된 영상 publish와 완료 manifest가 모두 있으면 `COMPLETED`로 복구하고, 그 밖의 이전 active 작업은 `INTERRUPTED`, 시작되지 못한 Goal 1B 작업은 `CANCELLED`로 정리합니다. 처리 중 chunk를 자동 재개하지는 않습니다.
 
 ### Workspace 구조
 
@@ -351,16 +360,17 @@ job-workspaces/
 ├── staging/                # 완성 전 작업; 완성 뒤 UUID 폴더로 atomic rename
 ├── quarantine/             # 손상·불완전 작업과 diagnostic JSON
 └── <job-id>/
-    ├── job-spec.json       # v2 이미지 또는 메모리 변환 가능한 v1 Fake spec
+    ├── job-spec.json       # v2 이미지·v4 영상 또는 메모리 변환 가능한 v1 Fake spec
     ├── plan.json
     ├── runner-job.json
     ├── image-pipeline.json # Goal 1B 전후처리·publish 계획
+    ├── video-pipeline.json # descriptor·MuxPlan·chunk·보간·publish 계획
     ├── plan-revisions.jsonl
     ├── manifest.json
     ├── progress.json       # 현재 lifecycle의 권위 원본
     ├── logs.jsonl
-    ├── work/               # 정규화 RGB·alpha·검증 전 native x4
-    └── verification.json   # 성공한 이미지의 입출력 검증 증거
+    ├── work/               # 이미지 중간 산출물 또는 bounded 영상 frame·chunk
+    └── verification.json   # 성공한 이미지·영상의 입출력 검증 증거
 ```
 
 프로세스는 `fs4` root exclusive lock을 보유하고 앱은 single-instance plugin으로 중복 실행을 차단합니다. JSONL의 마지막 미완성 tail만 안전하게 truncate하며, 중간 손상과 symlink·구조 위반은 진단 파일과 함께 격리합니다. 손상된 작업 하나가 정상 작업 목록이나 앱 시작을 막지 않습니다.
@@ -369,7 +379,7 @@ SQLite는 MVP의 권위 저장소로 사용하지 않습니다. 작업 상태는
 
 ## 10. Fallback 정책
 
-아래 자동·조건부 fallback은 **Goal 4 이후 목표 정책**입니다. 현재 Goal 1B의 `자동`은 실행 전에 backend 하나를 고정하며, 실행 중 설정을 바꾸어 재시도하거나 GPU에서 CPU로 자동 전환하지 않고 구조화 오류로 종료합니다.
+아래 자동·조건부 fallback은 **Goal 4 이후 목표 정책**입니다. 현재 Goal 1B·2의 `자동`은 실행 전에 backend 하나를 고정하며, 실행 중 설정을 바꾸어 재시도하거나 GPU에서 CPU로 자동 전환하지 않고 구조화 오류로 종료합니다.
 
 ```mermaid
 flowchart LR
@@ -410,6 +420,14 @@ flowchart LR
 - fetch·install은 archive allowlist, 크기·hash, cache 상위 경로 symlink, 설치 내부 symlink를 fail-closed로 검사합니다.
 - ORT dylib, 원본 가중치, 생성 ONNX와 두 wrapper는 모두 개발 cache/sidecar 전용이며 public release bundle 검사가 포함을 차단합니다.
 
+### Goal 2 개발 자산
+
+- [`assets/catalog/ffmpeg-macos-arm64.json`](assets/catalog/ffmpeg-macos-arm64.json)은 공식 FFmpeg 9.0.1 source archive와 PGP fingerprint, configure argv, arm64 결과 binary hash, codec·format build evidence를 고정합니다.
+- `pnpm goal2:fetch`만 네트워크를 사용해 FFmpeg source와 공식 `rife-ncnn-vulkan` 20221029 macOS archive를 검증합니다. ZIP·tar의 절대경로, `..`, link와 허용되지 않은 설치 파일을 거부합니다.
+- RIFE archive에서는 universal arm64+x86_64 실행기와 `rife-v4.6/flownet.bin`, `flownet.param`만 개발 cache에 설치합니다.
+- `pnpm goal2:build`는 검증된 source만 사용해 FFmpeg·ffprobe를 offline build하고 macOS 14·arm64·LGPL build receipt와 catalog hash를 재검사합니다.
+- FFmpeg·ffprobe, RIFE 실행기·모델과 Rust wrapper는 모두 `approved_for_distribution: false`인 개발 자산입니다. 특히 RIFE 모델 가중치 권리가 확인되기 전에는 공개 번들 승격을 금지합니다.
+
 아래 구조는 재배포 권리 검토 뒤 정식 모델 패키지로 승격할 때의 목표 형식입니다.
 
 ```text
@@ -445,7 +463,7 @@ models/<model-id>/<version>/
 | ONNX Runtime | MIT | [LICENSE](https://github.com/microsoft/onnxruntime/blob/main/LICENSE) |
 | Zoos Upscale | Apache-2.0 | [LICENSE](LICENSE) |
 | Tauri · Svelte · Rust crate | 각 upstream 라이선스 | lockfile·`cargo-deny`·pnpm inventory로 관리 |
-| FFmpeg | 빌드 옵션에 따라 별도 검토 | Goal 2에서 configure flags와 배포 조합 확정 |
+| FFmpeg | LGPL-2.1-or-later 개발 build | GPL·nonfree 비활성 configure와 exact source·binary evidence; 공개 배포는 별도 검토 |
 
 이 표는 코드 저장소의 라이선스만 요약합니다. 모델 가중치, 변환 artifact, codec과 전이 의존성의 재배포 조건은 별도로 확인합니다. Rust는 `cargo-deny 0.20.2`, JavaScript는 고정 lockfile 기반 license inventory를 CI gate로 사용합니다.
 
@@ -478,8 +496,8 @@ flowchart TB
     D["설계 기준선 v0.3.2<br/>Tauri · Rust · Svelte"] --> G0["✅ Goal 0<br/>계약 · 작업공간 · 공급망 gate"]
     G0 --> G1A["✅ Goal 1A<br/>Apple M5 이미지 ncnn/Vulkan"]
     G1A --> G1B["✅ Goal 1B<br/>ORT CPU · Batch · Alpha · Metadata"]
-    G1B --> G2["다음: Goal 2<br/>FFmpeg Baseline · RIFE"]
-    G2 --> G3["Goal 3<br/>영상 SR · 결합 처리"]
+    G1B --> G2["✅ Goal 2<br/>FFmpeg Baseline · RIFE 2배 CFR"]
+    G2 --> G3["다음: Goal 3<br/>영상 SR · 결합 처리"]
     G3 --> G4["Goal 4<br/>Queue · 복구 · Preview"]
     G4 --> G5M["Goal 5M<br/>macOS Verified Beta"]
 
@@ -500,7 +518,8 @@ flowchart TB
 | Goal 0 shell·계약·안전성 | 완료 | 로컬 Mac + CI | Fake Runner process 실패·취소, schema, workspace 복구, 공급망 gate 통과 |
 | Goal 1A 이미지 GPU | 완료 | Apple M5 | 8조합×3회, golden 기준, 원본 불변, atomic output, 취소 잔존 0 |
 | Goal 1B 이미지 호환성 | 완료 | Apple M5 CPU·GPU | ORT↔GPU 허용 오차, batch·alpha·ICC·EXIF·형식·취소 통과 |
-| 영상 MVP | 예정 | 로컬 Mac | 1분 fixture의 FPS·duration·A/V sync·stream 보존 통과 |
+| Goal 2 영상 보간 | 완료 | Apple M5 | MP4/MOV/MKV, 25/29.97/30 fps 2배, MuxPlan·chunk·scene cut·metadata·A/V sync·취소 실기 통과 |
+| Goal 3 영상 SR | 예정 | 로컬 Mac | 프레임별 SR과 보간→SR 결합, FPS·duration·stream 보존 통과 |
 | macOS Beta | 예정 | 별도 clean Mac 환경 | 설치·서명·장시간 처리·강제 종료 복구 통과 |
 | NVIDIA·AMD 검증 | 예정 | 각 GPU 노트북 | 먼저 ncnn/Vulkan 공통 경로와 ORT CPU 결과 비교 |
 | 전용 Backend | 조건부 | 해당 GPU 노트북 | 공통 경로 대비 성능·메모리·안정성 개선과 지속 회귀 테스트 확보 |

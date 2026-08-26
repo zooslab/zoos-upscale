@@ -1,0 +1,11 @@
+[project]
+name = "zoos-upscale-model-tools"
+version = "0.1.0"
+description = "Development-only model conversion and quality tools for Zoos Upscale"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+dependencies = []
+
+[tool.uv]
+package = false

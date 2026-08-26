@@ -1,0 +1,82 @@
+{
+  "environment": {
+    "architecture": "arm64",
+    "hardware": "Apple M5",
+    "operating_system": "macOS 26.6",
+    "platform": "macOS"
+  },
+  "models": [
+    {
+      "architecture": {
+        "blocks": 23,
+        "name": "RRDBNet",
+        "scale": 4
+      },
+      "dynamic_axes": [
+        "height",
+        "width"
+      ],
+      "input": "input",
+      "layout": "NCHW",
+      "onnx": {
+        "path": "realesrgan-x4plus-fp32-opset17.onnx",
+        "sha256": "95c08dbcaa58b4fabae771e74ae458d93df59b86cdcb885b85ade5be4e7f826b",
+        "size": 67054038
+      },
+      "opset": 17,
+      "output": "output",
+      "precision": "FP32",
+      "preset": "photo",
+      "source": {
+        "path": "RealESRGAN_x4plus.pth",
+        "sha256": "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1"
+      },
+      "verification": {
+        "max_abs_error": 1.5497207641601562e-06,
+        "mean_abs_error": 2.556866149916459e-07,
+        "output_height": 28,
+        "output_width": 36
+      }
+    },
+    {
+      "architecture": {
+        "blocks": 6,
+        "name": "RRDBNet",
+        "scale": 4
+      },
+      "dynamic_axes": [
+        "height",
+        "width"
+      ],
+      "input": "input",
+      "layout": "NCHW",
+      "onnx": {
+        "path": "realesrgan-x4plus-anime-6b-fp32-opset17.onnx",
+        "sha256": "8244ce14b66d7f285f5ed4980ce53d098c9aa7c5533d8782a5deeb7217035eb1",
+        "size": 17940629
+      },
+      "opset": 17,
+      "output": "output",
+      "precision": "FP32",
+      "preset": "anime",
+      "source": {
+        "path": "RealESRGAN_x4plus_anime_6B.pth",
+        "sha256": "f872d837d3c90ed2e05227bed711af5671a6fd1c9f7d7e91c911a61f155e99da"
+      },
+      "verification": {
+        "max_abs_error": 1.7285346984863281e-06,
+        "mean_abs_error": 2.768382501017186e-07,
+        "output_height": 28,
+        "output_width": 36
+      }
+    }
+  ],
+  "schema_version": 1,
+  "toolchain": {
+    "numpy": "2.5.2",
+    "onnx": "1.22.0",
+    "onnxruntime": "1.29.0",
+    "python": "3.12",
+    "torch": "2.13.0"
+  }
+}

@@ -10,6 +10,9 @@ const readJson = (path) => JSON.parse(readFileSync(join(repositoryRoot, path), '
 const tauri = readJson('src-tauri/tauri.conf.json')
 const sidecars = readJson('sidecars/manifest.json')
 const realEsrgan = readJson('assets/catalog/realesrgan-ncnn-vulkan-macos.json')
-validateDistribution(tauri, sidecars, [realEsrgan])
+const onnxRuntime = readJson('assets/catalog/onnxruntime-macos-arm64.json')
+const sourceWeights = readJson('assets/catalog/realesrgan-pytorch-weights.json')
+const onnxModels = readJson('assets/catalog/realesrgan-onnx-models.json')
+validateDistribution(tauri, sidecars, [realEsrgan, onnxRuntime, sourceWeights, onnxModels])
 
 console.log('Public bundle contains no unapproved sidecars, engines, or models')

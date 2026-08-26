@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "id": "realesrgan-onnx-models",
+  "version": "goal1b-v1",
+  "approved_for_distribution": false,
+  "bundled_in_release": false,
+  "export_contract": {
+    "precision": "FP32",
+    "layout": "NCHW",
+    "opset": 17,
+    "input": "input",
+    "output": "output",
+    "dynamic_axes": ["height", "width"],
+    "scale": 4
+  },
+  "toolchain": {
+    "python": "3.12",
+    "torch": "2.13.0",
+    "onnx": "1.22.0",
+    "onnxruntime": "1.29.0",
+    "numpy": "2.5.2"
+  },
+  "license_review": {
+    "derived_from_model_weights": "unapproved",
+    "approved_for_distribution": false,
+    "note": "Generated development cache only. Redistribution remains blocked with the source weights."
+  },
+  "files": [
+    {
+      "preset": "photo",
+      "architecture": "RRDBNet-23B",
+      "source_sha256": "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
+      "destination": "models/realesrgan-x4plus-fp32-opset17.onnx",
+      "size": 67054038,
+      "sha256": "95c08dbcaa58b4fabae771e74ae458d93df59b86cdcb885b85ade5be4e7f826b"
+    },
+    {
+      "preset": "anime",
+      "architecture": "RRDBNet-6B",
+      "source_sha256": "f872d837d3c90ed2e05227bed711af5671a6fd1c9f7d7e91c911a61f155e99da",
+      "destination": "models/realesrgan-x4plus-anime-6b-fp32-opset17.onnx",
+      "size": 17940629,
+      "sha256": "8244ce14b66d7f285f5ed4980ce53d098c9aa7c5533d8782a5deeb7217035eb1"
+    }
+  ]
+}

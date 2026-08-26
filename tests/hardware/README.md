@@ -10,8 +10,16 @@ The cache is never downloaded by the test. Fetch and verify it separately, then 
 workspace root on the Apple M5 host:
 
 ```sh
-ZOOS_M5_RUNTIME_ASSETS=/Users/mj/dev/zoos-upscale/.cache/runtime-assets/realesrgan-ncnn-vulkan-macos/0.2.5.0/macos-universal \
+ZOOS_M5_RUNTIME_ASSETS="$PWD/.cache/runtime-assets/realesrgan-ncnn-vulkan-macos/0.2.5.0/macos-universal" \
   cargo test -p zoos-runner-realesrgan --test apple_m5_goal1a -- --ignored --nocapture --test-threads=1
+```
+
+The smaller orchestrator smoke gate runs photo PNG x2 through `JobOrchestrator`, the real process
+backend, wrapper, image verification, and atomic publication path:
+
+```sh
+ZOOS_M5_RUNTIME_ASSETS="$PWD/.cache/runtime-assets/realesrgan-ncnn-vulkan-macos/0.2.5.0/macos-universal" \
+  cargo test -p zoos-runner-realesrgan --test apple_m5_orchestrator -- --ignored --nocapture --test-threads=1
 ```
 
 `ZOOS_M5_RUNTIME_ASSETS` must be an absolute path containing `bin/realesrgan-ncnn-vulkan` and the

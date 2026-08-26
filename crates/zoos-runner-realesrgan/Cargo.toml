@@ -22,4 +22,5 @@ zoos-runner-protocol = { path = "../zoos-runner-protocol" }
 image.workspace = true
 serde.workspace = true
 tempfile = "=3.27.0"
+tokio.workspace = true
 zoos-core = { path = "../zoos-core" }

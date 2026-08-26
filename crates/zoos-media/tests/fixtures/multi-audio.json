@@ -11,12 +11,44 @@
       "r_frame_rate": "30000/1001",
       "avg_frame_rate": "30000/1001",
       "nb_read_frames": "300",
+      "time_base": "1/1000",
+      "start_time": "0.000000",
+      "duration": "10.010000",
       "color_transfer": "bt709",
-      "color_primaries": "bt709"
+      "color_primaries": "bt709",
+      "tags": { "title": "Main video" },
+      "disposition": { "default": 1, "forced": 0 }
     },
-    { "index": 1, "codec_name": "aac", "codec_type": "audio" },
-    { "index": 2, "codec_name": "flac", "codec_type": "audio" }
+    {
+      "index": 1,
+      "codec_name": "aac",
+      "codec_type": "audio",
+      "start_time": "0.000000",
+      "duration": "10.010000",
+      "tags": { "language": "kor", "title": "Korean" },
+      "disposition": { "default": 1, "forced": 0 }
+    },
+    {
+      "index": 2,
+      "codec_name": "flac",
+      "codec_type": "audio",
+      "start_time": "0.000000",
+      "duration": "10.010000",
+      "tags": { "language": "eng", "title": "English" },
+      "disposition": { "default": 0, "forced": 0 }
+    }
   ],
-  "chapters": [],
-  "format": { "format_name": "matroska,webm", "duration": "10.010000" }
+  "chapters": [
+    {
+      "id": 7,
+      "start_time": "0.000000",
+      "end_time": "5.000000",
+      "tags": { "title": "Opening" }
+    }
+  ],
+  "format": {
+    "format_name": "matroska,webm",
+    "duration": "10.010000",
+    "tags": { "title": "Goal 2 metadata fixture", "encoder": "fixture" }
+  }
 }

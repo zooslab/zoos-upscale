@@ -40,7 +40,7 @@ use crate::image_safety::{
 use crate::video_safety::{
     VideoOutputPlan, VideoPipelineVerification, VideoSafetyError, cleanup_owned_video_output,
     cleanup_video_work_directory, plan_video_output, publish_staged_video_output,
-    recheck_video_input, stage_private_video_output,
+    recheck_video_input, stage_private_video_output, validate_published_video_output,
 };
 
 const JOB_SPEC_FILE: &str = "job-spec.json";
@@ -75,6 +75,7 @@ const RIFE_MODEL_PARAM_SHA256: &str =
     "724569596bcd1e7b9fa50455c604777ebed99746d2ef40aa86e31b5725f1053c";
 const RIFE_MODEL_BIN_SHA256: &str =
     "f334ed2260149ce0188a6dcf049844e8b0cdd912e01cbcfb63553157d2508958";
+const VIDEO_ENCODE_BITRATE_BITS_PER_SECOND: u64 = 12_000_000;
 
 #[derive(Deserialize)]
 struct RunnerRequestVersion {
@@ -774,11 +775,22 @@ impl WorkspaceStore {
             let chunk_frames =
                 u32::try_from(((768 * 1024 * 1024_u64) / bytes_per_interval).clamp(1, 120))
                     .map_err(|_| WorkspaceError::UnsafeRunnerRequest)?;
-            let bounded_workspace_bytes = frame_bytes
+            let bounded_frame_bytes = frame_bytes
                 .saturating_mul(u64::from(chunk_frames).saturating_add(1))
                 .saturating_mul(5);
             let input_size = fs::symlink_metadata(&input_path)?.len();
-            let estimated_output_bytes = input_size.saturating_mul(3);
+            let encoded_video_bytes = descriptor
+                .duration_ms
+                .saturating_mul(VIDEO_ENCODE_BITRATE_BITS_PER_SECOND)
+                .div_ceil(8_000);
+            let estimated_output_bytes = input_size
+                .saturating_mul(3)
+                .max(encoded_video_bytes.saturating_add(input_size));
+            // The runner retains all encoded chunks while creating an equally sized joined
+            // stream, then creates the private muxed output. Account for those accumulated
+            // intermediates separately from the private + destination-side partial copies.
+            let bounded_workspace_bytes =
+                bounded_frame_bytes.saturating_add(estimated_output_bytes.saturating_mul(2));
             let output = plan_video_output(
                 &input_path,
                 descriptor.container,
@@ -1492,6 +1504,9 @@ impl WorkspaceStore {
 
     pub fn recover_interrupted(&self) -> Result<(), WorkspaceError> {
         for job in self.list_jobs()? {
+            if job.status.is_active() && self.recover_completed_video_job(&job)? {
+                continue;
+            }
             if job.status == JobStatus::Created
                 && ((job.kind == JobKind::ImageUpscale && job.selected_backend.is_some())
                     || (job.kind == JobKind::VideoInterpolate
@@ -1519,6 +1534,62 @@ impl WorkspaceStore {
             }
         }
         Ok(())
+    }
+
+    fn recover_completed_video_job(&self, job: &JobSummary) -> Result<bool, WorkspaceError> {
+        if job.kind != JobKind::VideoInterpolate {
+            return Ok(false);
+        }
+        let job_dir = self.job_dir(&job.job_id)?;
+        let manifest: JobManifest = read_json(&job_dir.join(MANIFEST_FILE))?;
+        if manifest.result.as_deref() != Some("completed")
+            || manifest.exit_code != Some(0)
+            || manifest.started_at_ms.is_none()
+            || manifest.finished_at_ms.is_none()
+        {
+            return Ok(false);
+        }
+        let pipeline: VideoPipelinePlan = read_json(&job_dir.join(VIDEO_PIPELINE_FILE))?;
+        let verification_path = job_dir.join(VERIFICATION_FILE);
+        if require_regular_file(&verification_path).is_err() {
+            return Ok(false);
+        }
+        let verification: VideoPipelineVerification = match read_json(&verification_path) {
+            Ok(verification) => verification,
+            Err(_) => return Ok(false),
+        };
+        let manifest_matches = manifest.actual_video_backend == Some(pipeline.selected_backend)
+            && manifest
+                .actual_device
+                .as_deref()
+                .is_some_and(|device| !device.is_empty())
+            && manifest.ffmpeg_sha256.as_deref() == Some(FFMPEG_SHA256)
+            && manifest.ffprobe_sha256.as_deref() == Some(FFPROBE_SHA256)
+            && manifest.rife_engine_sha256.as_deref() == Some(RIFE_ENGINE_SHA256)
+            && manifest.rife_model_param_sha256.as_deref() == Some(RIFE_MODEL_PARAM_SHA256)
+            && manifest.rife_model_bin_sha256.as_deref() == Some(RIFE_MODEL_BIN_SHA256)
+            && manifest.source_sha256.as_deref() == Some(verification.input_sha256_after.as_str())
+            && manifest.intermediate_sha256.as_deref() == Some(verification.output_sha256.as_str())
+            && manifest.final_sha256.as_deref() == Some(verification.output_sha256.as_str())
+            && manifest.source_rate == Some(verification.source_rate)
+            && manifest.target_rate == Some(verification.target_rate)
+            && manifest.source_frames == Some(verification.source_frames)
+            && manifest.output_frames == Some(verification.output_frames)
+            && manifest.scene_cut_count == Some(verification.scene_cut_count)
+            && manifest.chunk_count == Some(verification.chunk_count);
+        if !manifest_matches
+            || validate_published_video_output(&pipeline.output, &verification).is_err()
+        {
+            return Ok(false);
+        }
+        self.update_summary(&job.job_id, |summary| {
+            summary.status = JobStatus::Completed;
+            summary.progress_percent = 100;
+            summary.stage = None;
+            summary.message = "Video interpolation completed successfully".into();
+            summary.error = None;
+        })?;
+        Ok(true)
     }
 
     fn recover_staging(&self) -> Result<(), WorkspaceError> {
@@ -2533,15 +2604,23 @@ mod tests {
                 numerator: 25,
                 denominator: 1,
             },
+            video_time_base: Some(RationalRate {
+                numerator: 1,
+                denominator: 1_000,
+            }),
             video_stream_index: 0,
             streams: vec![zoos_media::MediaStreamDescriptor {
                 input_index: 0,
                 kind: zoos_runner_protocol::MuxStreamKind::Video,
                 codec_name: "h264".into(),
+                start_time_ms: Some(0),
                 duration_ms: 1_000,
                 duration_from_format: false,
+                tags: std::collections::BTreeMap::new(),
+                disposition: std::collections::BTreeMap::new(),
             }],
             chapters: Vec::new(),
+            format_tags: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2669,15 +2748,23 @@ mod tests {
                 numerator: 50,
                 denominator: 1,
             },
+            video_time_base: Some(RationalRate {
+                numerator: 1,
+                denominator: 1_000,
+            }),
             video_stream_index: 0,
             streams: vec![zoos_media::MediaStreamDescriptor {
                 input_index: 0,
                 kind: zoos_runner_protocol::MuxStreamKind::Video,
                 codec_name: "h264".into(),
+                start_time_ms: Some(0),
                 duration_ms: 1_000,
                 duration_from_format: false,
+                tags: std::collections::BTreeMap::new(),
+                disposition: std::collections::BTreeMap::new(),
             }],
             chapters: Vec::new(),
+            format_tags: std::collections::BTreeMap::new(),
         };
         let private_sha256 =
             crate::image_safety::sha256_file(&request.output.path).expect("private output hash");
@@ -2700,6 +2787,119 @@ mod tests {
         assert_eq!(manifest.final_sha256.as_deref().map(str::len), Some(64));
         assert_eq!(manifest.output_frames, Some(50));
         assert_eq!(manifest.chunk_count, Some(1));
+    }
+
+    #[test]
+    fn recovery_promotes_manifest_completed_video_without_removing_final() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let inputs = tempfile::tempdir().expect("input root");
+        let input = inputs.path().join("clip.mkv");
+        fs::write(&input, b"source-video").expect("video fixture");
+        let store = WorkspaceStore::new(root.path()).expect("workspace");
+        let job = store
+            .create_video_job(
+                video_descriptor(&input),
+                video_settings(),
+                VideoBackend::VulkanGpu,
+            )
+            .expect("video job");
+        let StoredRunnerRequest::VideoInterpolate(request) = store
+            .load_stored_job(&job.job_id)
+            .expect("stored job")
+            .runner_request
+        else {
+            panic!("video request expected")
+        };
+        fs::write(&request.output.path, b"verified-video-output").expect("private output");
+        write_json_atomic(
+            &root
+                .path()
+                .join(&job.job_id)
+                .join("work")
+                .join(VIDEO_RUNNER_EVIDENCE_FILE),
+            &serde_json::json!({
+                "schema_version": 1,
+                "job_id": job.job_id,
+                "selected_backend": "vulkan",
+                "selected_device": "gpu:0",
+                "source_frames": 25,
+                "output_frames": 50,
+                "chunk_count": 1,
+                "scene_cut_count": 0,
+                "ffmpeg_sha256": FFMPEG_SHA256,
+                "ffprobe_sha256": FFPROBE_SHA256,
+                "rife_sha256": RIFE_ENGINE_SHA256,
+                "model_sha256": {
+                    "flownet.param": RIFE_MODEL_PARAM_SHA256,
+                    "flownet.bin": RIFE_MODEL_BIN_SHA256
+                }
+            }),
+        )
+        .expect("runner evidence");
+        let output_descriptor = MediaDescriptor {
+            input_path: request.output.path.clone(),
+            container: zoos_runner_protocol::VideoContainer::Mkv,
+            format_name: "matroska,webm".into(),
+            duration_ms: 1_000,
+            width: 64,
+            height: 64,
+            frame_count: 50,
+            frame_rate: RationalRate {
+                numerator: 50,
+                denominator: 1,
+            },
+            video_time_base: Some(RationalRate {
+                numerator: 1,
+                denominator: 1_000,
+            }),
+            video_stream_index: 0,
+            streams: vec![zoos_media::MediaStreamDescriptor {
+                input_index: 0,
+                kind: zoos_runner_protocol::MuxStreamKind::Video,
+                codec_name: "h264".into(),
+                start_time_ms: Some(0),
+                duration_ms: 1_000,
+                duration_from_format: false,
+                tags: std::collections::BTreeMap::new(),
+                disposition: std::collections::BTreeMap::new(),
+            }],
+            chapters: Vec::new(),
+            format_tags: std::collections::BTreeMap::new(),
+        };
+        let private_sha256 =
+            crate::image_safety::sha256_file(&request.output.path).expect("private output hash");
+        store
+            .publish_verified_video_output(&job.job_id, &output_descriptor, &private_sha256)
+            .expect("verified publish");
+        store
+            .finish_manifest(&job.job_id, "completed", Some(0), now_ms())
+            .expect("completed manifest");
+        store
+            .update_summary(&job.job_id, |summary| {
+                summary.status = JobStatus::Verifying;
+                summary.progress_percent = 99;
+            })
+            .expect("crash-window summary");
+        let final_path = job.output_path.expect("final output");
+        assert!(final_path.exists());
+        drop(store);
+
+        let reopened = WorkspaceStore::new(root.path()).expect("reopen workspace");
+        reopened
+            .recover_interrupted()
+            .expect("recover completed publish");
+        let recovered = reopened
+            .load_summary(&job.job_id)
+            .expect("recovered summary");
+        assert_eq!(recovered.status, JobStatus::Completed);
+        assert_eq!(recovered.progress_percent, 100);
+        assert!(final_path.exists());
+        assert!(
+            root.path()
+                .join(&job.job_id)
+                .join(VERIFICATION_FILE)
+                .is_file()
+        );
     }
 
     #[test]

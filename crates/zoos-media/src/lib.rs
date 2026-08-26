@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -16,6 +17,7 @@ use zoos_runner_protocol::{
 
 pub const MAX_FFPROBE_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_FFPROBE_STDERR_BYTES: usize = 64 * 1024;
+pub const MAX_CADENCE_STDOUT_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_VIDEO_SIDE: u32 = 8_192;
 pub const MAX_VIDEO_PIXELS: u64 = 33_177_600;
 pub const MAX_VIDEO_FRAMES: u64 = 1_000_000;
@@ -77,9 +79,51 @@ impl Ffprobe {
     ) -> Result<MediaDescriptor, MediaError> {
         validate_input_path(input)?;
 
+        let arguments = FFPROBE_ARGUMENTS.map(OsString::from);
+        let stdout = self
+            .run_probe(input, &arguments, MAX_FFPROBE_STDOUT_BYTES)
+            .await?;
+        let descriptor = parse_descriptor(input, &stdout, mode)?;
+        self.verify_video_cadence(input, &descriptor).await?;
+        Ok(descriptor)
+    }
+
+    async fn verify_video_cadence(
+        &self,
+        input: &Path,
+        descriptor: &MediaDescriptor,
+    ) -> Result<(), MediaError> {
+        let arguments = [
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "frame=best_effort_timestamp_time",
+            "-of",
+            "csv=p=0",
+        ]
+        .map(OsString::from);
+        let stdout = self
+            .run_probe(input, &arguments, MAX_CADENCE_STDOUT_BYTES)
+            .await?;
+        validate_cadence(
+            &stdout,
+            descriptor.frame_rate,
+            descriptor.video_time_base,
+            descriptor.frame_count,
+        )
+    }
+
+    async fn run_probe(
+        &self,
+        input: &Path,
+        arguments: &[OsString],
+        stdout_limit: usize,
+    ) -> Result<Vec<u8>, MediaError> {
         let mut command = Command::new(&self.executable);
         command
-            .args(FFPROBE_ARGUMENTS)
+            .args(arguments)
             .arg(input)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -99,7 +143,7 @@ impl Ffprobe {
             .stderr
             .take()
             .ok_or_else(|| MediaError::Spawn("ffprobe stderr was not piped".into()))?;
-        let stdout_task = tokio::spawn(read_bounded(stdout, MAX_FFPROBE_STDOUT_BYTES));
+        let stdout_task = tokio::spawn(read_bounded(stdout, stdout_limit));
         let stderr_task = tokio::spawn(read_bounded(stderr, MAX_FFPROBE_STDERR_BYTES));
         let started = Instant::now();
 
@@ -142,7 +186,7 @@ impl Ffprobe {
                 message: String::from_utf8_lossy(&stderr).trim().to_owned(),
             });
         }
-        parse_descriptor(input, &stdout, mode)
+        Ok(stdout)
     }
 }
 
@@ -156,9 +200,13 @@ pub struct MediaDescriptor {
     pub height: u32,
     pub frame_count: u64,
     pub frame_rate: RationalRate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_time_base: Option<RationalRate>,
     pub video_stream_index: u32,
     pub streams: Vec<MediaStreamDescriptor>,
     pub chapters: Vec<MediaChapterDescriptor>,
+    #[serde(default)]
+    pub format_tags: BTreeMap<String, String>,
 }
 
 impl MediaDescriptor {
@@ -193,8 +241,13 @@ pub struct MediaStreamDescriptor {
     pub input_index: u32,
     pub kind: MuxStreamKind,
     pub codec_name: String,
+    pub start_time_ms: Option<i64>,
     pub duration_ms: u64,
     pub duration_from_format: bool,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    #[serde(default)]
+    pub disposition: BTreeMap<String, i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +255,8 @@ pub struct MediaChapterDescriptor {
     pub id: i64,
     pub start_ms: u64,
     pub end_ms: u64,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,6 +271,8 @@ struct RawProbe {
 struct RawFormat {
     format_name: String,
     duration: String,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,9 +293,17 @@ struct RawStream {
     #[serde(default)]
     avg_frame_rate: Option<String>,
     #[serde(default)]
+    time_base: Option<String>,
+    #[serde(default)]
     nb_read_frames: Option<String>,
     #[serde(default)]
     duration: Option<String>,
+    #[serde(default)]
+    start_time: Option<String>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+    #[serde(default)]
+    disposition: BTreeMap<String, i32>,
     #[serde(default)]
     color_transfer: Option<String>,
     #[serde(default)]
@@ -250,6 +315,8 @@ struct RawChapter {
     id: i64,
     start_time: String,
     end_time: String,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,14 +367,24 @@ fn parse_descriptor(
         };
         let (stream_duration_ms, duration_from_format) = match stream.duration.as_deref() {
             Some(duration) => (parse_duration_ms(duration, "stream.duration")?, false),
-            None => (duration_ms, true),
+            None => match duration_from_tags(&stream.tags)? {
+                Some(duration) => (duration, false),
+                None => (duration_ms, true),
+            },
         };
         streams.push(MediaStreamDescriptor {
             input_index: stream.index,
             kind,
             codec_name: stream.codec_name,
+            start_time_ms: stream
+                .start_time
+                .as_deref()
+                .map(|value| parse_signed_time_ms(value, "stream.start_time"))
+                .transpose()?,
             duration_ms: stream_duration_ms,
             duration_from_format,
+            tags: stream.tags,
+            disposition: stream.disposition,
         });
     }
     streams.sort_by_key(|stream| stream.input_index);
@@ -324,6 +401,7 @@ fn parse_descriptor(
             id: chapter.id,
             start_ms,
             end_ms,
+            tags: chapter.tags,
         });
     }
 
@@ -336,9 +414,11 @@ fn parse_descriptor(
         height: video.height,
         frame_count: video.frame_count,
         frame_rate: video.frame_rate,
+        video_time_base: video.time_base,
         video_stream_index: video.index,
         streams,
         chapters,
+        format_tags: raw.format.tags,
     })
 }
 
@@ -348,6 +428,7 @@ struct VideoFacts {
     height: u32,
     frame_count: u64,
     frame_rate: RationalRate,
+    time_base: Option<RationalRate>,
 }
 
 impl TryFrom<&RawStream> for VideoFacts {
@@ -372,12 +453,14 @@ impl TryFrom<&RawStream> for VideoFacts {
                 .as_deref()
                 .ok_or_else(|| MediaError::Malformed("average frame rate is missing".into()))?,
         )?;
+        let time_base = stream.time_base.as_deref().map(parse_rate).transpose()?;
         Ok(Self {
             index: stream.index,
             width,
             height,
             frame_count,
             frame_rate,
+            time_base,
         })
     }
 }
@@ -490,6 +573,25 @@ pub fn verify_interpolated_output(
     if source.chapters.len() != output.chapters.len() {
         return Err(MediaError::Verification("chapter count changed"));
     }
+    if plan.copy_metadata
+        && !tags_preserved(&source.format_tags, &output.format_tags, TagScope::Format)
+    {
+        return Err(MediaError::Verification("format metadata changed"));
+    }
+    if plan.copy_chapters {
+        for (source_chapter, output_chapter) in source.chapters.iter().zip(&output.chapters) {
+            if source_chapter.start_ms.abs_diff(output_chapter.start_ms) > frame_tolerance_ms
+                || source_chapter.end_ms.abs_diff(output_chapter.end_ms) > frame_tolerance_ms
+                || !tags_preserved(
+                    &source_chapter.tags,
+                    &output_chapter.tags,
+                    TagScope::Chapter,
+                )
+            {
+                return Err(MediaError::Verification("chapter metadata changed"));
+            }
+        }
+    }
 
     let mut planned = plan.streams.clone();
     planned.sort_by_key(|stream| stream.input_index);
@@ -546,21 +648,109 @@ pub fn verify_interpolated_output(
                 return Err(MediaError::Verification("invalid non-video MuxPlan action"));
             }
         }
+        if !tags_preserved(&source_stream.tags, &output_stream.tags, TagScope::Stream)
+            || !positive_dispositions_preserved(
+                &source_stream.disposition,
+                &output_stream.disposition,
+            )
+        {
+            return Err(MediaError::Verification("stream metadata changed"));
+        }
+        if source_stream
+            .start_time_ms
+            .zip(output_stream.start_time_ms)
+            .is_some_and(|(source, output)| source.abs_diff(output) > frame_tolerance_ms)
+            || (source_stream.start_time_ms.is_some() && output_stream.start_time_ms.is_none())
+            || (!source_stream.duration_from_format
+                && source_stream
+                    .duration_ms
+                    .abs_diff(output_stream.duration_ms)
+                    > frame_tolerance_ms)
+        {
+            return Err(MediaError::Verification("stream timing changed"));
+        }
     }
 
-    let output_video_duration = output
+    let output_video = output
         .streams
         .iter()
         .find(|stream| stream.kind == MuxStreamKind::Video)
-        .map(|stream| stream.duration_ms)
         .ok_or(MediaError::Verification("output video stream is missing"))?;
-    if output.streams.iter().any(|stream| {
-        stream.kind == MuxStreamKind::Audio
-            && stream.duration_ms.abs_diff(output_video_duration) > frame_tolerance_ms
-    }) {
-        return Err(MediaError::Verification("audio and video duration differ"));
+    if output_video.duration_from_format {
+        return Err(MediaError::Verification("video duration is unavailable"));
+    }
+    let video_start = output_video.start_time_ms.unwrap_or(0);
+    let video_end = video_start.saturating_add_unsigned(output_video.duration_ms);
+    for audio in output
+        .streams
+        .iter()
+        .filter(|stream| stream.kind == MuxStreamKind::Audio)
+    {
+        if audio.duration_from_format {
+            return Err(MediaError::Verification("audio duration is unavailable"));
+        }
+        let Some(audio_start) = audio.start_time_ms else {
+            return Err(MediaError::Verification("audio start time is unavailable"));
+        };
+        let audio_end = audio_start.saturating_add_unsigned(audio.duration_ms);
+        if audio_start.abs_diff(video_start) > frame_tolerance_ms
+            || audio_end.abs_diff(video_end) > frame_tolerance_ms
+        {
+            return Err(MediaError::Verification("audio and video timing differ"));
+        }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum TagScope {
+    Format,
+    Stream,
+    Chapter,
+}
+
+fn tags_preserved(
+    source: &BTreeMap<String, String>,
+    output: &BTreeMap<String, String>,
+    scope: TagScope,
+) -> bool {
+    source.iter().all(|(key, value)| {
+        ignored_generated_tag(key, scope)
+            || output
+                .iter()
+                .any(|(candidate, actual)| candidate.eq_ignore_ascii_case(key) && actual == value)
+    })
+}
+
+fn ignored_generated_tag(key: &str, scope: TagScope) -> bool {
+    let key = key.to_ascii_lowercase();
+    match scope {
+        TagScope::Format => matches!(
+            key.as_str(),
+            "encoder" | "major_brand" | "minor_version" | "compatible_brands" | "duration"
+        ),
+        TagScope::Stream => {
+            key == "encoder"
+                || key == "duration"
+                || key == "number_of_frames"
+                || key == "number_of_bytes"
+                || key.starts_with("statistics_")
+                || key.starts_with("_") && key.ends_with("_eng")
+        }
+        TagScope::Chapter => false,
+    }
+}
+
+fn positive_dispositions_preserved(
+    source: &BTreeMap<String, i32>,
+    output: &BTreeMap<String, i32>,
+) -> bool {
+    source.iter().all(|(key, value)| {
+        *value == 0
+            || output
+                .iter()
+                .any(|(candidate, actual)| candidate.eq_ignore_ascii_case(key) && actual == value)
+    })
 }
 
 fn stream_kind_counts(streams: &[MediaStreamDescriptor]) -> [usize; 3] {
@@ -589,6 +779,59 @@ fn is_hdr(stream: &RawStream) -> bool {
         .color_primaries
         .as_deref()
         .is_some_and(|value| value.eq_ignore_ascii_case("bt2020"))
+}
+
+fn validate_cadence(
+    bytes: &[u8],
+    frame_rate: RationalRate,
+    time_base: Option<RationalRate>,
+    expected_frames: u64,
+) -> Result<(), MediaError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| MediaError::Malformed("frame timestamps are not UTF-8".into()))?;
+    let expected_delta = f64::from(frame_rate.denominator) / f64::from(frame_rate.numerator);
+    let timestamp_quantum = time_base.map_or(0.000_002, |base| {
+        f64::from(base.numerator) / f64::from(base.denominator)
+    });
+    let tolerance = timestamp_quantum.max(0.000_002) + f64::EPSILON;
+    let mut previous: Option<f64> = None;
+    let mut count = 0_u64;
+    for line in text.lines() {
+        let value = line
+            .trim()
+            .split(',')
+            .next()
+            .filter(|value| !value.is_empty() && *value != "N/A")
+            .ok_or_else(|| MediaError::Malformed("video frame timestamp is missing".into()))?
+            .parse::<f64>()
+            .map_err(|_| MediaError::Malformed("invalid video frame timestamp".into()))?;
+        if !value.is_finite() {
+            return Err(MediaError::Malformed(
+                "invalid video frame timestamp".into(),
+            ));
+        }
+        if let Some(previous) = previous {
+            let delta = value - previous;
+            if delta <= 0.0 || (delta - expected_delta).abs() > tolerance {
+                return Err(MediaError::Unsupported("variable frame rate"));
+            }
+        }
+        previous = Some(value);
+        count = count
+            .checked_add(1)
+            .ok_or(MediaError::LimitExceeded("frame_count"))?;
+        if count > expected_frames {
+            return Err(MediaError::Malformed(
+                "frame timestamp count exceeds the decoded frame count".into(),
+            ));
+        }
+    }
+    if count != expected_frames {
+        return Err(MediaError::Malformed(format!(
+            "frame timestamp count mismatch: expected {expected_frames}, got {count}"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_rate(value: &str) -> Result<RationalRate, MediaError> {
@@ -629,6 +872,57 @@ fn parse_duration_ms(value: &str, field: &'static str) -> Result<u64, MediaError
         return Err(MediaError::Malformed(format!("invalid {field}")));
     }
     Ok((seconds * 1_000.0).round() as u64)
+}
+
+fn parse_signed_time_ms(value: &str, field: &'static str) -> Result<i64, MediaError> {
+    let seconds = value
+        .parse::<f64>()
+        .map_err(|_| MediaError::Malformed(format!("invalid {field}")))?;
+    if !seconds.is_finite()
+        || seconds < (i64::MIN / 1_000) as f64
+        || seconds > (i64::MAX / 1_000) as f64
+    {
+        return Err(MediaError::Malformed(format!("invalid {field}")));
+    }
+    Ok((seconds * 1_000.0).round() as i64)
+}
+
+fn duration_from_tags(tags: &BTreeMap<String, String>) -> Result<Option<u64>, MediaError> {
+    let Some(value) = tags
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("duration"))
+        .map(|(_, value)| value)
+    else {
+        return Ok(None);
+    };
+    let mut fields = value.split(':');
+    let hours = fields.next();
+    let minutes = fields.next();
+    let seconds = fields.next();
+    if fields.next().is_some() {
+        return Err(MediaError::Malformed("invalid stream duration tag".into()));
+    }
+    let (Some(hours), Some(minutes), Some(seconds)) = (hours, minutes, seconds) else {
+        return Err(MediaError::Malformed("invalid stream duration tag".into()));
+    };
+    let hours = hours
+        .parse::<u64>()
+        .map_err(|_| MediaError::Malformed("invalid stream duration tag".into()))?;
+    let minutes = minutes
+        .parse::<u64>()
+        .map_err(|_| MediaError::Malformed("invalid stream duration tag".into()))?;
+    let seconds = seconds
+        .parse::<f64>()
+        .map_err(|_| MediaError::Malformed("invalid stream duration tag".into()))?;
+    if minutes >= 60 || !seconds.is_finite() || !(0.0..60.0).contains(&seconds) {
+        return Err(MediaError::Malformed("invalid stream duration tag".into()));
+    }
+    let total_ms = hours
+        .checked_mul(3_600_000)
+        .and_then(|value| value.checked_add(minutes * 60_000))
+        .and_then(|value| value.checked_add((seconds * 1_000.0).round() as u64))
+        .ok_or(MediaError::LimitExceeded("duration"))?;
+    Ok(Some(total_ms))
 }
 
 fn validate_container(input: &Path, format_name: &str) -> Result<VideoContainer, MediaError> {
@@ -782,7 +1076,7 @@ pub enum MediaError {
     Spawn(String),
     #[error("ffprobe timed out")]
     TimedOut,
-    #[error("ffprobe stdout exceeded 8 MiB")]
+    #[error("ffprobe stdout exceeded its bounded safety limit")]
     StdoutTooLarge,
     #[error("ffprobe stderr exceeded 64 KiB")]
     StderrTooLarge,
@@ -977,6 +1271,53 @@ mod tests {
     }
 
     #[test]
+    fn decoded_timestamps_must_have_a_constant_cadence() {
+        let exact = b"0.000000\n0.033333\n0.066667\n0.100000\n";
+        validate_cadence(
+            exact,
+            RationalRate {
+                numerator: 30,
+                denominator: 1,
+            },
+            Some(RationalRate {
+                numerator: 1,
+                denominator: 30_000,
+            }),
+            4,
+        )
+        .expect("quantized CFR timestamps");
+
+        let vfr = b"0.000000\n0.033333\n0.083333\n0.116667\n";
+        assert_eq!(
+            validate_cadence(
+                vfr,
+                RationalRate {
+                    numerator: 30,
+                    denominator: 1,
+                },
+                Some(RationalRate {
+                    numerator: 1,
+                    denominator: 30_000,
+                }),
+                4,
+            ),
+            Err(MediaError::Unsupported("variable frame rate"))
+        );
+        assert!(matches!(
+            validate_cadence(
+                exact,
+                RationalRate {
+                    numerator: 30,
+                    denominator: 1,
+                },
+                None,
+                5,
+            ),
+            Err(MediaError::Malformed(_))
+        ));
+    }
+
+    #[test]
     fn supports_mov_and_rejects_multiple_video_data_and_attachment_streams() {
         let (_directory, input, base) = fixture("video-only.json", "mp4");
         let mov_input = input.with_extension("mov");
@@ -1016,7 +1357,7 @@ mod tests {
             source
                 .streams
                 .iter()
-                .all(|stream| stream.duration_from_format)
+                .all(|stream| !stream.duration_from_format)
         );
 
         let mut output_json: serde_json::Value =
@@ -1061,7 +1402,7 @@ mod tests {
         wrong_audio_duration.streams[1].duration_ms -= 18;
         assert_eq!(
             verify_interpolated_output(&source, &wrong_audio_duration, &plan),
-            Err(MediaError::Verification("audio and video duration differ"))
+            Err(MediaError::Verification("stream timing changed"))
         );
         let mut incomplete_plan = plan.clone();
         incomplete_plan.streams.pop();
@@ -1069,6 +1410,24 @@ mod tests {
             verify_interpolated_output(&source, &output, &incomplete_plan),
             Err(MediaError::Verification(_))
         ));
+        let mut missing_metadata = output.clone();
+        missing_metadata.streams[1].tags.remove("language");
+        assert_eq!(
+            verify_interpolated_output(&source, &missing_metadata, &plan),
+            Err(MediaError::Verification("stream metadata changed"))
+        );
+        let mut missing_format_metadata = output.clone();
+        missing_format_metadata.format_tags.remove("title");
+        assert_eq!(
+            verify_interpolated_output(&source, &missing_format_metadata, &plan),
+            Err(MediaError::Verification("format metadata changed"))
+        );
+        let mut missing_chapter_metadata = output.clone();
+        missing_chapter_metadata.chapters[0].tags.remove("title");
+        assert_eq!(
+            verify_interpolated_output(&source, &missing_chapter_metadata, &plan),
+            Err(MediaError::Verification("chapter metadata changed"))
+        );
     }
 
     #[cfg(unix)]
@@ -1078,13 +1437,24 @@ mod tests {
         let tool_directory = tempfile::tempdir().expect("tool tempdir");
         let capture = tool_directory.path().join("args.txt");
         let json = tool_directory.path().join("probe.json");
+        let cadence = tool_directory.path().join("cadence.txt");
         fs::write(&json, bytes).expect("probe JSON");
+        fs::write(
+            &cadence,
+            (0..300)
+                .map(|index| format!("{:.6}\n", f64::from(index) / 30.0))
+                .collect::<String>(),
+        )
+        .expect("cadence fixture");
         let script = tool_directory.path().join("ffprobe fixture");
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\n: > '{}'\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{}'; done\n/bin/cat '{}'\n",
-                capture.display(), capture.display(), json.display()
+                "#!/bin/sh\nprintf '%s\\n' '---' >> '{}'\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{}'; done\ncase \"$*\" in\n  *best_effort_timestamp_time*) /bin/cat '{}' ;;\n  *) /bin/cat '{}' ;;\nesac\n",
+                capture.display(),
+                capture.display(),
+                cadence.display(),
+                json.display()
             ),
         )
         .expect("script");
@@ -1099,8 +1469,13 @@ mod tests {
             .expect("probe succeeds");
         assert_eq!(descriptor.input_path, input);
         let arguments = fs::read_to_string(capture).expect("captured arguments");
+        let invocations = arguments
+            .split("---\n")
+            .filter(|invocation| !invocation.is_empty())
+            .map(|invocation| invocation.lines().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
         assert_eq!(
-            arguments.lines().collect::<Vec<_>>(),
+            invocations[0],
             vec![
                 "-v",
                 "error",
@@ -1110,6 +1485,20 @@ mod tests {
                 "-show_streams",
                 "-show_chapters",
                 "-count_frames",
+                input.to_str().expect("UTF-8 fixture path"),
+            ]
+        );
+        assert_eq!(
+            invocations[1],
+            vec![
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "frame=best_effort_timestamp_time",
+                "-of",
+                "csv=p=0",
                 input.to_str().expect("UTF-8 fixture path"),
             ]
         );

@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use atomic_write_file::AtomicWriteFile;
@@ -181,11 +183,20 @@ pub fn publish_staged_video_output(
     verification_path: &Path,
     verification: &VideoPipelineVerification,
 ) -> Result<(), VideoSafetyError> {
+    publish_staged_video_output_with_hook(plan, verification_path, verification, || {})
+}
+
+fn publish_staged_video_output_with_hook(
+    plan: &VideoOutputPlan,
+    verification_path: &Path,
+    verification: &VideoPipelineVerification,
+    before_rename: impl FnOnce(),
+) -> Result<(), VideoSafetyError> {
     validate_verification(plan, verification)?;
     require_safe_planned_destination(plan)?;
-    require_regular_file(&plan.partial_path)?;
-    let staged_hash =
-        sha256_file(&plan.partial_path).map_err(VideoSafetyError::from_image_safety)?;
+    let mut staged_file = open_regular_file_no_follow(&plan.partial_path)?;
+    let staged_identity = FileIdentity::from_file(&staged_file)?;
+    let staged_hash = sha256_open_file(&mut staged_file)?;
     if staged_hash != verification.output_sha256 {
         return Err(VideoSafetyError::InvalidOutput(
             "staged output hash does not match verification",
@@ -197,9 +208,42 @@ pub fn publish_staged_video_output(
     }
 
     write_json_atomic(verification_path, verification)?;
+    before_rename();
+    let current_identity = match open_regular_file_no_follow(&plan.partial_path)
+        .and_then(|file| FileIdentity::from_file(&file))
+    {
+        Ok(identity) if identity == staged_identity => identity,
+        Ok(_) | Err(_) => {
+            let _ = remove_file_if_present(&plan.partial_path);
+            let _ = remove_file_if_present(verification_path);
+            return Err(VideoSafetyError::InvalidOutput(
+                "staged output identity changed before publish",
+            ));
+        }
+    };
     if let Err(error) = no_replace_rename(&plan.partial_path, &plan.final_path) {
         let _ = remove_file_if_present(verification_path);
         return Err(VideoSafetyError::from_image_safety(error));
+    }
+    let published = (|| {
+        let mut final_file = open_regular_file_no_follow(&plan.final_path)?;
+        let final_identity = FileIdentity::from_file(&final_file)?;
+        if final_identity != current_identity || final_identity != staged_identity {
+            return Err(VideoSafetyError::InvalidOutput(
+                "published output identity does not match the verified staging file",
+            ));
+        }
+        if sha256_open_file(&mut final_file)? != verification.output_sha256 {
+            return Err(VideoSafetyError::InvalidOutput(
+                "published output hash does not match verification",
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = published {
+        let _ = remove_file_if_present(&plan.final_path);
+        let _ = remove_file_if_present(verification_path);
+        return Err(error);
     }
     if let Err(error) = sync_parent_directory(&plan.final_path) {
         if sha256_file(&plan.final_path).ok().as_deref()
@@ -209,6 +253,26 @@ pub fn publish_staged_video_output(
         }
         let _ = remove_file_if_present(verification_path);
         return Err(VideoSafetyError::from_image_safety(error));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_published_video_output(
+    plan: &VideoOutputPlan,
+    verification: &VideoPipelineVerification,
+) -> Result<(), VideoSafetyError> {
+    validate_verification(plan, verification)?;
+    require_safe_planned_destination(plan)?;
+    if path_exists_no_follow(&plan.partial_path)? {
+        return Err(VideoSafetyError::InvalidOutput(
+            "completed publish still has a partial output",
+        ));
+    }
+    let mut final_file = open_regular_file_no_follow(&plan.final_path)?;
+    if sha256_open_file(&mut final_file)? != verification.output_sha256 {
+        return Err(VideoSafetyError::InvalidOutput(
+            "completed output hash does not match verification",
+        ));
     }
     Ok(())
 }
@@ -351,6 +415,74 @@ fn require_regular_file(path: &Path) -> Result<(), VideoSafetyError> {
         ));
     }
     Ok(())
+}
+
+fn open_regular_file_no_follow(path: &Path) -> Result<File, VideoSafetyError> {
+    let path_metadata = fs::symlink_metadata(path)?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || path_metadata.len() == 0
+    {
+        return Err(VideoSafetyError::InvalidOutput(
+            "output is not a regular file",
+        ));
+    }
+    let file = File::open(path)?;
+    let file_metadata = file.metadata()?;
+    if !file_metadata.is_file() || file_metadata.len() == 0 {
+        return Err(VideoSafetyError::InvalidOutput(
+            "output is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino() {
+        return Err(VideoSafetyError::InvalidOutput(
+            "output identity changed while it was opened",
+        ));
+    }
+    Ok(file)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn from_file(file: &File) -> Result<Self, VideoSafetyError> {
+        let metadata = file.metadata()?;
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            Ok(Self {})
+        }
+    }
+}
+
+fn sha256_open_file(file: &mut File) -> Result<String, VideoSafetyError> {
+    use sha2::{Digest, Sha256};
+
+    file.rewind()?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn first_available_output(
@@ -624,6 +756,60 @@ mod tests {
         ));
         assert_eq!(
             fs::read(&plan.final_path).expect("existing final"),
+            b"verified-video"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swapped_staging_inode_is_never_left_published() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let plan = plan(directory.path());
+        fs::write(&plan.private_output_path, b"verified-video").expect("private output");
+        let output_hash = stage_private_video_output(&plan).expect("stage output");
+        let verification_path = directory.path().join("verification.json");
+        let verification = VideoPipelineVerification {
+            schema_version: 1,
+            job_id: plan.job_id.clone(),
+            input_path: plan.input.path.clone(),
+            input_sha256_before: plan.input.sha256.clone(),
+            input_sha256_after: plan.input.sha256.clone(),
+            output_path: plan.final_path.clone(),
+            output_sha256: output_hash,
+            container: VideoContainer::Mp4,
+            width: 64,
+            height: 64,
+            source_rate: RationalRate {
+                numerator: 30,
+                denominator: 1,
+            },
+            target_rate: RationalRate {
+                numerator: 60,
+                denominator: 1,
+            },
+            source_frames: 2,
+            output_frames: 4,
+            duration_ms: 67,
+            audio_streams: 0,
+            subtitle_streams: 0,
+            chapter_count: 0,
+            scene_cut_count: 0,
+            chunk_count: 1,
+        };
+        let displaced = plan.partial_path.with_extension("displaced");
+        let result =
+            publish_staged_video_output_with_hook(&plan, &verification_path, &verification, || {
+                fs::rename(&plan.partial_path, &displaced).expect("displace verified inode");
+                // Identical bytes prove that the inode check, rather than a second hash alone,
+                // rejects replacement between verification and rename.
+                fs::write(&plan.partial_path, b"verified-video").expect("replacement inode");
+            });
+        assert!(matches!(result, Err(VideoSafetyError::InvalidOutput(_))));
+        assert!(!plan.final_path.exists());
+        assert!(!plan.partial_path.exists());
+        assert!(!verification_path.exists());
+        assert_eq!(
+            fs::read(displaced).expect("verified inode remains"),
             b"verified-video"
         );
     }

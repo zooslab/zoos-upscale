@@ -10,14 +10,17 @@ use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 use zoos_core::{
-    BackendError, ImageBackend, ImageBatchMetadata, ImageOutputFormat, ImagePreset, ImageSettings,
-    JobKind, JobOrchestrator, JobStatus, JobSummary, MetadataPolicy, OrchestratorError,
-    WorkspaceError,
+    BackendError, Ffprobe, ImageBackend, ImageBatchMetadata, ImageOutputFormat, ImagePreset,
+    ImageSettings, JobKind, JobOrchestrator, JobStatus, JobSummary, MediaError, MetadataPolicy,
+    OrchestratorError, VideoBackend, VideoContainer, VideoSafetyError, VideoSettings,
+    WorkspaceError, validate_video_file,
 };
 
 const GPU_RUNTIME_ASSET_SUBDIRECTORY: &str = "realesrgan-ncnn-vulkan-macos/0.2.5.0/macos-universal";
 const CPU_RUNTIME_ASSET_SUBDIRECTORY: &str = "onnxruntime-macos-arm64/1.29.0";
 const CPU_MODEL_ASSET_SUBDIRECTORY: &str = "realesrgan-onnx/goal1b-v1";
+const FFMPEG_RUNTIME_ASSET_SUBDIRECTORY: &str = "ffmpeg-macos-arm64/9.0.1";
+const RIFE_RUNTIME_ASSET_SUBDIRECTORY: &str = "rife-ncnn-vulkan-macos/20221029/macos-universal";
 
 const RUNTIME_ASSETS: [RuntimeAsset; 5] = [
     RuntimeAsset {
@@ -62,6 +65,37 @@ const CPU_MODEL_ASSETS: [RuntimeAsset; 2] = [
     RuntimeAsset {
         relative_path: "models/realesrgan-x4plus-anime-6b-fp32-opset17.onnx",
         sha256: "8244ce14b66d7f285f5ed4980ce53d098c9aa7c5533d8782a5deeb7217035eb1",
+        executable: false,
+    },
+];
+
+const FFMPEG_RUNTIME_ASSETS: [RuntimeAsset; 2] = [
+    RuntimeAsset {
+        relative_path: "bin/ffmpeg",
+        sha256: "653e700a788f3376ebc3817a3dcda56e111111410f7edd8eea919c4089216d4e",
+        executable: true,
+    },
+    RuntimeAsset {
+        relative_path: "bin/ffprobe",
+        sha256: "edaf9c5f53aef960ceb5f779d986e7dea86ee549e6716a2c03b70010b88a4da6",
+        executable: true,
+    },
+];
+
+const RIFE_RUNTIME_ASSETS: [RuntimeAsset; 3] = [
+    RuntimeAsset {
+        relative_path: "bin/rife-ncnn-vulkan",
+        sha256: "d11429c72f0cddfb170fd131ee9373dc5329a5729c4382c0acfd40092e5ed19a",
+        executable: true,
+    },
+    RuntimeAsset {
+        relative_path: "models/rife-v4.6/flownet.param",
+        sha256: "724569596bcd1e7b9fa50455c604777ebed99746d2ef40aa86e31b5725f1053c",
+        executable: false,
+    },
+    RuntimeAsset {
+        relative_path: "models/rife-v4.6/flownet.bin",
+        sha256: "f334ed2260149ce0188a6dcf049844e8b0cdd912e01cbcfb63553157d2508958",
         executable: false,
     },
 ];
@@ -125,6 +159,71 @@ impl ImageRuntime {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct VideoRuntime {
+    pub wrapper_path: PathBuf,
+    pub ffmpeg_install_directory: PathBuf,
+    pub rife_install_directory: PathBuf,
+    pub media_probe: Ffprobe,
+}
+
+impl VideoRuntime {
+    pub fn ffmpeg_path(&self) -> PathBuf {
+        self.ffmpeg_install_directory.join("bin/ffmpeg")
+    }
+
+    pub fn ffprobe_path(&self) -> PathBuf {
+        self.ffmpeg_install_directory.join("bin/ffprobe")
+    }
+
+    pub fn rife_engine_path(&self) -> PathBuf {
+        self.rife_install_directory.join("bin/rife-ncnn-vulkan")
+    }
+
+    pub fn rife_models_path(&self) -> PathBuf {
+        self.rife_install_directory.join("models/rife-v4.6")
+    }
+
+    pub fn status(&self) -> VideoEngineStatus {
+        let media = backend_status(
+            &self.ffprobe_path(),
+            &[(
+                &self.ffmpeg_install_directory,
+                FFMPEG_RUNTIME_ASSETS.as_slice(),
+            )],
+            "9.0.1",
+            "software",
+        );
+        let gpu = backend_status(
+            &self.wrapper_path,
+            &[(&self.rife_install_directory, RIFE_RUNTIME_ASSETS.as_slice())],
+            "20221029 / rife-v4.6",
+            "gpu:0",
+        );
+        let cpu = backend_status(
+            &self.wrapper_path,
+            &[(&self.rife_install_directory, RIFE_RUNTIME_ASSETS.as_slice())],
+            "20221029 / rife-v4.6",
+            "cpu",
+        );
+        let recommended_backend = if media.state != ImageEngineState::Ready {
+            None
+        } else if gpu.state == ImageEngineState::Ready {
+            Some(VideoBackend::VulkanGpu)
+        } else if cpu.state == ImageEngineState::Ready {
+            Some(VideoBackend::NcnnCpu)
+        } else {
+            None
+        };
+        VideoEngineStatus {
+            media,
+            gpu,
+            cpu,
+            recommended_backend,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ImageEngineState {
@@ -149,7 +248,7 @@ impl BackendEngineStatus {
         Self {
             state: ImageEngineState::Ready,
             code: None,
-            message: "The verified local image engine is ready.".into(),
+            message: "The verified local processing engine is ready.".into(),
             engine_version: Some(engine_version.into()),
             device: Some(device.into()),
         }
@@ -159,7 +258,7 @@ impl BackendEngineStatus {
         Self {
             state: ImageEngineState::NotInstalled,
             code: Some("ENGINE_NOT_INSTALLED".into()),
-            message: "The verified local image engine is not installed.".into(),
+            message: "The verified local processing engine is not installed.".into(),
             engine_version: None,
             device: None,
         }
@@ -169,7 +268,7 @@ impl BackendEngineStatus {
         Self {
             state: ImageEngineState::Invalid,
             code: Some("ASSET_HASH_MISMATCH".into()),
-            message: "The local image engine cache failed integrity verification.".into(),
+            message: "The local processing engine cache failed integrity verification.".into(),
             engine_version: None,
             device: None,
         }
@@ -195,6 +294,14 @@ pub struct ImageEngineStatus {
     pub recommended_backend: Option<ImageBackend>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VideoEngineStatus {
+    pub media: BackendEngineStatus,
+    pub gpu: BackendEngineStatus,
+    pub cpu: BackendEngineStatus,
+    pub recommended_backend: Option<VideoBackend>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CommandError {
     pub code: String,
@@ -204,6 +311,76 @@ pub struct CommandError {
 #[tauri::command]
 pub fn get_image_engine_status(runtime: State<'_, ImageRuntime>) -> ImageEngineStatus {
     runtime.status()
+}
+
+#[tauri::command]
+pub fn get_video_engine_status(runtime: State<'_, VideoRuntime>) -> VideoEngineStatus {
+    runtime.status()
+}
+
+#[tauri::command]
+pub async fn pick_and_create_video_job(
+    app: AppHandle,
+    orchestrator: State<'_, JobOrchestrator>,
+    runtime: State<'_, VideoRuntime>,
+    backend: VideoBackend,
+) -> Result<Option<JobSummary>, CommandError> {
+    let selected_backend = select_video_backend(&runtime.status(), backend)?;
+    let selected = app
+        .dialog()
+        .file()
+        .add_filter("CFR SDR video", &["mp4", "mov", "mkv"])
+        .blocking_pick_file();
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let input_path = selected.into_path().map_err(|_| {
+        CommandError::fixed(
+            "UNSUPPORTED_MEDIA",
+            "The selected item is not a local video file.",
+        )
+    })?;
+    let container = video_container_from_path(&input_path)?;
+    let before = validate_video_file(&input_path, container).map_err(CommandError::from_video)?;
+    let descriptor = runtime
+        .media_probe
+        .probe(&input_path)
+        .await
+        .map_err(CommandError::from_media)?;
+    let after = validate_video_file(&input_path, container).map_err(CommandError::from_video)?;
+    if before.sha256 != after.sha256 {
+        return Err(CommandError::fixed(
+            "INPUT_CHANGED",
+            "The selected video changed while it was being inspected.",
+        ));
+    }
+    let created = orchestrator
+        .create_video_job(descriptor, VideoSettings { backend }, selected_backend)
+        .map_err(CommandError::from)?;
+    match orchestrator.start_job(&created.job_id).await {
+        Ok(started) => Ok(Some(started)),
+        Err(error) => {
+            let _ = orchestrator.cancel_created_job(&created.job_id);
+            Err(CommandError::from(error))
+        }
+    }
+}
+
+fn video_container_from_path(path: &Path) -> Result<VideoContainer, CommandError> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("mp4") => Ok(VideoContainer::Mp4),
+        Some("mov") => Ok(VideoContainer::Mov),
+        Some("mkv") => Ok(VideoContainer::Mkv),
+        _ => Err(CommandError::fixed(
+            "UNSUPPORTED_MEDIA",
+            "Only MP4, MOV, and MKV inputs are supported.",
+        )),
+    }
 }
 
 #[tauri::command]
@@ -397,17 +574,29 @@ pub async fn list_jobs(
 #[tauri::command]
 pub async fn start_job(
     orchestrator: State<'_, JobOrchestrator>,
-    runtime: State<'_, ImageRuntime>,
+    image_runtime: State<'_, ImageRuntime>,
+    video_runtime: State<'_, VideoRuntime>,
     job_id: String,
 ) -> Result<JobSummary, CommandError> {
     if let Some(job) = orchestrator
         .list_jobs()
         .map_err(CommandError::from)?
         .iter()
-        .find(|job| job.job_id == job_id && job.kind == JobKind::ImageUpscale)
+        .find(|job| job.job_id == job_id)
     {
-        let selected_backend = stored_backend(job.selected_backend);
-        require_backend(&runtime.status(), selected_backend)?;
+        match job.kind {
+            JobKind::ImageUpscale => {
+                let selected_backend = stored_backend(job.selected_backend);
+                require_backend(&image_runtime.status(), selected_backend)?;
+            }
+            JobKind::VideoInterpolate => {
+                let selected_backend = job.selected_video_backend.ok_or_else(|| {
+                    CommandError::fixed("INVALID_JOB_STATE", "The stored video backend is missing.")
+                })?;
+                require_video_backend(&video_runtime.status(), selected_backend)?;
+            }
+            JobKind::FakeValidation => {}
+        }
     }
     orchestrator
         .start_job(&job_id)
@@ -528,6 +717,48 @@ fn require_backend(status: &ImageEngineStatus, backend: ImageBackend) -> Result<
     }
 }
 
+fn select_video_backend(
+    status: &VideoEngineStatus,
+    requested: VideoBackend,
+) -> Result<VideoBackend, CommandError> {
+    match requested {
+        VideoBackend::Auto => status.recommended_backend.ok_or_else(|| {
+            if [status.media.state, status.gpu.state, status.cpu.state]
+                .contains(&ImageEngineState::Invalid)
+            {
+                CommandError::fixed(
+                    "ASSET_HASH_MISMATCH",
+                    "A local video runtime cache failed integrity verification.",
+                )
+            } else {
+                CommandError::fixed(
+                    "ENGINE_NOT_INSTALLED",
+                    "No verified local video backend is installed.",
+                )
+            }
+        }),
+        backend @ (VideoBackend::VulkanGpu | VideoBackend::NcnnCpu) => {
+            require_video_backend(status, backend)?;
+            Ok(backend)
+        }
+    }
+}
+
+fn require_video_backend(
+    status: &VideoEngineStatus,
+    backend: VideoBackend,
+) -> Result<(), CommandError> {
+    status.media.clone().into_result()?;
+    match backend {
+        VideoBackend::VulkanGpu => status.gpu.clone().into_result(),
+        VideoBackend::NcnnCpu => status.cpu.clone().into_result(),
+        VideoBackend::Auto => Err(CommandError::fixed(
+            "UPSTREAM_FAILED",
+            "Auto must be resolved before a video job is stored.",
+        )),
+    }
+}
+
 #[tauri::command]
 pub async fn cancel_job(
     orchestrator: State<'_, JobOrchestrator>,
@@ -560,11 +791,19 @@ impl From<OrchestratorError> for CommandError {
                 code: error.code().into(),
                 message: error.to_string(),
             },
-            OrchestratorError::Backend(error) => Self::from_backend(error),
-            OrchestratorError::Workspace(_) => Self::fixed(
-                "UPSTREAM_FAILED",
-                "The image job could not be updated safely.",
+            OrchestratorError::Workspace(WorkspaceError::Video(error)) => Self {
+                code: error.code().into(),
+                message: error.to_string(),
+            },
+            OrchestratorError::Workspace(WorkspaceError::Media(error)) => Self::from_media(error),
+            OrchestratorError::Workspace(WorkspaceError::MediaVerifierUnavailable) => Self::fixed(
+                "ENGINE_NOT_INSTALLED",
+                "The verified ffprobe runtime is not configured.",
             ),
+            OrchestratorError::Backend(error) => Self::from_backend(error),
+            OrchestratorError::Workspace(_) => {
+                Self::fixed("UPSTREAM_FAILED", "The job could not be updated safely.")
+            }
         }
     }
 }
@@ -583,11 +822,11 @@ impl CommandError {
             | BackendError::RunnerNotRegistered(_)
             | BackendError::SpawnFailed(_) => Self::fixed(
                 "ENGINE_NOT_INSTALLED",
-                "The verified local image engine is not installed.",
+                "The verified local processing engine is not installed.",
             ),
             BackendError::ProbeFailed(_) => Self::fixed(
                 "ASSET_HASH_MISMATCH",
-                "The local image engine cache failed integrity verification.",
+                "The local processing engine cache failed integrity verification.",
             ),
             BackendError::RunnerFailed {
                 error_code,
@@ -603,6 +842,13 @@ impl CommandError {
                     | "INSUFFICIENT_DISK"
                     | "OUTPUT_EXISTS"
                     | "GPU_UNAVAILABLE"
+                    | "UNSUPPORTED_MEDIA"
+                    | "MEDIA_TOO_LARGE"
+                    | "FFPROBE_FAILED"
+                    | "FFMPEG_FAILED"
+                    | "RIFE_FAILED"
+                    | "MUX_FAILED"
+                    | "INVALID_OUTPUT"
                     | "UPSTREAM_FAILED"
                     | "CANCELLED"
             ) =>
@@ -612,11 +858,25 @@ impl CommandError {
                     message,
                 }
             }
-            BackendError::Cancelled => Self::fixed("CANCELLED", "The image upscale was cancelled."),
+            BackendError::Cancelled => Self::fixed("CANCELLED", "The local job was cancelled."),
             _ => Self::fixed(
                 "UPSTREAM_FAILED",
-                "The local image engine failed unexpectedly.",
+                "The local processing engine failed unexpectedly.",
             ),
+        }
+    }
+
+    fn from_media(error: MediaError) -> Self {
+        Self {
+            code: error.code().into(),
+            message: error.to_string(),
+        }
+    }
+
+    fn from_video(error: VideoSafetyError) -> Self {
+        Self {
+            code: error.code().into(),
+            message: error.to_string(),
         }
     }
 }
@@ -736,6 +996,14 @@ pub fn cpu_model_asset_directory(cache_root: &Path) -> PathBuf {
     cache_root.join(CPU_MODEL_ASSET_SUBDIRECTORY)
 }
 
+pub fn ffmpeg_runtime_asset_directory(cache_root: &Path) -> PathBuf {
+    cache_root.join(FFMPEG_RUNTIME_ASSET_SUBDIRECTORY)
+}
+
+pub fn rife_runtime_asset_directory(cache_root: &Path) -> PathBuf {
+    cache_root.join(RIFE_RUNTIME_ASSET_SUBDIRECTORY)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,6 +1083,18 @@ mod tests {
         fs::write(assets.join("models/model.bin"), b"corrupt").expect("corrupt fixture");
         let corrupt = backend_status(&wrapper, &roots, "test", "test");
         assert_eq!(corrupt.state, ImageEngineState::Invalid);
+
+        #[cfg(unix)]
+        {
+            let external = directory.path().join("external-model");
+            fs::write(&external, b"world").expect("external model");
+            fs::remove_file(assets.join("models/model.bin")).expect("remove model");
+            std::os::unix::fs::symlink(&external, assets.join("models/model.bin"))
+                .expect("model symlink");
+            let symlinked = backend_status(&wrapper, &roots, "test", "test");
+            assert_eq!(symlinked.state, ImageEngineState::Invalid);
+            assert_eq!(fs::read(external).expect("external remains"), b"world");
+        }
     }
 
     #[test]
@@ -851,6 +1131,48 @@ mod tests {
     }
 
     #[test]
+    fn video_auto_requires_media_and_prefers_gpu_then_cpu() {
+        let both = VideoEngineStatus {
+            media: status(ImageEngineState::Ready),
+            gpu: status(ImageEngineState::Ready),
+            cpu: status(ImageEngineState::Ready),
+            recommended_backend: Some(VideoBackend::VulkanGpu),
+        };
+        assert_eq!(
+            select_video_backend(&both, VideoBackend::Auto).expect("GPU auto selection"),
+            VideoBackend::VulkanGpu
+        );
+        let cpu_only = VideoEngineStatus {
+            media: status(ImageEngineState::Ready),
+            gpu: status(ImageEngineState::NotInstalled),
+            cpu: status(ImageEngineState::Ready),
+            recommended_backend: Some(VideoBackend::NcnnCpu),
+        };
+        assert_eq!(
+            select_video_backend(&cpu_only, VideoBackend::Auto).expect("CPU auto selection"),
+            VideoBackend::NcnnCpu
+        );
+        assert_eq!(
+            select_video_backend(&cpu_only, VideoBackend::VulkanGpu)
+                .expect_err("explicit missing GPU")
+                .code,
+            "ENGINE_NOT_INSTALLED"
+        );
+        let no_media = VideoEngineStatus {
+            media: status(ImageEngineState::NotInstalled),
+            gpu: status(ImageEngineState::Ready),
+            cpu: status(ImageEngineState::Ready),
+            recommended_backend: None,
+        };
+        assert_eq!(
+            select_video_backend(&no_media, VideoBackend::Auto)
+                .expect_err("media runtime is mandatory")
+                .code,
+            "ENGINE_NOT_INSTALLED"
+        );
+    }
+
+    #[test]
     fn goal1b_pipeline_rejections_keep_their_public_error_code() {
         let error = CommandError::from(OrchestratorError::Workspace(WorkspaceError::Pipeline(
             zoos_core::Goal1bImageError::AlphaJpegUnsupported,
@@ -871,6 +1193,46 @@ mod tests {
                 "95c08dbcaa58b4fabae771e74ae458d93df59b86cdcb885b85ade5be4e7f826b",
                 "8244ce14b66d7f285f5ed4980ce53d098c9aa7c5533d8782a5deeb7217035eb1",
             ]
+        );
+    }
+
+    #[test]
+    fn video_cache_contract_uses_the_catalog_hashes() {
+        assert_eq!(
+            FFMPEG_RUNTIME_ASSETS.map(|asset| asset.sha256),
+            [
+                "653e700a788f3376ebc3817a3dcda56e111111410f7edd8eea919c4089216d4e",
+                "edaf9c5f53aef960ceb5f779d986e7dea86ee549e6716a2c03b70010b88a4da6",
+            ]
+        );
+        assert_eq!(
+            RIFE_RUNTIME_ASSETS.map(|asset| asset.sha256),
+            [
+                "d11429c72f0cddfb170fd131ee9373dc5329a5729c4382c0acfd40092e5ed19a",
+                "724569596bcd1e7b9fa50455c604777ebed99746d2ef40aa86e31b5725f1053c",
+                "f334ed2260149ce0188a6dcf049844e8b0cdd912e01cbcfb63553157d2508958",
+            ]
+        );
+    }
+
+    #[test]
+    fn media_probe_errors_keep_their_public_codes() {
+        for (error, expected) in [
+            (MediaError::Unsupported("VFR"), "UNSUPPORTED_MEDIA"),
+            (MediaError::LimitExceeded("duration"), "MEDIA_TOO_LARGE"),
+            (MediaError::TimedOut, "FFPROBE_FAILED"),
+        ] {
+            assert_eq!(CommandError::from_media(error).code, expected);
+        }
+        assert_eq!(
+            video_container_from_path(Path::new("/tmp/clip.MP4")).expect("uppercase MP4"),
+            VideoContainer::Mp4
+        );
+        assert_eq!(
+            video_container_from_path(Path::new("/tmp/clip.avi"))
+                .expect_err("unsupported extension")
+                .code,
+            "UNSUPPORTED_MEDIA"
         );
     }
 

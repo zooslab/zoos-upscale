@@ -30,6 +30,16 @@
       "approved_for_distribution": false,
       "bundled_in_release": false,
       "release_policy": "Development cache integration only; ONNX Runtime and model distribution remain blocked"
+    },
+    {
+      "id": "zoos-runner-rife",
+      "version": "0.1.0",
+      "kind": "development-video-runner-wrapper",
+      "source": "crates/zoos-runner-rife",
+      "license": "Apache-2.0",
+      "approved_for_distribution": false,
+      "bundled_in_release": false,
+      "release_policy": "Development cache integration only; FFmpeg, RIFE engine and model distribution remain blocked"
     }
   ]
 }

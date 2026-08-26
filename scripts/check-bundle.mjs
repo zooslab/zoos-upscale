@@ -12,22 +12,27 @@ const defaultBundleRoot = join(
   'macos',
   'Zoos Upscale.app',
 )
-const catalogPath = join(
-  repositoryRoot,
-  'assets',
-  'catalog',
+const catalogPaths = [
   'realesrgan-ncnn-vulkan-macos.json',
-)
+  'onnxruntime-macos-arm64.json',
+  'realesrgan-pytorch-weights.json',
+  'realesrgan-onnx-models.json',
+].map((name) => join(repositoryRoot, 'assets', 'catalog', name))
 
-export async function validateBundleContents(bundleRoot, catalog) {
-  const forbiddenName = /(?:zoos-runner-(?:fake|realesrgan)|realesrgan|\.param$|\.bin$|\.zip$)/i
+export async function validateBundleContents(bundleRoot, catalogValue) {
+  const catalogs = Array.isArray(catalogValue) ? catalogValue : [catalogValue]
+  const forbiddenName = /(?:zoos-runner-(?:fake|realesrgan|ort)|realesrgan|onnxruntime|\.param$|\.bin$|\.onnx$|\.pth$|\.dylib$|\.zip$)/i
+  const catalogFiles = catalogs.flatMap((catalog) => catalog.files ?? [])
+  const catalogSources = catalogs
+    .map((catalog) => catalog.source)
+    .filter((source) => source?.sha256 && source?.archive_size)
   const forbiddenHashes = new Set([
-    catalog.source.sha256,
-    ...catalog.files.map((file) => file.sha256),
+    ...catalogSources.map((source) => source.sha256),
+    ...catalogFiles.map((file) => file.sha256),
   ])
   const forbiddenSizes = new Set([
-    catalog.source.archive_size,
-    ...catalog.files.map((file) => file.size),
+    ...catalogSources.map((source) => source.archive_size),
+    ...catalogFiles.map((file) => file.size),
   ])
 
   let inspectedFiles = 0
@@ -61,7 +66,9 @@ async function listBundleFiles(directory) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const catalog = JSON.parse(await readFile(catalogPath, 'utf8'))
-  const inspected = await validateBundleContents(defaultBundleRoot, catalog)
+  const catalogs = await Promise.all(
+    catalogPaths.map(async (path) => JSON.parse(await readFile(path, 'utf8'))),
+  )
+  const inspected = await validateBundleContents(defaultBundleRoot, catalogs)
   console.log(`Verified ${inspected} production bundle files; no engine or model assets found`)
 }

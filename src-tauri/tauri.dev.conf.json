@@ -6,7 +6,8 @@
   "bundle": {
     "externalBin": [
       "binaries/zoos-runner-fake",
-      "binaries/zoos-runner-realesrgan"
+      "binaries/zoos-runner-realesrgan",
+      "binaries/zoos-runner-ort"
     ]
   }
 }

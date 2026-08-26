@@ -20,6 +20,25 @@ test('rejects a fake runner configured as an external binary', () => {
   )
 })
 
+test('rejects the ORT wrapper and runtime from the public bundle', () => {
+  assert.throws(
+    () =>
+      validateDistribution(
+        { bundle: { externalBin: ['binaries/zoos-runner-ort'] } },
+        { sidecars: [] },
+      ),
+    /unapproved runtime asset/,
+  )
+  assert.throws(
+    () =>
+      validateDistribution(
+        { bundle: { resources: ['lib/libonnxruntime.1.29.0.dylib'] } },
+        { sidecars: [] },
+      ),
+    /unapproved runtime asset/,
+  )
+})
+
 test('rejects a model configured as a public resource', () => {
   assert.throws(
     () =>

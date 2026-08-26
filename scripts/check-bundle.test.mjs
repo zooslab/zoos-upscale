@@ -32,6 +32,28 @@ test('rejects a fake runner by bundle path', async () => {
   )
 })
 
+test('rejects renamed ORT and ONNX assets by catalog hash', async () => {
+  const model = Buffer.from('onnx-model')
+  const bundle = await fixtureBundle(model, 'innocent-name')
+  await assert.rejects(
+    validateBundleContents(bundle, [
+      fixtureCatalog(Buffer.from('engine')),
+      { files: [{ size: model.length, sha256: hash(model) }] },
+    ]),
+    /cataloged runtime asset/,
+  )
+})
+
+test('rejects ORT wrapper and dylib paths', async () => {
+  for (const name of ['zoos-runner-ort', 'libonnxruntime.1.29.0.dylib']) {
+    const bundle = await fixtureBundle('not a real binary', name)
+    await assert.rejects(
+      validateBundleContents(bundle, fixtureCatalog(Buffer.from('engine'))),
+      /forbidden runtime asset/,
+    )
+  }
+})
+
 function fixtureCatalog(engine) {
   return {
     source: { archive_size: 1, sha256: '0'.repeat(64) },

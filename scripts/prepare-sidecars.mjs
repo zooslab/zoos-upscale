@@ -23,6 +23,7 @@ if (!/^[a-zA-Z0-9_.-]+$/.test(targetTriple)) {
 const sidecars = [
   ['zoos-runner-fake', 'zoos-runner-fake-bin'],
   ['zoos-runner-realesrgan', 'zoos-runner-realesrgan-bin'],
+  ['zoos-runner-ort', 'zoos-runner-ort-bin'],
 ]
 const cargoArguments = ['build', '--locked']
 for (const [packageName] of sidecars) cargoArguments.push('-p', packageName)

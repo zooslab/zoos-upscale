@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -675,8 +675,6 @@ fn upstream_args(
     .into()
 }
 
-static PRIVATE_OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
 fn claim_private_upstream_output(destination: &Path) -> Result<PathBuf, String> {
     let parent = destination
         .parent()
@@ -685,26 +683,21 @@ fn claim_private_upstream_output(destination: &Path) -> Result<PathBuf, String> 
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| "native output filename is invalid".to_string())?;
-    for _ in 0..100 {
-        let sequence = PRIVATE_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(
-            ".{name}.zoos-upstream-{}-{sequence}.partial.png",
-            std::process::id()
-        ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => {
-                if let Err(error) = file.sync_all() {
-                    drop(file);
-                    let _ = fs::remove_file(&path);
-                    return Err(error.to_string());
-                }
-                return Ok(path);
+    let path = parent.join(format!(".{name}.zoos-upstream.partial.png"));
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(file) => {
+            if let Err(error) = file.sync_all() {
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(error.to_string());
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("could not claim private native output: {error}")),
+            Ok(path)
         }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            Err("private native output already exists; interrupted-job cleanup is required".into())
+        }
+        Err(error) => Err(format!("could not claim private native output: {error}")),
     }
-    Err("could not allocate a private native output path".into())
 }
 
 fn verify_assets(
@@ -1094,6 +1087,25 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[test]
+    fn private_upstream_output_has_a_deterministic_job_owned_name() {
+        let temp = tempdir().unwrap();
+        let output = temp.path().join("sr-native-x4.png");
+        let private = claim_private_upstream_output(&output).expect("first claim must succeed");
+        assert_eq!(
+            private,
+            temp.path()
+                .join(".sr-native-x4.png.zoos-upstream.partial.png")
+        );
+        assert!(private.is_file());
+        assert!(
+            claim_private_upstream_output(&output)
+                .unwrap_err()
+                .contains("cleanup is required")
+        );
+        fs::remove_file(private).unwrap();
     }
 
     #[test]

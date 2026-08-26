@@ -819,6 +819,8 @@ impl WorkspaceStore {
             }
             StoredRunnerRequest::ImageUpscaleV2(request) => {
                 let pipeline: ImagePipelinePlan = read_json(&job_dir.join(IMAGE_PIPELINE_FILE))?;
+                let upstream_partial = upstream_private_output_path(&pipeline.native_x4_png)
+                    .ok_or(WorkspaceError::UnsafeRunnerRequest)?;
                 let destination_partial_was_present =
                     match fs::symlink_metadata(&pipeline.destination_partial) {
                         Ok(_) => true,
@@ -826,6 +828,7 @@ impl WorkspaceStore {
                         Err(error) => return Err(error.into()),
                     };
                 remove_if_exists(&request.output.path)?;
+                remove_if_exists(&upstream_partial)?;
                 remove_if_exists(&pipeline.destination_partial)?;
                 remove_if_exists(&pipeline.inference_png)?;
                 if let Some(alpha) = pipeline.alpha_png.as_ref() {
@@ -1553,10 +1556,12 @@ fn is_safe_image_request_v2(
     ));
     let work_is_safe = fs::symlink_metadata(&work)
         .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+    let upstream_private_output = upstream_private_output_path(&pipeline.native_x4_png);
     let managed_files_safe = [
         Some(request.input.path.as_path()),
         pipeline.alpha_png.as_deref(),
         Some(request.output.path.as_path()),
+        upstream_private_output.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -1609,6 +1614,8 @@ fn is_safe_image_request_v2(
             .as_ref()
             .is_none_or(|path| path == &work.join("alpha.png"))
         && pipeline.native_x4_png == work.join("sr-native-x4.png")
+        && upstream_private_output
+            .is_some_and(|path| path == work.join(".sr-native-x4.png.zoos-upstream.partial.png"))
         && pipeline.source_path != final_path
         && final_path.parent().is_some_and(|final_parent| {
             pipeline
@@ -1633,6 +1640,12 @@ fn is_safe_image_request_v2(
         && work_is_safe
         && managed_files_safe
         && final_name_is_safe
+}
+
+fn upstream_private_output_path(destination: &Path) -> Option<PathBuf> {
+    let parent = destination.parent()?;
+    let name = destination.file_name()?.to_str()?;
+    Some(parent.join(format!(".{name}.zoos-upstream.partial.png")))
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), WorkspaceError> {
@@ -2841,6 +2854,85 @@ mod tests {
             b_manifest.result.as_deref(),
             Some("cancelled_after_restart")
         );
+    }
+
+    #[test]
+    fn goal1b_recovery_removes_deterministic_gpu_upstream_partial_after_wrapper_crash() {
+        let workspace = tempfile::tempdir().expect("workspace must be created");
+        let sources = tempfile::tempdir().expect("sources must be created");
+        let input = sources.path().join("input.png");
+        rgb_png(&input, 2, 2, [1, 2, 3]);
+        let store = WorkspaceStore::new(workspace.path()).expect("store must open");
+        let created = store
+            .create_image_job_v2(
+                &input,
+                goal1b_settings(ProductOutputFormat::Png),
+                ImageBackend::VulkanGpu,
+                None,
+            )
+            .expect("GPU job must create");
+        let private_output = workspace
+            .path()
+            .join(&created.job_id)
+            .join("work/.sr-native-x4.png.zoos-upstream.partial.png");
+        fs::write(
+            &private_output,
+            b"wrapper was killed after claiming this file",
+        )
+        .expect("crash residue fixture");
+        store
+            .update_summary(&created.job_id, |summary| {
+                summary.status = JobStatus::Running
+            })
+            .expect("job must become active");
+        drop(store);
+
+        let reopened = WorkspaceStore::new(workspace.path()).expect("workspace must reopen");
+        assert!(
+            private_output.exists(),
+            "regular owned residue is valid before recovery"
+        );
+        reopened
+            .recover_interrupted()
+            .expect("interrupted recovery must clean owned files");
+        assert!(!private_output.exists());
+        assert_eq!(
+            reopened.load_summary(&created.job_id).unwrap().status,
+            JobStatus::Interrupted
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn goal1b_gpu_upstream_partial_symlink_is_quarantined_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace must be created");
+        let sources = tempfile::tempdir().expect("sources must be created");
+        let input = sources.path().join("input.png");
+        let external = sources.path().join("external.txt");
+        rgb_png(&input, 2, 2, [1, 2, 3]);
+        fs::write(&external, b"must remain unchanged").unwrap();
+        let expected = fs::read(&external).unwrap();
+        let store = WorkspaceStore::new(workspace.path()).expect("store must open");
+        let created = store
+            .create_image_job_v2(
+                &input,
+                goal1b_settings(ProductOutputFormat::Png),
+                ImageBackend::VulkanGpu,
+                None,
+            )
+            .expect("GPU job must create");
+        let private_output = workspace
+            .path()
+            .join(&created.job_id)
+            .join("work/.sr-native-x4.png.zoos-upstream.partial.png");
+        symlink(&external, private_output).expect("malicious private output symlink");
+        drop(store);
+
+        let reopened = WorkspaceStore::new(workspace.path()).expect("startup must continue");
+        assert!(reopened.list_jobs().unwrap().is_empty());
+        assert_eq!(fs::read(external).unwrap(), expected);
     }
 
     #[cfg(unix)]

@@ -7,9 +7,11 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use image::{ColorType, ImageDecoder, ImageReader};
 use sha2::{Digest, Sha256};
 use zoos_runner_protocol::{
-    DeviceCapability, ImageModelId, ImageUpscaleJobRequest, ModelCapability, PROTOCOL_VERSION,
+    DeviceCapability, ImageBackendSettingsV2, ImageDeviceV2, ImageModelId, ImageSemanticModelV2,
+    ImageUpscaleJobRequest, ImageUpscaleJobRequestV2, ModelCapability, PROTOCOL_VERSION,
     RunnerCapabilities, RunnerEvent, RunnerEventPayload, RunnerOutput, RunnerTask, UpstreamInfo,
 };
 
@@ -171,22 +173,51 @@ fn run_job_file(
     model_files: &[(&str, &str)],
     output: &mut impl Write,
 ) -> i32 {
-    let request: ImageUpscaleJobRequest = match File::open(job_path)
-        .map_err(|error| error.to_string())
-        .and_then(|file| serde_json::from_reader(file).map_err(|error| error.to_string()))
-        .and_then(|request: ImageUpscaleJobRequest| {
-            request
-                .validate()
-                .map(|()| request)
-                .map_err(|error| error.to_string())
-        }) {
+    let request = match read_job_request(job_path) {
         Ok(request) => request,
         Err(error) => {
             eprintln!("invalid image job: {error}");
             return EXIT_INVALID_INPUT;
         }
     };
-    run_job(&request, assets, engine_hash, model_files, output)
+    match request {
+        SupportedRequest::V1(request) => {
+            run_job(&request, assets, engine_hash, model_files, output)
+        }
+        SupportedRequest::V2(request) => {
+            run_job_v2(&request, assets, engine_hash, model_files, output)
+        }
+    }
+}
+
+enum SupportedRequest {
+    V1(ImageUpscaleJobRequest),
+    V2(ImageUpscaleJobRequestV2),
+}
+
+fn read_job_request(path: &Path) -> Result<SupportedRequest, String> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let version = value
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("protocol_version is required")?;
+    match version {
+        1 => {
+            let request: ImageUpscaleJobRequest =
+                serde_json::from_value(value).map_err(|error| error.to_string())?;
+            request.validate().map_err(|error| error.to_string())?;
+            Ok(SupportedRequest::V1(request))
+        }
+        2 => {
+            let request: ImageUpscaleJobRequestV2 =
+                serde_json::from_value(value).map_err(|error| error.to_string())?;
+            request.validate().map_err(|error| error.to_string())?;
+            Ok(SupportedRequest::V2(request))
+        }
+        version => Err(format!("unsupported protocol version {version}")),
+    }
 }
 
 fn run_job(
@@ -196,7 +227,187 @@ fn run_job(
     model_files: &[(&str, &str)],
     output: &mut impl Write,
 ) -> i32 {
+    let model = match request.parameters.model_id {
+        ImageModelId::RealEsrganX4plus => "realesrgan-x4plus",
+        ImageModelId::RealEsrganX4plusAnime => "realesrgan-x4plus-anime",
+    };
+    run_upstream(
+        UpstreamJob {
+            job_id: &request.job_id,
+            input: &request.input.path,
+            output: &request.output.path,
+            model,
+            scale: request.parameters.scale,
+            tile_size: request.parameters.tile_size,
+            gpu_id: request.parameters.gpu_id,
+            threads: &request.parameters.threads,
+            expected_output_dimensions: None,
+        },
+        assets,
+        engine_hash,
+        model_files,
+        output,
+    )
+}
+
+fn run_job_v2(
+    request: &ImageUpscaleJobRequestV2,
+    assets: &Assets,
+    engine_hash: &str,
+    model_files: &[(&str, &str)],
+    output: &mut impl Write,
+) -> i32 {
     let mut events = EventWriter::new(output, &request.job_id);
+    let (tile_size, threads) = match (
+        &request.parameters.device,
+        &request.parameters.backend_settings,
+    ) {
+        (
+            ImageDeviceV2::Vulkan { index: 0 },
+            ImageBackendSettingsV2::Vulkan { tile_size, threads },
+        ) => (*tile_size, threads.as_str()),
+        _ => {
+            let _ = events.failed(
+                "GPU_UNAVAILABLE",
+                "Real-ESRGAN runner protocol v2 requires Vulkan device index 0 and Vulkan settings",
+            );
+            return EXIT_INVALID_INPUT;
+        }
+    };
+    if let Err(error) = verify_v2_input(request) {
+        let _ = events.failed(error.code, &error.message);
+        return EXIT_INVALID_INPUT;
+    }
+    let expected_width = match request
+        .input
+        .width
+        .checked_mul(request.parameters.native_scale.into())
+    {
+        Some(value) => value,
+        None => {
+            let _ = events.failed("OUTPUT_TOO_LARGE", "native output width overflowed");
+            return EXIT_INVALID_INPUT;
+        }
+    };
+    let expected_height = match request
+        .input
+        .height
+        .checked_mul(request.parameters.native_scale.into())
+    {
+        Some(value) => value,
+        None => {
+            let _ = events.failed("OUTPUT_TOO_LARGE", "native output height overflowed");
+            return EXIT_INVALID_INPUT;
+        }
+    };
+    let model = match request.parameters.semantic_model {
+        ImageSemanticModelV2::Photo => "realesrgan-x4plus",
+        ImageSemanticModelV2::Anime => "realesrgan-x4plus-anime",
+    };
+    run_upstream(
+        UpstreamJob {
+            job_id: &request.job_id,
+            input: &request.input.path,
+            output: &request.output.path,
+            model,
+            // Both x2 and x4 user requests first produce the model's native x4 artifact.
+            scale: request.parameters.native_scale,
+            tile_size,
+            gpu_id: 0,
+            threads,
+            expected_output_dimensions: Some((expected_width, expected_height)),
+        },
+        assets,
+        engine_hash,
+        model_files,
+        output,
+    )
+}
+
+struct InputValidationError {
+    code: &'static str,
+    message: String,
+}
+
+fn verify_v2_input(request: &ImageUpscaleJobRequestV2) -> Result<(), InputValidationError> {
+    let actual_hash = hash_file(&request.input.path).map_err(|message| InputValidationError {
+        code: "UNSUPPORTED_IMAGE_MODE",
+        message,
+    })?;
+    if actual_hash != request.input.sha256 {
+        return Err(InputValidationError {
+            code: "INPUT_CHANGED",
+            message: "normalized input SHA-256 does not match the request".into(),
+        });
+    }
+    let reader = ImageReader::open(&request.input.path)
+        .and_then(ImageReader::with_guessed_format)
+        .map_err(|error| InputValidationError {
+            code: "UNSUPPORTED_IMAGE_MODE",
+            message: format!("normalized input cannot be opened: {error}"),
+        })?;
+    if reader.format() != Some(image::ImageFormat::Png) {
+        return Err(InputValidationError {
+            code: "UNSUPPORTED_IMAGE_MODE",
+            message: "normalized input must be PNG".into(),
+        });
+    }
+    let decoder = reader
+        .into_decoder()
+        .map_err(|error| InputValidationError {
+            code: "UNSUPPORTED_IMAGE_MODE",
+            message: format!("normalized input cannot be decoded: {error}"),
+        })?;
+    if decoder.color_type() != ColorType::Rgb8
+        || decoder.dimensions() != (request.input.width, request.input.height)
+    {
+        return Err(InputValidationError {
+            code: "UNSUPPORTED_IMAGE_MODE",
+            message: "normalized input must be RGB8 PNG with the declared dimensions".into(),
+        });
+    }
+    drop(decoder);
+    image::open(&request.input.path).map_err(|error| InputValidationError {
+        code: "UNSUPPORTED_IMAGE_MODE",
+        message: format!("normalized input pixels cannot be decoded: {error}"),
+    })?;
+    Ok(())
+}
+
+fn hash_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+struct UpstreamJob<'a> {
+    job_id: &'a str,
+    input: &'a Path,
+    output: &'a Path,
+    model: &'a str,
+    scale: u8,
+    tile_size: u32,
+    gpu_id: u32,
+    threads: &'a str,
+    expected_output_dimensions: Option<(u32, u32)>,
+}
+
+fn run_upstream(
+    job: UpstreamJob<'_>,
+    assets: &Assets,
+    engine_hash: &str,
+    model_files: &[(&str, &str)],
+    output: &mut impl Write,
+) -> i32 {
+    let mut events = EventWriter::new(output, job.job_id);
     if events
         .emit(RunnerEventPayload::Started {
             stage: "validating_assets".into(),
@@ -214,16 +425,12 @@ fn run_job(
         let _ = events.failed(code, &error);
         return EXIT_ASSET;
     }
-    if request.output.path.exists() {
+    if job.output.exists() {
         let _ = events.failed("OUTPUT_EXISTS", "destination already exists");
         return EXIT_UPSTREAM;
     }
-    let partial = request.output.path.clone();
-    let model = match request.parameters.model_id {
-        ImageModelId::RealEsrganX4plus => "realesrgan-x4plus",
-        ImageModelId::RealEsrganX4plusAnime => "realesrgan-x4plus-anime",
-    };
-    let args = upstream_args(request, &partial, assets, model);
+    let partial = job.output.to_path_buf();
+    let args = upstream_args(&job, assets);
     let mut child = match Command::new(&assets.engine)
         .args(&args)
         .stdin(Stdio::null())
@@ -353,10 +560,17 @@ fn run_job(
         );
         return EXIT_UPSTREAM;
     }
+    if let Some(expected) = job.expected_output_dimensions
+        && let Err(error) = verify_v2_output(&partial, expected)
+    {
+        let _ = fs::remove_file(&partial);
+        let _ = events.failed("UPSTREAM_FAILED", &error);
+        return EXIT_UPSTREAM;
+    }
     if events
         .emit(RunnerEventPayload::Completed {
             output: RunnerOutput {
-                path: request.output.path.clone(),
+                path: job.output.to_path_buf(),
             },
         })
         .is_err()
@@ -366,29 +580,46 @@ fn run_job(
     EXIT_SUCCESS
 }
 
-fn upstream_args(
-    request: &ImageUpscaleJobRequest,
-    partial: &Path,
-    assets: &Assets,
-    model: &str,
-) -> Vec<std::ffi::OsString> {
+fn verify_v2_output(path: &Path, expected: (u32, u32)) -> Result<(), String> {
+    let reader = ImageReader::open(path)
+        .and_then(ImageReader::with_guessed_format)
+        .map_err(|error| format!("native x4 output cannot be opened: {error}"))?;
+    if reader.format() != Some(image::ImageFormat::Png) {
+        return Err("native x4 output is not PNG".into());
+    }
+    let decoder = reader
+        .into_decoder()
+        .map_err(|error| format!("native x4 output cannot be decoded: {error}"))?;
+    if decoder.color_type() != ColorType::Rgb8 || decoder.dimensions() != expected {
+        return Err(format!(
+            "native x4 output must be RGB8 PNG with dimensions {}x{}",
+            expected.0, expected.1
+        ));
+    }
+    drop(decoder);
+    image::open(path)
+        .map_err(|error| format!("native x4 output pixels cannot be decoded: {error}"))?;
+    Ok(())
+}
+
+fn upstream_args(job: &UpstreamJob<'_>, assets: &Assets) -> Vec<std::ffi::OsString> {
     [
         "-i".into(),
-        request.input.path.as_os_str().to_owned(),
+        job.input.as_os_str().to_owned(),
         "-o".into(),
-        partial.as_os_str().to_owned(),
+        job.output.as_os_str().to_owned(),
         "-m".into(),
         assets.models.as_os_str().to_owned(),
         "-n".into(),
-        model.into(),
+        job.model.into(),
         "-s".into(),
-        request.parameters.scale.to_string().into(),
+        job.scale.to_string().into(),
         "-g".into(),
-        "0".into(),
+        job.gpu_id.to_string().into(),
         "-t".into(),
-        "256".into(),
+        job.tile_size.to_string().into(),
         "-j".into(),
-        "1:2:2".into(),
+        job.threads.into(),
         "-f".into(),
         "png".into(),
     ]
@@ -532,8 +763,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
     use zoos_runner_protocol::{
-        ImageInputFormat, ImageOutputFormat, ImagePreset, ImageRunnerInput, ImageRunnerOutput,
-        ImageTask, ImageUpscaleParameters,
+        IMAGE_PROTOCOL_VERSION_V2, ImageInferenceFormatV2, ImageInferenceInputV2, ImageInputFormat,
+        ImageIntermediateOutputV2, ImageOutputFormat, ImagePixelFormatV2, ImagePreset,
+        ImageRunnerInput, ImageRunnerOutput, ImageTask, ImageUpscaleParameters,
+        ImageUpscaleParametersV2,
     };
 
     fn hash(bytes: &[u8]) -> String {
@@ -566,6 +799,41 @@ mod tests {
         }
     }
 
+    fn request_v2(root: &Path) -> ImageUpscaleJobRequestV2 {
+        let input = root.join("normalized input.png");
+        image::RgbImage::from_pixel(2, 3, image::Rgb([10, 20, 30]))
+            .save(&input)
+            .unwrap();
+        ImageUpscaleJobRequestV2 {
+            protocol_version: IMAGE_PROTOCOL_VERSION_V2,
+            job_id: "v2-job".into(),
+            task: ImageTask::ImageUpscale,
+            input: ImageInferenceInputV2 {
+                sha256: hash(&fs::read(&input).unwrap()),
+                path: input,
+                width: 2,
+                height: 3,
+                format: ImageInferenceFormatV2::Png,
+                pixel_format: ImagePixelFormatV2::Rgb8,
+            },
+            output: ImageIntermediateOutputV2 {
+                path: root.join("native-x4.png"),
+                format: ImageInferenceFormatV2::Png,
+                pixel_format: ImagePixelFormatV2::Rgb8,
+            },
+            parameters: ImageUpscaleParametersV2 {
+                semantic_model: ImageSemanticModelV2::Photo,
+                requested_scale: 2,
+                native_scale: 4,
+                device: ImageDeviceV2::Vulkan { index: 0 },
+                backend_settings: ImageBackendSettingsV2::Vulkan {
+                    tile_size: 256,
+                    threads: "1:2:2".into(),
+                },
+            },
+        }
+    }
+
     #[test]
     fn exact_upstream_arguments_preserve_unicode_and_spaces() {
         let root = Path::new("/tmp/유니 코드");
@@ -574,12 +842,18 @@ mod tests {
             engine: root.join("engine"),
             models: root.join("models dir"),
         };
-        let args = upstream_args(
-            &request,
-            Path::new("/tmp/결과 partial.png"),
-            &assets,
-            "realesrgan-x4plus",
-        );
+        let job = UpstreamJob {
+            job_id: &request.job_id,
+            input: &request.input.path,
+            output: Path::new("/tmp/결과 partial.png"),
+            model: "realesrgan-x4plus",
+            scale: request.parameters.scale,
+            tile_size: request.parameters.tile_size,
+            gpu_id: request.parameters.gpu_id,
+            threads: &request.parameters.threads,
+            expected_output_dimensions: None,
+        };
+        let args = upstream_args(&job, &assets);
         assert_eq!(
             args,
             vec![
@@ -606,6 +880,133 @@ mod tests {
             .map(Into::into)
             .collect::<Vec<std::ffi::OsString>>()
         );
+    }
+
+    #[test]
+    fn v2_exact_arguments_always_request_native_x4() {
+        let root = Path::new("/tmp/v2 gpu");
+        let assets = Assets {
+            engine: root.join("engine"),
+            models: root.join("models"),
+        };
+        let job = UpstreamJob {
+            job_id: "v2",
+            input: &root.join("normalized.png"),
+            output: &root.join("native-x4.png"),
+            model: "realesrgan-x4plus-anime",
+            scale: 4,
+            tile_size: 256,
+            gpu_id: 0,
+            threads: "1:2:2",
+            expected_output_dimensions: Some((8, 12)),
+        };
+        assert_eq!(
+            upstream_args(&job, &assets),
+            vec![
+                "-i",
+                "/tmp/v2 gpu/normalized.png",
+                "-o",
+                "/tmp/v2 gpu/native-x4.png",
+                "-m",
+                "/tmp/v2 gpu/models",
+                "-n",
+                "realesrgan-x4plus-anime",
+                "-s",
+                "4",
+                "-g",
+                "0",
+                "-t",
+                "256",
+                "-j",
+                "1:2:2",
+                "-f",
+                "png",
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<std::ffi::OsString>>()
+        );
+    }
+
+    #[test]
+    fn v2_cpu_request_is_rejected_by_gpu_runner() {
+        let temp = tempdir().unwrap();
+        let mut request = request_v2(temp.path());
+        request.parameters.device = ImageDeviceV2::Cpu;
+        request.parameters.backend_settings = ImageBackendSettingsV2::OrtCpu {
+            tile_size: 128,
+            intra_threads: 2,
+            inter_threads: 1,
+        };
+        let assets = Assets {
+            engine: temp.path().join("missing engine"),
+            models: temp.path().join("missing models"),
+        };
+        let mut output = Vec::new();
+        assert_eq!(
+            run_job_v2(&request, &assets, "", &[], &mut output),
+            EXIT_INVALID_INPUT
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("GPU_UNAVAILABLE")
+        );
+    }
+
+    #[test]
+    fn v2_input_hash_mismatch_is_rejected_before_engine_start() {
+        let temp = tempdir().unwrap();
+        let mut request = request_v2(temp.path());
+        request.input.sha256 = "0".repeat(64);
+        let assets = Assets {
+            engine: temp.path().join("missing engine"),
+            models: temp.path().join("missing models"),
+        };
+        let mut output = Vec::new();
+        assert_eq!(
+            run_job_v2(&request, &assets, "", &[], &mut output),
+            EXIT_INVALID_INPUT
+        );
+        assert!(String::from_utf8(output).unwrap().contains("INPUT_CHANGED"));
+        assert!(!request.output.path.exists());
+    }
+
+    #[test]
+    fn v2_invalid_native_output_is_removed() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("models")).unwrap();
+        let engine = root.join("engine");
+        fs::write(
+            &engine,
+            "#!/bin/sh\nout=''\nwhile [ $# -gt 0 ]; do if [ \"$1\" = -o ]; then out=$2; shift 2; else shift; fi; done\nprintf invalid > \"$out\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&engine, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(root.join("models/model"), b"model").unwrap();
+        let assets = Assets {
+            engine: engine.clone(),
+            models: root.join("models"),
+        };
+        let request = request_v2(root);
+        let mut output = Vec::new();
+        assert_eq!(
+            run_job_v2(
+                &request,
+                &assets,
+                &hash(&fs::read(engine).unwrap()),
+                &[("model", &hash(b"model"))],
+                &mut output,
+            ),
+            EXIT_UPSTREAM
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("UPSTREAM_FAILED")
+        );
+        assert!(!request.output.path.exists());
     }
 
     #[test]

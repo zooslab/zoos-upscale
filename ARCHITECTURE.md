@@ -4,7 +4,7 @@
 
 > 이 문서는 Zoos Upscale의 공개 기술 개요입니다. **현재 구현된 범위**와 **후속 설계**를 구분해 기록합니다.
 
-**문서 상태:** 설계 기준선 v0.3.2 · Goal 0/1A 구현 반영 · **최종 갱신:** 2026-08-26
+**문서 상태:** 설계 기준선 v0.3.2 · Goal 0/1A/1B 구현 반영 · **최종 갱신:** 2026-08-26
 
 ## 1. 설계 목표
 
@@ -25,10 +25,12 @@ Zoos Upscale은 이미지 업스케일링, 영상 업스케일링, 프레임 보
 |---|---|---|
 | Goal 0 | 완료 | 범용 작업 계약, schema 생성, process 생명주기, workspace lock·staging·quarantine, 라이선스 gate |
 | Goal 1A | 완료 | 단일 RGB8 PNG/JPEG, 사진·애니, 2배·4배, Real-ESRGAN ncnn/Vulkan GPU 0, 안전한 PNG 공개 |
+| Goal 1B | 완료 | ORT CPU, 최상위 폴더 batch, RGBA 분리, EXIF 회전, ICC·EXIF 정책, PNG·JPEG·WebP 출력 |
 | Apple M5 gate | 통과 | 8개 조합×3회, 정확한 크기·RGB8·nonblack·원본 hash 불변, 골든 오차 0, 취소 후 잔존 0 |
+| Apple M5 Goal 1B gate | 통과 | CPU↔GPU 사진·애니 2x/4x PSNR 50 dB 이상, batch·alpha·ICC·EXIF·형식·취소·asset hash 증거 |
 | 공개 배포 | 차단 | 모델 가중치 재배포 권리 미확인으로 엔진·모델·개발 Fake Runner를 release bundle에서 제외 |
 
-현재 지원 표시는 **Apple M5에서 직접 통과한 Goal 1A 범위**에만 적용합니다. ORT CPU, batch, alpha, metadata 보존, FFmpeg·RIFE, Windows Job Object와 NVIDIA·AMD 검증은 아직 후속 단계입니다.
+현재 지원 표시는 **Apple M5에서 직접 통과한 Goal 1A·1B 이미지 범위**에만 적용합니다. FFmpeg·RIFE, 본격 queue·checkpoint, Windows Job Object와 NVIDIA·AMD 검증은 아직 후속 단계입니다.
 
 ## 2. 전체 시스템 구조
 
@@ -43,26 +45,28 @@ flowchart TB
         ORCH --> STORE["Job Workspace<br/>JSON 권위 원본 · 격리"]
     end
 
-    subgraph G1A["구현된 Goal 1A 실행 계층"]
+    subgraph G1["구현된 Goal 1 이미지 실행 계층"]
         EXEC --> PROTOCOL["RunnerProtocolV1<br/>job.json · NDJSON 이벤트"]
-        PROTOCOL --> WRAP["Rust Real-ESRGAN Wrapper"]
-        WRAP --> ESR["Pinned Real-ESRGAN ncnn/Vulkan<br/>개발 캐시 · GPU 0"]
+        PROTOCOL --> GPUWRAP["Rust Real-ESRGAN Wrapper"]
+        PROTOCOL --> CPUWRAP["Rust ONNX Runtime Wrapper"]
+        GPUWRAP --> ESR["Pinned Real-ESRGAN ncnn/Vulkan<br/>개발 캐시 · GPU 0"]
+        CPUWRAP --> ORT["Pinned ONNX Runtime FP32<br/>개발 캐시 · CPU"]
     end
 
-    STORE --> PREFLIGHT["입력·용량·hash 사전 검증"]
+    STORE --> PREFLIGHT["입력·용량·hash·EXIF 사전 검증<br/>RGB와 alpha 분리"]
     PREFLIGHT --> EXEC
-    ESR --> PARTIAL["대상 폴더의 .partial PNG"]
-    PARTIAL --> VERIFY["형식·크기·픽셀·hash 재검증"]
+    ESR --> X4RGB["검증된 native x4 RGB PNG"]
+    ORT --> X4RGB
+    X4RGB --> PARTIAL["PNG/JPEG/WebP 렌더<br/>대상 폴더의 숨겨진 partial"]
+    PARTIAL --> VERIFY["형식·크기·픽셀·metadata·hash 재검증"]
     VERIFY --> OUTPUT["Atomic Rename<br/>최종 결과 공개"]
 
     subgraph NEXT["후속 Goal"]
-        ORT["ONNX Runtime CPU<br/>Goal 1B"]
         MEDIA["FFmpeg / ffprobe<br/>Goal 2"]
         RIFE["RIFE 프레임 보간<br/>Goal 2"]
-        QUEUE["Batch · Queue · Checkpoint"]
+        QUEUE["본격 Queue · Pause · Checkpoint"]
     end
 
-    EXEC -. 검증 후 .-> ORT
     ORCH -. 영상 단계 .-> MEDIA
     PROTOCOL -. 영상 단계 .-> RIFE
     ORCH -. 확장 .-> QUEUE
@@ -110,14 +114,14 @@ Svelte frontend에는 범용 shell 권한을 주지 않습니다. UI는 좁은 t
 ```mermaid
 flowchart LR
     UI["Svelte UI"] -->|"typed invoke"| APP["Rust Orchestrator"]
-    APP -->|"절대 경로 · 인자 배열"| WR1["zoos-runner-realesrgan<br/>현재"]
+    APP -->|"절대 경로 · 인자 배열"| WR1["zoos-runner-realesrgan"]
+    APP --> WR3["zoos-runner-ort"]
     WR1 -->|"고정 CLI · GPU 0"| ESR["Real-ESRGAN ncnn/Vulkan<br/>v0.2.5.0 package"]
+    WR3 --> ORT["ONNX Runtime 1.29.0<br/>Real-ESRGAN ONNX FP32"]
 
-    APP -. "Goal 1B" .-> WR3["zoos-runner-ort"]
     APP -. "Goal 2" .-> WR2["zoos-runner-rife"]
     APP -. "Goal 2" .-> FF["ffmpeg / ffprobe"]
     WR2 -.-> RIFE["Pinned RIFE ncnn binary"]
-    WR3 -.-> ORT["ONNX Runtime CPU API"]
 ```
 
 - 실행 파일은 앱이 알고 있는 절대 경로로만 호출합니다.
@@ -137,39 +141,44 @@ flowchart LR
 | 오류 분류 | 표준 오류 코드 | 입력 오류, 모델 누락, GPU 오류, OOM, 취소 등 구분 |
 | 취소 | Process tree 종료 | 고아 프로세스와 불완전 결과 방지 |
 
-Rust 타입이 `RunnerProtocolV1`의 권위 원본이며 `schemars`로 JSON Schema를 생성합니다. CI의 `cargo xtask schema --check`가 생성 결과의 drift를 차단합니다. native Fake Runner로 성공·명시 실패·malformed NDJSON·crash·hang·timeout·취소·terminal event와 exit code 충돌을 검증하고, 같은 계약으로 실제 Real-ESRGAN wrapper를 실행합니다. macOS에서는 별도 process group을 사용해 자식·손자 process를 함께 종료합니다.
+Rust 타입이 runner 계약의 권위 원본이며 `schemars`로 JSON Schema를 생성합니다. Goal 1B의 backend-neutral 이미지 request는 schema version 2이고, NDJSON event envelope는 안정된 version 1을 유지합니다. CI의 `cargo xtask schema --check`가 생성 결과의 drift를 차단합니다. native Fake Runner로 성공·명시 실패·malformed NDJSON·crash·hang·timeout·취소·terminal event와 exit code 충돌을 검증하고, 같은 event 계약으로 GPU·CPU wrapper를 실행합니다. macOS에서는 별도 process group을 사용해 자식·손자 process를 함께 종료합니다.
 
 ## 4. 이미지 데이터 흐름
 
 ```mermaid
 flowchart TB
-    PICK["Rust native picker<br/>PNG · JPEG 한 장"] --> PREFLIGHT["RGB8 · EXIF orientation · 크기<br/>출력 한도 · 디스크 · 입력 SHA-256"]
-    PREFLIGHT --> PLAN["사진/애니 모델 · 2x/4x<br/>GPU 0 · tile 256 · 출력 이름 계획"]
+    PICK["Rust native picker<br/>한 장 또는 폴더 최상위 PNG/JPEG"] --> PREFLIGHT["RGB/RGBA8 · EXIF orientation · 크기<br/>출력 한도 · 디스크 · 입력 SHA-256"]
+    PREFLIGHT --> NORMALIZE["회전 적용 · EXIF tag 1<br/>RGB 추론 PNG와 alpha plane 분리"]
+    NORMALIZE --> PLAN["사진/애니 · 2x/4x · 출력 형식<br/>자동/GPU/CPU · 출력 이름 예약"]
     PLAN --> RECHECK1["시작 직전 입력 SHA-256 재검사"]
-    RECHECK1 --> WRAP["Rust wrapper<br/>NDJSON 진행률 · heartbeat"]
-    WRAP --> ESR["Real-ESRGAN ncnn/Vulkan"]
-    ESR --> PARTIAL["입력 폴더/Upscaled/<br/>숨겨진 partial PNG"]
-    PARTIAL --> VERIFY["PNG · RGB8 · 정확한 배율<br/>nonblack · 입력 SHA-256 재검사"]
+    RECHECK1 --> BACKEND{"선택된 backend"}
+    BACKEND --> GPU["ncnn/Vulkan<br/>tile 256 · GPU 0"]
+    BACKEND --> CPU["ORT FP32 CPU<br/>tile 128 · reflect101 pad 10"]
+    GPU --> X4["native x4 RGB PNG"]
+    CPU --> X4
+    X4 --> RENDER["x2면 Lanczos3 · alpha 재결합<br/>ICC·EXIF 유지 또는 제거"]
+    RENDER --> PARTIAL["입력 폴더/Upscaled/<br/>숨겨진 PNG/JPEG/WebP partial"]
+    PARTIAL --> VERIFY["형식 · RGB/RGBA8 · 정확한 배율<br/>nonblack · metadata · 입력 hash 재검사"]
     VERIFY --> PUBLISH["macOS renamex_np<br/>RENAME_EXCL"]
     PUBLISH --> RECORD["verification.json<br/>입력 전후·출력 hash와 크기"]
 
     VERIFY -->|"실패"| CLEAN["작업 소유 partial·미검증 결과 정리"]
-    WRAP -->|"실패·취소"| CLEAN
+    BACKEND -->|"실패·취소"| CLEAN
 ```
 
-계획 단계에서 `<stem>_upscaled_<2|4>x.png`를 선택하고, 이미 있으면 `_2`부터 `_999`까지 첫 빈 이름을 사용합니다. 계획 뒤 다른 process가 같은 이름을 만들면 publish를 `OUTPUT_EXISTS`로 실패시키며 기존 파일은 유지합니다.
+계획 단계에서 `<stem>_upscaled_<2|4>x.<format>`을 선택하고, 디스크 파일뿐 아니라 아직 실행되지 않은 batch 작업의 예약도 피합니다. 이미 있으면 `_2`부터 `_999`까지 첫 빈 이름을 사용합니다. 계획 뒤 다른 process가 같은 이름을 만들면 publish를 `OUTPUT_EXISTS`로 실패시키며 기존 파일은 유지합니다.
 
 ### 현재 범위와 후속 범위
 
-| 단계 | Goal 1A 현재 선택 | Goal 1B 이후 |
+| 단계 | 현재 Goal 1 범위 | 후속 |
 |---|---|---|
-| Decode·Encode | PNG/JPEG RGB8 입력, PNG RGB8 출력 | alpha 분리 처리, JPEG·WebP 출력, metadata·ICC·EXIF 보존 |
-| 일반 사진 SR | `realesrgan-x4plus`, upstream scale 2 또는 4 | 별도 x2 모델·저메모리 모델은 품질·라이선스 검증 후 |
-| 애니·일러스트 SR | `realesrgan-x4plus-anime`, upstream scale 2 또는 4 | `realesr-animevideov3`는 후속 후보 |
+| Decode·Encode | PNG/JPEG RGB8·RGBA8 입력, PNG/JPEG95/lossless WebP 출력, ICC·EXIF 정책 | 회색조·16-bit·입력 WebP는 별도 검증 후 |
+| 일반 사진 SR | `realesrgan-x4plus`, GPU ncnn 또는 CPU ONNX, native x4 뒤 2x 가능 | 별도 x2·저메모리 모델은 품질·라이선스 검증 후 |
+| 애니·일러스트 SR | `realesrgan-x4plus-anime`, GPU ncnn 또는 CPU ONNX | `realesr-animevideov3`는 후속 후보 |
 | GPU 추론 | ncnn/Vulkan GPU 0, Apple M5 검증 | NVIDIA·AMD 실제 장치 검증, 필요 시 vendor backend |
-| CPU 추론 | 미지원 | ONNX Runtime CPU artifact·self-test 추가 |
+| CPU 추론 | ONNX Runtime 1.29.0 FP32, Apple M5 검증 | 다른 OS·CPU 아키텍처 artifact 검증 |
 
-이미지 자산·처리 오류 코드는 `ENGINE_NOT_INSTALLED`, `ASSET_HASH_MISMATCH`, `UNSUPPORTED_IMAGE_MODE`, `OUTPUT_TOO_LARGE`, `INSUFFICIENT_DISK`, `OUTPUT_EXISTS`, `INPUT_CHANGED`, `GPU_UNAVAILABLE`, `UPSTREAM_FAILED`, `CANCELLED`로 고정합니다. 명령 상태 오류는 `JOB_BUSY`, `JOB_NOT_ACTIVE`, `INVALID_JOB_STATE`로 별도 구분합니다.
+이미지 자산·처리 오류 코드는 `ENGINE_NOT_INSTALLED`, `ASSET_HASH_MISMATCH`, `UNSUPPORTED_IMAGE_MODE`, `OUTPUT_TOO_LARGE`, `INSUFFICIENT_DISK`, `OUTPUT_EXISTS`, `INPUT_CHANGED`, `GPU_UNAVAILABLE`, `UPSTREAM_FAILED`, `CANCELLED`로 고정합니다. 명령 상태 오류는 `JOB_BUSY`, `JOB_NOT_ACTIVE`, `INVALID_JOB_STATE`, 폴더 선택 오류는 `BATCH_EMPTY`, `BATCH_TOO_LARGE`로 별도 구분합니다.
 
 ## 5. 영상 데이터 흐름
 
@@ -231,7 +240,8 @@ MVP의 영상 SR은 각 프레임을 독립적으로 처리하므로 세밀한 �
 |---|---|---|---|---|
 | 이미지 SR | 사진·일반 2배·4배 | RealESRGAN x4plus | ncnn `.param/.bin` | **Apple M5 검증됨** |
 | 이미지 SR | 애니·일러스트 2배·4배 | RealESRGAN x4plus anime 6B | ncnn `.param/.bin` | **Apple M5 검증됨** |
-| 이미지 SR | 사진·일반 CPU | RealESRGAN ONNX | ONNX FP32 | Goal 1B 계획 |
+| 이미지 SR | 사진·일반 CPU | RealESRGAN x4plus | ONNX FP32 opset 17 | **Apple M5 검증됨** |
+| 이미지 SR | 애니·일러스트 CPU | RealESRGAN x4plus anime 6B | ONNX FP32 opset 17 | **Apple M5 검증됨** |
 | 이미지 SR | 사진 전용 2배 | RealESRGAN x2plus | ONNX 또는 변환된 ncnn | 후보 |
 | 이미지 SR | 저메모리·빠른 처리 | realesr-general-x4v3 | 변환 artifact | 후보 |
 | 영상 SR | 일반 영상 | 이미지 SR 모델의 프레임별 적용 | ncnn / ONNX | Goal 3 계획 |
@@ -252,7 +262,7 @@ AI 모델과 실행 엔진은 분리합니다. 동일한 작업도 장치에 따
 |---|---|---|---|
 | ncnn / Vulkan | Apple M5 GPU 0 | Goal 1A 이미지 SR | **현재 검증됨** |
 | ncnn / Vulkan | NVIDIA·AMD 등 호환 GPU | 공통 이미지·영상 GPU 경로 | 해당 실장치 검증 전 후보 |
-| ONNX Runtime CPU | CPU | 이미지·영상 SR의 안전한 CPU 대체 경로 | Goal 1B 계획 |
+| ONNX Runtime CPU | Apple M5 CPU | 이미지 SR의 명시적 CPU 호환 경로 | **현재 검증됨** |
 | RIFE ncnn CPU (`-g -1`) | CPU | 프레임 보간 CPU 후보 | Goal 2 실측 후 확정 |
 | RIFE ONNX + ORT CPU | CPU | 프레임 보간 CPU 후보 | Goal 2 실측 후 확정 |
 | Core ML | Apple Silicon | macOS 전용 성능·전력 최적화 | Benchmark 통과 시 |
@@ -265,7 +275,7 @@ AI 모델과 실행 엔진은 분리합니다. 동일한 작업도 장치에 따
 
 ### 목표 Backend 선택 과정
 
-아래는 Goal 1B 이후의 목표 정책입니다. Goal 1A는 Apple M5의 ncnn/Vulkan GPU 0만 허용하며 GPU 실패를 CPU로 자동 전환하지 않습니다.
+현재 `자동`은 작업 생성 전에 hash 검증된 GPU 실행 cache를 우선하고 그 cache가 없을 때 CPU를 선택합니다. 실제 GPU probe 실패를 CPU로 무음 전환하는 정책은 아직 구현하지 않았습니다.
 
 ```mermaid
 flowchart TB
@@ -311,6 +321,7 @@ flowchart LR
 stateDiagram-v2
     [*] --> CREATED
     CREATED --> PROBING
+    CREATED --> CANCELLED
     PROBING --> PLANNING
     PLANNING --> RUNNING
     RUNNING --> VERIFYING
@@ -330,7 +341,7 @@ stateDiagram-v2
     VERIFYING --> FAILED
 ```
 
-현재 앱은 한 번에 하나의 active 작업만 실행합니다. batch queue, pause/resume, checkpoint 재개와 `NEEDS_ATTENTION` 재계획은 후속 Goal입니다. 앱 재시작 시 이전 active 작업은 자동 재개하지 않고 `INTERRUPTED`로 표시하며, 소유가 증명된 partial만 정리합니다.
+현재 앱은 폴더의 각 파일을 독립 workspace로 만들고 한 번에 하나씩 순차 실행합니다. 한 파일의 실패가 다음 파일을 막지 않으며 전체 batch 취소는 active process tree와 아직 시작하지 않은 파일을 함께 정리합니다. 이는 Goal 1B의 작은 batch scheduler이고, 순서 변경·pause/resume·checkpoint를 갖춘 본격 queue는 Goal 4 범위입니다. 앱 재시작 시 이전 active 작업은 `INTERRUPTED`, 시작되지 못한 Goal 1B 작업은 `CANCELLED`로 정리하며 자동 재개하지 않습니다.
 
 ### Workspace 구조
 
@@ -343,10 +354,12 @@ job-workspaces/
     ├── job-spec.json       # v2 이미지 또는 메모리 변환 가능한 v1 Fake spec
     ├── plan.json
     ├── runner-job.json
+    ├── image-pipeline.json # Goal 1B 전후처리·publish 계획
     ├── plan-revisions.jsonl
     ├── manifest.json
     ├── progress.json       # 현재 lifecycle의 권위 원본
     ├── logs.jsonl
+    ├── work/               # 정규화 RGB·alpha·검증 전 native x4
     └── verification.json   # 성공한 이미지의 입출력 검증 증거
 ```
 
@@ -356,7 +369,7 @@ SQLite는 MVP의 권위 저장소로 사용하지 않습니다. 작업 상태는
 
 ## 10. Fallback 정책
 
-아래 자동·조건부 fallback은 **Goal 1B 이후 목표 정책**입니다. 현재 Goal 1A는 설정을 바꾸어 재시도하거나 CPU로 자동 전환하지 않고 구조화 오류로 종료합니다.
+아래 자동·조건부 fallback은 **Goal 4 이후 목표 정책**입니다. 현재 Goal 1B의 `자동`은 실행 전에 backend 하나를 고정하며, 실행 중 설정을 바꾸어 재시도하거나 GPU에서 CPU로 자동 전환하지 않고 구조화 오류로 종료합니다.
 
 ```mermaid
 flowchart LR
@@ -388,7 +401,16 @@ flowchart LR
 - 설치된 cache에도 allowlist 밖의 파일이 있으면 거부합니다. 샘플 미디어와 `animevideov3`는 추출하지 않습니다.
 - catalog의 `approved_for_distribution`과 `bundled_in_release`는 모두 `false`입니다. release 검사에서 Fake Runner, upstream engine과 model weight 포함을 차단합니다.
 
-아래 구조는 Goal 1B 이후 정식 모델 패키지로 승격할 때의 목표 형식입니다.
+### Goal 1B 개발 자산
+
+- 공식 ONNX Runtime macOS arm64 `1.29.0` archive와 versioned dylib의 크기·SHA-256·arm64 Mach-O를 검증합니다.
+- 공식 Real-ESRGAN 사진·애니 `.pth`를 별도 catalog로 고정하고 `uv` lock의 Python 3.12·PyTorch·ONNX 도구로 FP32 opset 17 모델을 두 번 export합니다.
+- 두 export가 byte-for-byte 같고 PyTorch↔ORT tensor 오차 기준을 통과해야 catalog의 ONNX SHA-256과 대조합니다.
+- ncnn의 `REFLECT_101` prepadding 10 동작을 ORT runner에도 적용해 Apple M5 CPU↔GPU fixture PSNR을 50 dB 이상으로 고정했습니다.
+- fetch·install은 archive allowlist, 크기·hash, cache 상위 경로 symlink, 설치 내부 symlink를 fail-closed로 검사합니다.
+- ORT dylib, 원본 가중치, 생성 ONNX와 두 wrapper는 모두 개발 cache/sidecar 전용이며 public release bundle 검사가 포함을 차단합니다.
+
+아래 구조는 재배포 권리 검토 뒤 정식 모델 패키지로 승격할 때의 목표 형식입니다.
 
 ```text
 models/<model-id>/<version>/
@@ -455,8 +477,8 @@ CI에서 빌드에 성공한 것과 실제 하드웨어에서 안정적으로 �
 flowchart TB
     D["설계 기준선 v0.3.2<br/>Tauri · Rust · Svelte"] --> G0["✅ Goal 0<br/>계약 · 작업공간 · 공급망 gate"]
     G0 --> G1A["✅ Goal 1A<br/>Apple M5 이미지 ncnn/Vulkan"]
-    G1A --> G1B["다음: Goal 1B<br/>ORT CPU · Batch · Alpha · Metadata"]
-    G1B --> G2["Goal 2<br/>FFmpeg Baseline · RIFE"]
+    G1A --> G1B["✅ Goal 1B<br/>ORT CPU · Batch · Alpha · Metadata"]
+    G1B --> G2["다음: Goal 2<br/>FFmpeg Baseline · RIFE"]
     G2 --> G3["Goal 3<br/>영상 SR · 결합 처리"]
     G3 --> G4["Goal 4<br/>Queue · 복구 · Preview"]
     G4 --> G5M["Goal 5M<br/>macOS Verified Beta"]
@@ -477,7 +499,7 @@ flowchart TB
 |---|---|---|---|
 | Goal 0 shell·계약·안전성 | 완료 | 로컬 Mac + CI | Fake Runner process 실패·취소, schema, workspace 복구, 공급망 gate 통과 |
 | Goal 1A 이미지 GPU | 완료 | Apple M5 | 8조합×3회, golden 기준, 원본 불변, atomic output, 취소 잔존 0 |
-| Goal 1B 이미지 호환성 | 다음 | 로컬 Mac CPU | ORT 결과 허용 오차, batch·alpha·metadata 정책 통과 |
+| Goal 1B 이미지 호환성 | 완료 | Apple M5 CPU·GPU | ORT↔GPU 허용 오차, batch·alpha·ICC·EXIF·형식·취소 통과 |
 | 영상 MVP | 예정 | 로컬 Mac | 1분 fixture의 FPS·duration·A/V sync·stream 보존 통과 |
 | macOS Beta | 예정 | 별도 clean Mac 환경 | 설치·서명·장시간 처리·강제 종료 복구 통과 |
 | NVIDIA·AMD 검증 | 예정 | 각 GPU 노트북 | 먼저 ncnn/Vulkan 공통 경로와 ORT CPU 결과 비교 |

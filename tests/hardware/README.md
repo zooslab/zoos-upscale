@@ -39,7 +39,13 @@ The Goal 1B gate uses `JobOrchestrator`, both registered native runners, and
 Apple M5-only byte hashes, and enforces the measured CPU-to-GPU pixel thresholds in
 `apple-m5-goal1b-thresholds.json`. It also generates alpha, EXIF-orientation, and encoding
 fixtures at runtime to cover PNG/WebP alpha preservation, orientation normalization, metadata
-preserve/strip, JPEG quality 95, lossless WebP, and real CPU-process cancellation cleanup.
+preserve/strip including ICC, JPEG quality 95, lossless WebP, same-stem PNG/JPEG batch filename
+reservation and sequential completion, and real CPU-process cancellation cleanup. Every successful
+job also verifies the recorded backend, Apple M5 device, runtime/model SHA-256, and final hash.
+
+The ORT runner mirrors the pinned ncnn shader's 10-pixel `REFLECT_101` boundary padding. The
+committed thresholds require every photo/anime x2/x4 comparison to remain above 50 dB PSNR;
+they are regression limits for this fixture rather than a promise of byte-identical backends.
 
 The engine, ONNX Runtime, and ONNX model files stay in the verified local cache and are never
 committed. Build both wrappers and run the ignored gate from the workspace root:

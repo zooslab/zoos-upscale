@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "catalog_id": "ffmpeg-macos-arm64",
+  "catalog_version": "9.0.1",
+  "host": {
+    "architecture": "arm64",
+    "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "sdk": "macOS 26.5",
+    "minimum_macos": "14.0"
+  },
+  "version": "9.0.1",
+  "license": "LGPL version 2.1 or later",
+  "output_hashes": {
+    "buildconf": "3708c54fe077b63c0c81280fa8910f41b27b0579618200b7d1a107b80efdc774",
+    "codecs": "bff50188904f3edba63327eec056594b868cedb1dd0953a454acb61284db27d9",
+    "formats": "e46b89404ffa4ad115625f70fb8c68f2e33966e50841dc1c33f4ec3ab6c5dd28",
+    "encoders": "631f8ee532d256ec642cee5743113482a7e7ca3728eae261a4fb26623b6ff946",
+    "decoders": "f28dca6f64b38589e58ecf2dd3c0780fb84936b81e6fc7d843722c2c154978bb"
+  },
+  "files": {
+    "ffmpeg": {
+      "size": 21740072,
+      "sha256": "653e700a788f3376ebc3817a3dcda56e111111410f7edd8eea919c4089216d4e"
+    },
+    "ffprobe": {
+      "size": 21531000,
+      "sha256": "edaf9c5f53aef960ceb5f779d986e7dea86ee549e6716a2c03b70010b88a4da6"
+    }
+  }
+}

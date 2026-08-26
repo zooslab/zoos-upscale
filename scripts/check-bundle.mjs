@@ -17,11 +17,12 @@ const catalogPaths = [
   'onnxruntime-macos-arm64.json',
   'realesrgan-pytorch-weights.json',
   'realesrgan-onnx-models.json',
+  'ffmpeg-macos-arm64.json',
 ].map((name) => join(repositoryRoot, 'assets', 'catalog', name))
 
 export async function validateBundleContents(bundleRoot, catalogValue) {
   const catalogs = Array.isArray(catalogValue) ? catalogValue : [catalogValue]
-  const forbiddenName = /(?:zoos-runner-(?:fake|realesrgan|ort)|realesrgan|onnxruntime|\.param$|\.bin$|\.onnx$|\.pth$|\.dylib$|\.zip$)/i
+  const forbiddenName = /(?:zoos-runner-(?:fake|realesrgan|ort)|realesrgan|onnxruntime|ffmpeg|ffprobe|\.param$|\.bin$|\.onnx$|\.pth$|\.dylib$|\.zip$|\.tar\.gz$)/i
   const catalogFiles = catalogs.flatMap((catalog) => catalog.files ?? [])
   const catalogSources = catalogs
     .map((catalog) => catalog.source)

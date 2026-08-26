@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "id": "ffmpeg-macos-arm64",
+  "version": "9.0.1",
+  "platform": "macos",
+  "architecture": "arm64",
+  "minimum_macos": "14.0",
+  "license": "LGPL-2.1-or-later",
+  "approved_for_distribution": false,
+  "bundled_in_release": false,
+  "source": {
+    "repository": "https://git.ffmpeg.org/ffmpeg.git",
+    "release": "n9.0.1",
+    "url": "https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.gz",
+    "signature_url": "https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.gz.asc",
+    "signing_key_fingerprint": "FCF986EA15E6E293A5644F10B4322F04D67658D8",
+    "archive_size": 18122748,
+    "sha256": "657dbf258cce6c0681714b6e40b8ca69e988c67ecfc2f7aab47574e6ebaceb38"
+  },
+  "build": {
+    "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "sdk": "macOS 26.5",
+    "configure_argv": [
+      "--prefix=/opt/zoos-ffmpeg/9.0.1",
+      "--arch=arm64",
+      "--target-os=darwin",
+      "--cc=clang",
+      "--extra-cflags=-mmacosx-version-min=14.0",
+      "--extra-ldflags=-mmacosx-version-min=14.0",
+      "--disable-autodetect",
+      "--disable-gpl",
+      "--disable-nonfree",
+      "--disable-doc",
+      "--disable-debug",
+      "--disable-ffplay",
+      "--disable-network",
+      "--disable-devices",
+      "--enable-static",
+      "--disable-shared",
+      "--enable-zlib",
+      "--enable-videotoolbox"
+    ],
+    "make_argv": ["-j6"],
+    "license_result": "LGPL version 2.1 or later"
+  },
+  "files": [
+    {
+      "destination": "bin/ffmpeg",
+      "kind": "media-engine",
+      "size": 21740072,
+      "sha256": "653e700a788f3376ebc3817a3dcda56e111111410f7edd8eea919c4089216d4e",
+      "architecture": "arm64",
+      "executable": true
+    },
+    {
+      "destination": "bin/ffprobe",
+      "kind": "media-probe",
+      "size": 21531000,
+      "sha256": "edaf9c5f53aef960ceb5f779d986e7dea86ee549e6716a2c03b70010b88a4da6",
+      "architecture": "arm64",
+      "executable": true
+    }
+  ],
+  "release_policy": "Development cache only. Public distribution requires a corresponding-source offer, notices, and a separate legal review."
+}

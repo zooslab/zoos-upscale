@@ -19,6 +19,8 @@
     "engine:fetch": "node scripts/fetch-engine.mjs",
     "goal1b:fetch": "node scripts/fetch-goal1b-assets.mjs",
     "goal1b:models": "node scripts/prepare-goal1b-models.mjs",
+    "goal2:build": "node scripts/build-goal2-assets.mjs",
+    "goal2:fetch": "node scripts/fetch-goal2-assets.mjs",
     "license:check": "node scripts/license-inventory.mjs --check && pnpm distribution:check && pnpm test:scripts",
     "license:inventory": "node scripts/license-inventory.mjs",
     "preview": "vite preview",

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "gate_id": "apple-m5-goal1b",
+  "platform": "macOS arm64",
+  "cpu": "Apple M5 / ONNX Runtime 1.29.0 CPU",
+  "gpu": "gpu:0 Apple M5 / Vulkan",
+  "regression_only": true,
+  "outputs": {
+    "photo-x2": {
+      "cpu_sha256": "68165e57c96c533a23fadec76cf3698c8798297d13213445809305629bb2f229",
+      "gpu_sha256": "a5c6db2fb7e0613a64ae40df430370ab115ed836e6b10f0f6f2c2df95e6da65d",
+      "width": 128,
+      "height": 96
+    },
+    "photo-x4": {
+      "cpu_sha256": "03600c9a4b4c130d225a2342beb8c121bd5189ac6b7a373b56841318d56b605a",
+      "gpu_sha256": "e21b31e13d976b7895ab775cda85b894f7809333b93682c835809abb5e1fe822",
+      "width": 256,
+      "height": 192
+    },
+    "anime-x2": {
+      "cpu_sha256": "54e5a35ca5f5f17ee83a376f0978711b2034bd75441a16e29d073b66f9e415b4",
+      "gpu_sha256": "57007f8a8cc3efcd2f6026eab72336bc9a5688e0b9ae2bcc0af09217c3c78266",
+      "width": 128,
+      "height": 96
+    },
+    "anime-x4": {
+      "cpu_sha256": "9ee8ac8810d81b1ea708a232b67757222d2936a8dea9db915c0a7321e6bab577",
+      "gpu_sha256": "7be084153de93046b623a78035ad7f9ad9ae419933c587f42f9b1ca6fd27c728",
+      "width": 256,
+      "height": 192
+    }
+  }
+}

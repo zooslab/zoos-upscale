@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "gate_id": "apple-m5-goal1b",
+  "fixture": "rgb8-pattern-64x48.png",
+  "cases": {
+    "photo-x2": {
+      "measured_max_abs_error": 7,
+      "measured_mean_abs_error": 0.38511827,
+      "measured_psnr_db": 51.2054,
+      "max_abs_error": 9,
+      "mean_abs_error": 0.42,
+      "min_psnr_db": 50.8
+    },
+    "photo-x4": {
+      "measured_max_abs_error": 12,
+      "measured_mean_abs_error": 0.40048557,
+      "measured_psnr_db": 50.5836,
+      "max_abs_error": 14,
+      "mean_abs_error": 0.44,
+      "min_psnr_db": 50.2
+    },
+    "anime-x2": {
+      "measured_max_abs_error": 7,
+      "measured_mean_abs_error": 0.28938802,
+      "measured_psnr_db": 52.5681,
+      "max_abs_error": 9,
+      "mean_abs_error": 0.32,
+      "min_psnr_db": 52.1
+    },
+    "anime-x4": {
+      "measured_max_abs_error": 24,
+      "measured_mean_abs_error": 0.32355414,
+      "measured_psnr_db": 50.6683,
+      "max_abs_error": 26,
+      "mean_abs_error": 0.36,
+      "min_psnr_db": 50.2
+    }
+  }
+}

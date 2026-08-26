@@ -1,0 +1,21 @@
+[package]
+name = "zoos-upscale-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "zoos_upscale_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "zoos-upscale"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "=2.11.5", features = [] }

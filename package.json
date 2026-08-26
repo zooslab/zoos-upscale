@@ -1,0 +1,37 @@
+{
+  "name": "zoos-upscale",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=22.22.3",
+    "pnpm": ">=11.19.0 <12"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "pnpm check && vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "svelte": "5.56.10"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "7.3.0",
+    "@tauri-apps/cli": "2.11.4",
+    "@testing-library/svelte": "5.4.2",
+    "@tsconfig/svelte": "5.0.8",
+    "@types/node": "22.20.1",
+    "jsdom": "30.0.1",
+    "svelte-check": "4.7.6",
+    "typescript": "6.0.2",
+    "vite": "8.2.2",
+    "vitest": "4.1.11"
+  }
+}

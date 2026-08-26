@@ -556,6 +556,10 @@ impl From<OrchestratorError> for CommandError {
                 code: error.code().into(),
                 message: error.to_string(),
             },
+            OrchestratorError::Workspace(WorkspaceError::Pipeline(error)) => Self {
+                code: error.code().into(),
+                message: error.to_string(),
+            },
             OrchestratorError::Backend(error) => Self::from_backend(error),
             OrchestratorError::Workspace(_) => Self::fixed(
                 "UPSTREAM_FAILED",
@@ -593,6 +597,11 @@ impl CommandError {
                 error_code.as_str(),
                 "ENGINE_NOT_INSTALLED"
                     | "ASSET_HASH_MISMATCH"
+                    | "INPUT_CHANGED"
+                    | "UNSUPPORTED_IMAGE_MODE"
+                    | "OUTPUT_TOO_LARGE"
+                    | "INSUFFICIENT_DISK"
+                    | "OUTPUT_EXISTS"
                     | "GPU_UNAVAILABLE"
                     | "UPSTREAM_FAILED"
                     | "CANCELLED"
@@ -839,6 +848,15 @@ mod tests {
                 .code,
             "ENGINE_NOT_INSTALLED"
         );
+    }
+
+    #[test]
+    fn goal1b_pipeline_rejections_keep_their_public_error_code() {
+        let error = CommandError::from(OrchestratorError::Workspace(WorkspaceError::Pipeline(
+            zoos_core::Goal1bImageError::AlphaJpegUnsupported,
+        )));
+        assert_eq!(error.code, "UNSUPPORTED_IMAGE_MODE");
+        assert!(error.message.contains("JPEG"));
     }
 
     #[test]

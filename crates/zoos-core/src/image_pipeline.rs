@@ -938,6 +938,30 @@ pub enum Goal1bImageError {
     Io(#[from] io::Error),
 }
 
+impl Goal1bImageError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::ImageTooLarge => "OUTPUT_TOO_LARGE",
+            Self::InvalidRunnerOutput
+            | Self::InvalidAlpha
+            | Self::Encode
+            | Self::InvalidOutput
+            | Self::MetadataMismatch
+            | Self::Io(_) => "UPSTREAM_FAILED",
+            Self::InvalidInput
+            | Self::InputTooLarge
+            | Self::UnsupportedFormat
+            | Self::UnsupportedImageMode
+            | Self::Decode
+            | Self::InvalidExif
+            | Self::InvalidMetadata
+            | Self::MetadataTooLarge
+            | Self::UnsupportedScale
+            | Self::AlphaJpegUnsupported => "UNSUPPORTED_IMAGE_MODE",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,6 +1142,19 @@ mod tests {
             ),
             Err(Goal1bImageError::InvalidExif)
         ));
+    }
+
+    #[test]
+    fn public_goal1b_error_codes_are_stable() {
+        assert_eq!(Goal1bImageError::ImageTooLarge.code(), "OUTPUT_TOO_LARGE");
+        assert_eq!(
+            Goal1bImageError::AlphaJpegUnsupported.code(),
+            "UNSUPPORTED_IMAGE_MODE"
+        );
+        assert_eq!(
+            Goal1bImageError::InvalidRunnerOutput.code(),
+            "UPSTREAM_FAILED"
+        );
     }
 
     #[test]

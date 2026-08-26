@@ -399,10 +399,9 @@ impl JobOrchestrator {
             WorkspaceError::Image(image_error) => {
                 (image_error.code().to_owned(), image_error.to_string())
             }
-            WorkspaceError::Pipeline(image_error) => (
-                goal1b_image_error_code(image_error).to_owned(),
-                image_error.to_string(),
-            ),
+            WorkspaceError::Pipeline(image_error) => {
+                (image_error.code().to_owned(), image_error.to_string())
+            }
             _ => {
                 return self.finish_with_internal_error_locked(
                     job_id,
@@ -530,28 +529,6 @@ impl JobOrchestrator {
         cleanup?;
         progress?;
         manifest
-    }
-}
-
-fn goal1b_image_error_code(error: &crate::Goal1bImageError) -> &'static str {
-    match error {
-        crate::Goal1bImageError::ImageTooLarge => "OUTPUT_TOO_LARGE",
-        crate::Goal1bImageError::InvalidRunnerOutput
-        | crate::Goal1bImageError::InvalidAlpha
-        | crate::Goal1bImageError::Encode
-        | crate::Goal1bImageError::InvalidOutput
-        | crate::Goal1bImageError::MetadataMismatch
-        | crate::Goal1bImageError::Io(_) => "UPSTREAM_FAILED",
-        crate::Goal1bImageError::InvalidInput
-        | crate::Goal1bImageError::InputTooLarge
-        | crate::Goal1bImageError::UnsupportedFormat
-        | crate::Goal1bImageError::UnsupportedImageMode
-        | crate::Goal1bImageError::Decode
-        | crate::Goal1bImageError::InvalidExif
-        | crate::Goal1bImageError::InvalidMetadata
-        | crate::Goal1bImageError::MetadataTooLarge
-        | crate::Goal1bImageError::UnsupportedScale
-        | crate::Goal1bImageError::AlphaJpegUnsupported => "UNSUPPORTED_IMAGE_MODE",
     }
 }
 

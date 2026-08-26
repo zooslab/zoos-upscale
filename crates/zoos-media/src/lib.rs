@@ -447,12 +447,7 @@ impl TryFrom<&RawStream> for VideoFacts {
             .ok_or_else(|| MediaError::Malformed("video frame count is missing".into()))?
             .parse::<u64>()
             .map_err(|_| MediaError::Malformed("invalid video frame count".into()))?;
-        let frame_rate = parse_rate(
-            stream
-                .avg_frame_rate
-                .as_deref()
-                .ok_or_else(|| MediaError::Malformed("average frame rate is missing".into()))?,
-        )?;
+        let frame_rate = canonical_frame_rate(stream, frame_count)?;
         let time_base = stream.time_base.as_deref().map(parse_rate).transpose()?;
         Ok(Self {
             index: stream.index,
@@ -502,6 +497,24 @@ fn validate_video_stream(stream: &RawStream, mode: ProbeMode) -> Result<(), Medi
     if is_hdr(stream) {
         return Err(MediaError::Unsupported("HDR video"));
     }
+    let canonical = canonical_frame_rate(stream, frame_count)?;
+    let supported = match mode {
+        ProbeMode::Source => matches!(
+            (canonical.numerator, canonical.denominator),
+            (25, 1) | (30, 1) | (30_000, 1_001)
+        ),
+        ProbeMode::InterpolatedOutput => matches!(
+            (canonical.numerator, canonical.denominator),
+            (50, 1) | (60, 1) | (60_000, 1_001)
+        ),
+    };
+    if !supported {
+        return Err(MediaError::Unsupported("unsupported frame rate"));
+    }
+    Ok(())
+}
+
+fn canonical_frame_rate(stream: &RawStream, frame_count: u64) -> Result<RationalRate, MediaError> {
     let average = parse_rate(
         stream
             .avg_frame_rate
@@ -514,23 +527,68 @@ fn validate_video_stream(stream: &RawStream, mode: ProbeMode) -> Result<(), Medi
             .as_deref()
             .ok_or_else(|| MediaError::Malformed("real frame rate is missing".into()))?,
     )?;
-    if average != real {
-        return Err(MediaError::Unsupported("variable frame rate"));
-    }
-    let supported = match mode {
-        ProbeMode::Source => matches!(
-            (average.numerator, average.denominator),
-            (25, 1) | (30, 1) | (30_000, 1_001)
-        ),
-        ProbeMode::InterpolatedOutput => matches!(
-            (average.numerator, average.denominator),
-            (50, 1) | (60, 1) | (60_000, 1_001)
-        ),
+    let time_base = stream.time_base.as_deref().map(parse_rate).transpose()?;
+    let candidates = [
+        RationalRate {
+            numerator: 25,
+            denominator: 1,
+        },
+        RationalRate {
+            numerator: 30,
+            denominator: 1,
+        },
+        RationalRate {
+            numerator: 30_000,
+            denominator: 1_001,
+        },
+        RationalRate {
+            numerator: 50,
+            denominator: 1,
+        },
+        RationalRate {
+            numerator: 60,
+            denominator: 1,
+        },
+        RationalRate {
+            numerator: 60_000,
+            denominator: 1_001,
+        },
+    ];
+    let map_rate = |reported| {
+        candidates
+            .iter()
+            .copied()
+            .min_by(|left, right| {
+                rate_distance(reported, *left).total_cmp(&rate_distance(reported, *right))
+            })
+            .filter(|candidate| rate_matches(reported, *candidate, frame_count, time_base))
     };
-    if !supported {
-        return Err(MediaError::Unsupported("unsupported frame rate"));
+    match (map_rate(average), map_rate(real)) {
+        (Some(average), Some(real)) if average == real => Ok(average),
+        _ => Err(MediaError::Unsupported("variable frame rate")),
     }
-    Ok(())
+}
+
+fn rate_distance(left: RationalRate, right: RationalRate) -> f64 {
+    (f64::from(left.numerator) / f64::from(left.denominator)
+        - f64::from(right.numerator) / f64::from(right.denominator))
+    .abs()
+}
+
+fn rate_matches(
+    reported: RationalRate,
+    candidate: RationalRate,
+    frame_count: u64,
+    time_base: Option<RationalRate>,
+) -> bool {
+    let intervals = frame_count.saturating_sub(1).max(1) as f64;
+    let reported_span = intervals * f64::from(reported.denominator) / f64::from(reported.numerator);
+    let candidate_span =
+        intervals * f64::from(candidate.denominator) / f64::from(candidate.numerator);
+    let quantum = time_base.map_or(0.000_002, |base| {
+        f64::from(base.numerator) / f64::from(base.denominator)
+    });
+    (reported_span - candidate_span).abs() <= quantum * 2.0 + 0.000_002
 }
 
 pub fn verify_interpolated_output(
@@ -612,6 +670,21 @@ pub fn verify_interpolated_output(
     if source_kinds != output_kinds {
         return Err(MediaError::Verification("stream kind counts changed"));
     }
+    let source_video = source
+        .streams
+        .iter()
+        .find(|stream| stream.kind == MuxStreamKind::Video)
+        .ok_or(MediaError::Verification("source video stream is missing"))?;
+    let output_video = output
+        .streams
+        .iter()
+        .find(|stream| stream.kind == MuxStreamKind::Video)
+        .ok_or(MediaError::Verification("output video stream is missing"))?;
+    if !tags_preserved(&source_video.tags, &output_video.tags, TagScope::Stream)
+        || !positive_dispositions_preserved(&source_video.disposition, &output_video.disposition)
+    {
+        return Err(MediaError::Verification("video metadata changed"));
+    }
 
     let source_non_video = source
         .streams
@@ -671,11 +744,6 @@ pub fn verify_interpolated_output(
         }
     }
 
-    let output_video = output
-        .streams
-        .iter()
-        .find(|stream| stream.kind == MuxStreamKind::Video)
-        .ok_or(MediaError::Verification("output video stream is missing"))?;
     if output_video.duration_from_format {
         return Err(MediaError::Verification("video duration is unavailable"));
     }
@@ -795,6 +863,7 @@ fn validate_cadence(
     });
     let tolerance = timestamp_quantum.max(0.000_002) + f64::EPSILON;
     let mut previous: Option<f64> = None;
+    let mut first: Option<f64> = None;
     let mut count = 0_u64;
     for line in text.lines() {
         let value = line
@@ -809,6 +878,11 @@ fn validate_cadence(
             return Err(MediaError::Malformed(
                 "invalid video frame timestamp".into(),
             ));
+        }
+        let first = *first.get_or_insert(value);
+        let expected = first + count as f64 * expected_delta;
+        if (value - expected).abs() > tolerance {
+            return Err(MediaError::Unsupported("variable frame rate"));
         }
         if let Some(previous) = previous {
             let delta = value - previous;
@@ -1315,6 +1389,71 @@ mod tests {
             ),
             Err(MediaError::Malformed(_))
         ));
+
+        let matroska_ntsc = (0..600)
+            .map(|index| {
+                let exact = f64::from(index) * 1_001.0 / 60_000.0;
+                format!("{:.6}\n", (exact * 1_000.0).round() / 1_000.0)
+            })
+            .collect::<String>();
+        validate_cadence(
+            matroska_ntsc.as_bytes(),
+            RationalRate {
+                numerator: 60_000,
+                denominator: 1_001,
+            },
+            Some(RationalRate {
+                numerator: 1,
+                denominator: 1_000,
+            }),
+            600,
+        )
+        .expect("Matroska millisecond quantization remains CFR");
+
+        let drifting = (0..600)
+            .map(|index| format!("{:.6}\n", f64::from(index) / 59.0))
+            .collect::<String>();
+        assert_eq!(
+            validate_cadence(
+                drifting.as_bytes(),
+                RationalRate {
+                    numerator: 60_000,
+                    denominator: 1_001,
+                },
+                Some(RationalRate {
+                    numerator: 1,
+                    denominator: 1_000,
+                }),
+                600,
+            ),
+            Err(MediaError::Unsupported("variable frame rate"))
+        );
+    }
+
+    #[test]
+    fn matroska_quantized_ntsc_rate_maps_to_the_exact_supported_rational() {
+        let (_directory, input, base) = fixture("video-only.json", "mkv");
+        let mut json: serde_json::Value = serde_json::from_slice(&base).expect("fixture JSON");
+        json["format"]["format_name"] = "matroska,webm".into();
+        json["format"]["duration"] = "10.021000".into();
+        json["streams"][0]["r_frame_rate"] = "19001/317".into();
+        json["streams"][0]["avg_frame_rate"] = "19001/317".into();
+        json["streams"][0]["time_base"] = "1/1000".into();
+        json["streams"][0]["nb_read_frames"] = "600".into();
+        json["streams"][0]["duration"] = "10.021000".into();
+        let descriptor = parse_descriptor(
+            &input,
+            &serde_json::to_vec(&json).expect("probe JSON"),
+            ProbeMode::InterpolatedOutput,
+        )
+        .expect("quantized Matroska output");
+        assert_eq!(
+            descriptor.frame_rate,
+            RationalRate {
+                numerator: 60_000,
+                denominator: 1_001,
+            }
+        );
     }
 
     #[test]
@@ -1415,6 +1554,12 @@ mod tests {
         assert_eq!(
             verify_interpolated_output(&source, &missing_metadata, &plan),
             Err(MediaError::Verification("stream metadata changed"))
+        );
+        let mut missing_video_metadata = output.clone();
+        missing_video_metadata.streams[0].tags.remove("title");
+        assert_eq!(
+            verify_interpolated_output(&source, &missing_video_metadata, &plan),
+            Err(MediaError::Verification("video metadata changed"))
         );
         let mut missing_format_metadata = output.clone();
         missing_format_metadata.format_tags.remove("title");

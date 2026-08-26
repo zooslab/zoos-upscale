@@ -39,6 +39,15 @@ test('rejects the ORT wrapper and runtime from the public bundle', () => {
   )
 })
 
+test('rejects FFmpeg and RIFE assets from the public bundle', () => {
+  for (const asset of ['bin/ffmpeg', 'bin/ffprobe', 'binaries/zoos-runner-rife', 'bin/rife-ncnn-vulkan']) {
+    assert.throws(
+      () => validateDistribution({ bundle: { resources: [asset] } }, { sidecars: [] }),
+      /unapproved runtime asset/,
+    )
+  }
+})
+
 test('rejects a model configured as a public resource', () => {
   assert.throws(
     () =>

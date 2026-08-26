@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "id": "rife-ncnn-vulkan-macos",
+  "version": "20221029",
+  "model": "rife-v4.6",
+  "platform": "macos",
+  "architecture": "universal-arm64-x86_64",
+  "license": {
+    "runner": "MIT",
+    "model_weights": "UNVERIFIED"
+  },
+  "approved_for_distribution": false,
+  "bundled_in_release": false,
+  "source": {
+    "repository": "https://github.com/nihui/rife-ncnn-vulkan",
+    "release": "20221029",
+    "source_commit": "a7532fc3f9f8f008cd6eecd6f2ffe2a9698e0cf7",
+    "ncnn_commit": "b4ba207c18d3103d6df890c0e3a97b469b196b26",
+    "libwebp_commit": "5abb55823bb6196a918dd87202b2f32bbaff4c18",
+    "url": "https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/rife-ncnn-vulkan-20221029-macos.zip",
+    "archive_size": 436537917,
+    "sha256": "4a63a1f3c9c715773c57d2ee51df1b315ed20cd6c63103e45c483ecc4400b595"
+  },
+  "files": [
+    {
+      "archive_path": "rife-ncnn-vulkan-20221029-macos/rife-ncnn-vulkan",
+      "destination": "bin/rife-ncnn-vulkan",
+      "kind": "engine",
+      "size": 25838096,
+      "sha256": "d11429c72f0cddfb170fd131ee9373dc5329a5729c4382c0acfd40092e5ed19a",
+      "architecture": "universal-arm64-x86_64",
+      "executable": true
+    },
+    {
+      "archive_path": "rife-ncnn-vulkan-20221029-macos/rife-v4.6/flownet.bin",
+      "destination": "models/rife-v4.6/flownet.bin",
+      "kind": "model",
+      "size": 10614320,
+      "sha256": "f334ed2260149ce0188a6dcf049844e8b0cdd912e01cbcfb63553157d2508958",
+      "executable": false
+    },
+    {
+      "archive_path": "rife-ncnn-vulkan-20221029-macos/rife-v4.6/flownet.param",
+      "destination": "models/rife-v4.6/flownet.param",
+      "kind": "model",
+      "size": 16532,
+      "sha256": "724569596bcd1e7b9fa50455c604777ebed99746d2ef40aa86e31b5725f1053c",
+      "executable": false
+    }
+  ],
+  "release_policy": "Development cache only. Model-weight redistribution rights must be verified before any public bundle."
+}

@@ -14,6 +14,7 @@ const onnxRuntime = readJson('assets/catalog/onnxruntime-macos-arm64.json')
 const sourceWeights = readJson('assets/catalog/realesrgan-pytorch-weights.json')
 const onnxModels = readJson('assets/catalog/realesrgan-onnx-models.json')
 const ffmpeg = readJson('assets/catalog/ffmpeg-macos-arm64.json')
-validateDistribution(tauri, sidecars, [realEsrgan, onnxRuntime, sourceWeights, onnxModels, ffmpeg])
+const rife = readJson('assets/catalog/rife-ncnn-vulkan-macos.json')
+validateDistribution(tauri, sidecars, [realEsrgan, onnxRuntime, sourceWeights, onnxModels, ffmpeg, rife])
 
 console.log('Public bundle contains no unapproved sidecars, engines, or models')

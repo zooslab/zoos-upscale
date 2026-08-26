@@ -15,6 +15,8 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join, posix, resolve, sep } from 'node:path'
 
+import yauzl from 'yauzl'
+
 const SHA256_PATTERN = /^[a-f0-9]{64}$/
 const TAR_BLOCK_SIZE = 512
 const MAX_FFMPEG_TAR_SIZE = 128 * 1024 * 1024
@@ -23,6 +25,90 @@ const CPU_TYPE_ARM64 = 0x0100000c
 const LC_BUILD_VERSION = 0x32
 const MACOS_14 = 0x000e0000
 const FFMPEG_SOURCE_NAME = 'ffmpeg-9.0.1.tar.gz'
+const FAT_MAGIC = 0xcafebabe
+const CPU_TYPE_X86_64 = 0x01000007
+
+export function validateRifeCatalog(catalog) {
+  validateDevelopmentOnly(catalog)
+  if (
+    catalog.id !== 'rife-ncnn-vulkan-macos' ||
+    catalog.version !== '20221029' ||
+    catalog.model !== 'rife-v4.6' ||
+    catalog.architecture !== 'universal-arm64-x86_64'
+  ) {
+    throw new Error('Unexpected RIFE catalog identity')
+  }
+  if (
+    catalog.license?.runner !== 'MIT' ||
+    catalog.license?.model_weights !== 'UNVERIFIED' ||
+    catalog.source?.repository !== 'https://github.com/nihui/rife-ncnn-vulkan' ||
+    catalog.source?.release !== '20221029' ||
+    catalog.source?.source_commit !== 'a7532fc3f9f8f008cd6eecd6f2ffe2a9698e0cf7' ||
+    catalog.source?.ncnn_commit !== 'b4ba207c18d3103d6df890c0e3a97b469b196b26' ||
+    catalog.source?.libwebp_commit !== '5abb55823bb6196a918dd87202b2f32bbaff4c18' ||
+    catalog.source?.url !== 'https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/rife-ncnn-vulkan-20221029-macos.zip'
+  ) {
+    throw new Error('RIFE provenance or license policy is not approved')
+  }
+  validateSizedHash(catalog.source.sha256, catalog.source.archive_size, 'RIFE archive')
+  if (!Array.isArray(catalog.files) || catalog.files.length !== 3) {
+    throw new Error('RIFE catalog must allow exactly one engine and two rife-v4.6 files')
+  }
+  const expected = new Set([
+    'bin/rife-ncnn-vulkan',
+    'models/rife-v4.6/flownet.bin',
+    'models/rife-v4.6/flownet.param',
+  ])
+  for (const file of catalog.files) {
+    assertSafeRelativePath(file.archive_path)
+    assertSafeRelativePath(file.destination)
+    if (!expected.delete(file.destination)) throw new Error(`Unexpected RIFE file: ${file.destination}`)
+    validateSizedHash(file.sha256, file.size, file.destination)
+  }
+  const engine = catalog.files.find((file) => file.kind === 'engine')
+  if (engine?.destination !== 'bin/rife-ncnn-vulkan' || engine.executable !== true) {
+    throw new Error('RIFE catalog must pin one executable engine')
+  }
+  return catalog
+}
+
+export async function fetchAndInstallRife(
+  catalogValue,
+  runtimeRoot,
+  fetchImplementation = globalThis.fetch,
+) {
+  const catalog = validateRifeCatalog(catalogValue)
+  await assertSafeCacheRoot(runtimeRoot)
+  const destination = join(runtimeRoot, catalog.id, catalog.version, 'macos-universal')
+  if (await verifyRifeInstallation(catalog, destination)) return destination
+  if (await exists(destination)) throw new Error(`Existing RIFE runtime cache is incomplete: ${destination}`)
+
+  const archive = await fetchVerifiedBuffer(
+    catalog.source.url,
+    catalog.source.sha256,
+    catalog.source.archive_size,
+    fetchImplementation,
+  )
+  const extracted = await extractAllowedZip(archive, catalog.files)
+  const staging = `${destination}.staging-${randomUUID()}`
+  await mkdir(staging, { recursive: true })
+  try {
+    for (const file of catalog.files) {
+      const contents = extracted.get(file.destination)
+      const output = safeDestination(staging, file.destination)
+      await mkdir(dirname(output), { recursive: true })
+      await writeFile(output, contents, { mode: file.executable ? 0o755 : 0o644 })
+      if (file.executable) await chmod(output, 0o755)
+    }
+    await writeFile(join(staging, 'catalog.json'), `${JSON.stringify(catalog, null, 2)}\n`)
+    await mkdir(dirname(destination), { recursive: true })
+    await rename(staging, destination)
+    return destination
+  } catch (error) {
+    await rm(staging, { recursive: true, force: true })
+    throw error
+  }
+}
 
 export function validateFfmpegCatalog(catalog) {
   validateDevelopmentOnly(catalog)
@@ -299,6 +385,120 @@ async function verifyFfmpegInstallation(catalog, evidence, destination) {
   } catch {
     return false
   }
+}
+
+async function verifyRifeInstallation(catalog, destination) {
+  try {
+    const allowed = new Set(['catalog.json', ...catalog.files.map((file) => file.destination)])
+    const files = await listFiles(destination)
+    if (files.length !== allowed.size || files.some((file) => !allowed.has(file))) return false
+    if (JSON.stringify(JSON.parse(await readFile(join(destination, 'catalog.json'), 'utf8'))) !== JSON.stringify(catalog)) return false
+    for (const file of catalog.files) {
+      const path = safeDestination(destination, file.destination)
+      const info = await lstat(path)
+      if (!info.isFile() || info.isSymbolicLink()) return false
+      const contents = await readFile(path)
+      verifyBuffer(contents, file.sha256, file.size, file.destination)
+      if (file.kind === 'engine') validateUniversalMachO(contents)
+      if (file.executable) await chmod(path, 0o755)
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function validateUniversalMachO(buffer) {
+  if (buffer.length < 48 || buffer.readUInt32BE(0) !== FAT_MAGIC) {
+    throw new Error('RIFE engine is not a universal Mach-O')
+  }
+  const count = buffer.readUInt32BE(4)
+  if (count < 2 || count > 32 || buffer.length < 8 + count * 20) {
+    throw new Error('RIFE universal architecture table is invalid')
+  }
+  const architectures = new Set()
+  const slices = []
+  for (let index = 0; index < count; index += 1) {
+    const offset = 8 + index * 20
+    const cpuType = buffer.readUInt32BE(offset)
+    const sliceOffset = buffer.readUInt32BE(offset + 8)
+    const sliceSize = buffer.readUInt32BE(offset + 12)
+    const end = sliceOffset + sliceSize
+    if (sliceSize < 12 || sliceOffset < 8 + count * 20 || end > buffer.length || end < sliceOffset) {
+      throw new Error('RIFE universal Mach-O contains an invalid slice')
+    }
+    if (buffer.readUInt32LE(sliceOffset) !== MH_MAGIC_64 || buffer.readUInt32LE(sliceOffset + 4) !== cpuType) {
+      throw new Error('RIFE Mach-O slice header does not match its architecture')
+    }
+    architectures.add(cpuType)
+    slices.push([sliceOffset, end])
+  }
+  slices.sort((left, right) => left[0] - right[0])
+  if (slices.some((slice, index) => index > 0 && slice[0] < slices[index - 1][1])) {
+    throw new Error('RIFE universal Mach-O slices overlap')
+  }
+  if (!architectures.has(CPU_TYPE_ARM64) || !architectures.has(CPU_TYPE_X86_64)) {
+    throw new Error('RIFE engine must contain arm64 and x86_64 slices')
+  }
+}
+
+export async function extractAllowedZip(archive, files) {
+  const allowed = new Map(files.map((file) => [file.archive_path, file]))
+  const extracted = new Map()
+  await visitZipEntries(archive, async (zip, entry) => {
+    const rawPath = entry.fileName.endsWith('/') ? entry.fileName.slice(0, -1) : entry.fileName
+    assertSafeRelativePath(rawPath)
+    if (isZipSymbolicLink(entry)) throw new Error(`Symbolic link is forbidden: ${entry.fileName}`)
+    if (entry.fileName.endsWith('/')) return
+    const file = allowed.get(entry.fileName)
+    if (!file) return
+    if (extracted.has(file.destination)) throw new Error(`Duplicate RIFE archive entry: ${entry.fileName}`)
+    if (entry.uncompressedSize !== file.size) throw new Error(`Unexpected size for ${entry.fileName}`)
+    const contents = await readZipEntry(zip, entry)
+    verifyBuffer(contents, file.sha256, file.size, entry.fileName)
+    if (file.kind === 'engine') validateUniversalMachO(contents)
+    extracted.set(file.destination, contents)
+  })
+  const missing = files.filter((file) => !extracted.has(file.destination))
+  if (missing.length > 0) throw new Error(`RIFE archive is missing: ${missing.map((file) => file.archive_path).join(', ')}`)
+  return extracted
+}
+
+function isZipSymbolicLink(entry) {
+  const unixMode = entry.externalFileAttributes >>> 16
+  return (unixMode & 0o170000) === 0o120000
+}
+
+function visitZipEntries(buffer, visitor) {
+  return new Promise((resolvePromise, reject) => {
+    yauzl.fromBuffer(buffer, { lazyEntries: true, decodeStrings: true }, (openError, zip) => {
+      if (openError) return reject(openError)
+      let chain = Promise.resolve()
+      zip.on('entry', (entry) => {
+        chain = chain.then(() => visitor(zip, entry)).then(() => zip.readEntry()).catch(reject)
+      })
+      zip.on('end', () => chain.then(resolvePromise, reject))
+      zip.on('error', reject)
+      zip.readEntry()
+    })
+  })
+}
+
+function readZipEntry(zip, entry) {
+  return new Promise((resolvePromise, reject) => {
+    zip.openReadStream(entry, (error, stream) => {
+      if (error) return reject(error)
+      const chunks = []
+      let length = 0
+      stream.on('data', (chunk) => {
+        length += chunk.length
+        if (length > entry.uncompressedSize) stream.destroy(new Error(`ZIP entry exceeded declared size: ${entry.fileName}`))
+        else chunks.push(chunk)
+      })
+      stream.on('end', () => resolvePromise(Buffer.concat(chunks, length)))
+      stream.on('error', reject)
+    })
+  })
 }
 
 export function validateArm64MachO(buffer, requireMacos14 = false) {

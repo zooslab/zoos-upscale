@@ -54,6 +54,16 @@ test('rejects ORT wrapper and dylib paths', async () => {
   }
 })
 
+test('rejects FFmpeg and RIFE development engines by bundle path', async () => {
+  for (const name of ['ffmpeg', 'ffprobe', 'zoos-runner-rife', 'rife-ncnn-vulkan']) {
+    const bundle = await fixtureBundle('not a real binary', name)
+    await assert.rejects(
+      validateBundleContents(bundle, fixtureCatalog(Buffer.from('engine'))),
+      /forbidden runtime asset/,
+    )
+  }
+})
+
 test('rejects symbolic links instead of skipping bundle entries', async () => {
   const bundle = await fixtureBundle('safe application')
   await symlink('/tmp/not-installed-onnx-model', join(bundle, 'model.onnx'))

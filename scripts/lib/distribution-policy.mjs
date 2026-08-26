@@ -1,4 +1,4 @@
-const forbiddenBundlePattern = /(?:fake|realesrgan|zoos-runner-ort|onnxruntime|ffmpeg|ffprobe|\.param$|\.bin$|\.onnx$|\.pth$|\.dylib$)/i
+const forbiddenBundlePattern = /(?:fake|realesrgan|zoos-runner-(?:ort|rife)|rife-ncnn|onnxruntime|ffmpeg|ffprobe|\.param$|\.bin$|\.onnx$|\.pth$|\.dylib$)/i
 
 export function validateDistribution(tauri, sidecars, catalogs = []) {
   const resourceConfiguration = tauri.bundle?.resources ?? []

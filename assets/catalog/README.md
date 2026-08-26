@@ -4,7 +4,7 @@ These catalogs are the only network allowlist for local development assets. The 
 
 - `pnpm engine:fetch`: Goal 1A Vulkan engine and ncnn models.
 - `pnpm goal1b:fetch`: Goal 1B macOS arm64 ONNX Runtime and official PyTorch source weights.
-- `pnpm goal2:fetch`: Goal 2 official FFmpeg source archive.
+- `pnpm goal2:fetch`: Goal 2 official FFmpeg source and RIFE macOS development archive.
 - `pnpm goal2:build`: offline LGPL-only FFmpeg/ffprobe build from the verified source cache.
 
 Every source and installed file is pinned by byte length and SHA-256. Existing caches are reused without network access only after their complete contents, paths, hashes, and architecture have been verified. Goal 1B assets remain development-cache-only with `approved_for_distribution: false`; neither weights nor binaries may enter Git or a public application bundle.

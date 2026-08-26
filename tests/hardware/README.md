@@ -61,3 +61,31 @@ ZOOS_M5_ONNX_MODELS="$PWD/.cache/model-assets/realesrgan-onnx/goal1b-v1/models" 
 
 The CPU/GPU comparison detects backend drift on this exact Apple M5 fixture; it is not a claim
 that different GPU vendors or drivers will produce the same pixels.
+
+## Goal 2 FFmpeg/RIFE video gate
+
+The Goal 2 ignored gate builds CFR MP4, MOV, and MKV fixtures from Rust-generated 64×64 PNG
+frames, PCM WAV tracks, and SRT text. It validates 25→50, 30→60, and
+30000/1001→60000/1001 interpolation, video-only and multi-stream mux plans, a 60-second bounded
+workspace run, scene-cut protection, exact frame counts, A/V sync, source immutability, atomic
+publication, cancellation cleanup, and GPU/CPU regression metrics. Bitmap subtitle rejection stays
+in the ordinary `zoos-media` fixture tests.
+
+The test never downloads assets and invokes only absolute executable paths. Prepare the verified
+development caches and wrapper, then run serially on the Apple M5 host:
+
+```sh
+pnpm goal2:fetch
+cargo build -p zoos-runner-rife --bin zoos-runner-rife-bin --locked
+ZOOS_M5_FFMPEG_ASSETS="$PWD/.cache/runtime-assets/ffmpeg-macos-arm64/9.0.1" \
+ZOOS_M5_RIFE_ASSETS="$PWD/.cache/runtime-assets/rife-ncnn-vulkan-macos/20221029/macos-universal" \
+ZOOS_M5_RIFE_WRAPPER="$PWD/target/debug/zoos-runner-rife-bin" \
+  cargo test -p zoos-core --test apple_m5_goal2 --locked -- \
+  --ignored --nocapture --test-threads=1
+```
+
+Every run verifies its output SHA-256, but VideoToolbox byte hashes are not pinned because repeated
+encodes are not byte-deterministic. The committed CPU/GPU thresholds are Apple M5 regression
+evidence only and do not establish support for other GPUs or operating systems.
+The decoded-frame guard is `max_abs_error <= 14`, `mean_abs_error <= 0.30`, and
+`PSNR >= 51.5 dB`; scene-cut midpoint replacement permits a post-H.264 maximum error of 2.

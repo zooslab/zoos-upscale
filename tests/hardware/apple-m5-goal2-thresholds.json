@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "gate_id": "apple-m5-goal2",
+  "cpu_gpu": {
+    "measured_max_abs_error": 12,
+    "measured_mean_abs_error": 0.24781575520833332,
+    "measured_psnr_db": 52.25162684078799,
+    "max_abs_error": 14,
+    "max_mean_abs_error": 0.3,
+    "min_psnr_db": 51.5
+  },
+  "scene_cut": {
+    "measured_midpoint_max_abs_error": 2,
+    "max_midpoint_abs_error": 2
+  },
+  "max_av_sync_ms": 40
+}

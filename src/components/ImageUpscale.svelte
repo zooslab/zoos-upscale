@@ -16,7 +16,7 @@
 
   let imageJobs = $derived(jobs.filter((job) => job.kind === 'image_upscale'))
   let batchJobs = $derived(batchJobIds.map((id) => imageJobs.find((job) => job.job_id === id)).filter((job): job is JobSummary => Boolean(job)))
-  let batchFinished = $derived(batchJobs.filter((job) => terminal.has(job.status) || batchStartErrors[job.job_id]).length)
+  let batchFinished = $derived(batchJobIds.filter((id) => { const job = imageJobs.find((item) => item.job_id === id); return !job || terminal.has(job.status) || Boolean(batchStartErrors[id]) }).length)
   let batchRunning = $derived(Boolean(batchId && !batchCancelled && batchFinished < batchJobIds.length))
   let currentJob = $derived(batchJobs.find((job) => activeStatuses.has(job.status)) ?? batchJobs.find((job) => job.status === 'CREATED' && !batchStartErrors[job.job_id]) ?? imageJobs.find((job) => activeStatuses.has(job.status)) ?? imageJobs[0] ?? null)
   let isActive = $derived(Boolean(currentJob && activeStatuses.has(currentJob.status)))
@@ -37,7 +37,13 @@
   async function selectImage() {
     requestPending = true; requestError = null; let created: JobSummary | null = null
     try { created = await pickAndCreateImageJob(preset, scale, backend, outputFormat, metadata); if (!created) return; merge([created]); merge([await startJob(created.job_id)]); schedulePoll() }
-    catch (error) { requestError = commandError(error); await resync(Boolean(created)) }
+    catch (error) {
+      requestError = commandError(error)
+      if (created) {
+        try { merge([await cancelJob(created.job_id)]) } catch { /* resync below keeps the original start error visible */ }
+      }
+      await resync(Boolean(created))
+    }
     finally { requestPending = false }
   }
   async function selectBatch() {
@@ -52,12 +58,23 @@
   async function advanceBatch() {
     if (!batchId || batchCancelled || advanceInFlight || batchJobs.some((job) => activeStatuses.has(job.status))) return
     const next = batchJobs.find((job) => job.status === 'CREATED' && !batchStartErrors[job.job_id]); if (!next) return
-    advanceInFlight = true
-    try { merge([await startJob(next.job_id)]) }
-    catch (error) { batchStartErrors = { ...batchStartErrors, [next.job_id]: commandError(error) }; requestError = commandError(error); try { jobs = await listJobs() } catch { /* continue from known queue */ } }
+    advanceInFlight = true; let retryWhenIdle = false
+    try { merge([await startJob(next.job_id)]); requestError = null }
+    catch (error) {
+      const failure = commandError(error); requestError = failure
+      if (failure.code === 'JOB_BUSY') {
+        retryWhenIdle = true
+        try { jobs = await listJobs() } catch { /* retry from the known queue on the next poll */ }
+      } else {
+        batchStartErrors = { ...batchStartErrors, [next.job_id]: failure }
+        try { merge([await cancelJob(next.job_id)]) } catch { try { jobs = await listJobs() } catch { /* retain the start error */ } }
+      }
+    }
     finally { advanceInFlight = false }
+    if (retryWhenIdle) return
     if (!batchJobs.some((job) => activeStatuses.has(job.status))) await advanceBatch()
   }
+  function batchJob(id: string): JobSummary | undefined { return imageJobs.find((job) => job.job_id === id) }
   async function cancelCurrentBatch() { if (!batchId || batchCancelling) return; batchCancelling = true; requestError = null; try { await cancelBatch(batchId); batchCancelled = true; jobs = await listJobs() } catch (error) { requestError = commandError(error) } finally { batchCancelling = false; schedulePoll() } }
   async function cancelCurrentJob() {
     if (!currentJob || !activeStatuses.has(currentJob.status) || cancellingJobId === currentJob.job_id) return
@@ -91,7 +108,7 @@
   {/if}
 
   {#if batchId}
-    <article class="batch-panel" aria-live="polite"><div class="batch-heading"><strong>일괄 작업 {batchFinished}/{batchJobIds.length}</strong><span>{batchRunning ? '한 파일씩 안전하게 처리 중' : batchCancelled ? '일괄 작업 취소됨' : '일괄 작업 완료'}</span></div><div class="batch-list">{#each batchJobs as job}<div class:failed={job.status === 'FAILED' || Boolean(batchStartErrors[job.job_id])}><span>{job.input_name ?? `이미지 ${job.batch_index ?? ''}`}</span><b>{batchStartErrors[job.job_id] ? '시작 실패' : labels[job.status]}</b></div>{/each}</div>{#if rejected.length}<p class="rejected-summary">선택하지 못한 파일 {rejected.length}개 · {rejected.map((item) => item.input_name).join(', ')}</p>{/if}{#if batchRunning}<button class="cancel-action" type="button" onclick={cancelCurrentBatch} disabled={batchCancelling}>{batchCancelling ? '전체 취소 중…' : '일괄 작업 취소'}</button>{/if}</article>
+    <article class="batch-panel" aria-live="polite"><div class="batch-heading"><strong>일괄 작업 {batchFinished}/{batchJobIds.length}</strong><span>{batchRunning ? '한 파일씩 안전하게 처리 중' : batchCancelled ? '일괄 작업 취소됨' : '일괄 작업 완료'}</span></div><div class="batch-list">{#each batchJobIds as jobId}{@const job = batchJob(jobId)}<div class:failed={!job || job.status === 'FAILED' || Boolean(batchStartErrors[jobId])}><span>{job?.input_name ?? '격리된 작업 기록'}</span><b>{!job ? '기록 격리됨' : batchStartErrors[jobId] ? '시작 실패' : labels[job.status]}</b></div>{/each}</div>{#if rejected.length}<p class="rejected-summary">선택하지 못한 파일 {rejected.length}개 · {rejected.map((item) => item.input_name).join(', ')}</p>{/if}{#if batchRunning}<button class="cancel-action" type="button" onclick={cancelCurrentBatch} disabled={batchCancelling}>{batchCancelling ? '전체 취소 중…' : '일괄 작업 취소'}</button>{/if}</article>
   {:else if currentJob}
     <article class="current-job" aria-live="polite"><div class="job-heading"><div><strong>{currentJob.input_name ?? '선택한 이미지'}</strong><span>{currentJob.stage ?? labels[currentJob.status]}</span></div><b>{labels[currentJob.status]}</b></div><div class="progress-track" role="progressbar" aria-label="업스케일 진행률" aria-valuenow={currentJob.progress_percent} aria-valuemin="0" aria-valuemax="100"><span style={`width: ${currentJob.progress_percent}%`}></span></div>{#if isActive}<button class="cancel-action" type="button" onclick={cancelCurrentJob} disabled={requestPending || cancellingJobId === currentJob.job_id}>{cancellingJobId === currentJob.job_id ? '취소 중…' : '작업 취소'}</button>{:else if currentJob.status === 'COMPLETED' && currentJob.output_path}<div class="output-path"><span>저장 완료</span><code>{currentJob.output_path}</code></div>{/if}</article>
   {/if}

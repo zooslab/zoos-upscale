@@ -978,7 +978,23 @@ impl WorkspaceStore {
 
     pub fn recover_interrupted(&self) -> Result<(), WorkspaceError> {
         for job in self.list_jobs()? {
-            if job.status.is_active() {
+            if job.status == JobStatus::Created
+                && job.kind == JobKind::ImageUpscale
+                && job.selected_backend.is_some()
+            {
+                // Goal 1B picker-created jobs have no manual "start later" UI. If the app ended
+                // between creation and start, keeping normalized pixels and filename reservations
+                // would strand an invisible queue forever. Legacy Goal 1A jobs have no persisted
+                // selected backend and remain startable for compatibility.
+                self.cleanup_unverified_output(&job.job_id)?;
+                self.finish_unstarted_manifest(&job.job_id, "cancelled_after_restart")?;
+                self.update_summary(&job.job_id, |summary| {
+                    summary.status = JobStatus::Cancelled;
+                    summary.stage = None;
+                    summary.message = "Cancelled before execution after app restart".into();
+                    summary.error = None;
+                })?;
+            } else if job.status.is_active() {
                 self.cleanup_unverified_output(&job.job_id)?;
                 self.update_summary(&job.job_id, |summary| {
                     summary.status = JobStatus::Interrupted;
@@ -1863,6 +1879,13 @@ mod tests {
                 },
             )
             .expect("image job must be created");
+        store
+            .recover_interrupted()
+            .expect("legacy Goal 1A created job must survive recovery");
+        assert_eq!(
+            store.load_summary(&created.job_id).unwrap().status,
+            JobStatus::Created
+        );
 
         assert_eq!(created.kind, JobKind::ImageUpscale);
         assert_eq!(created.input_name.as_deref(), Some("원본 사진.png"));
@@ -2750,7 +2773,7 @@ mod tests {
     }
 
     #[test]
-    fn goal1b_recovery_removes_intermediates_and_keeps_independent_jobs() {
+    fn goal1b_recovery_cleans_active_and_unstarted_jobs() {
         let workspace = tempfile::tempdir().expect("workspace must be created");
         let sources = tempfile::tempdir().expect("sources must be created");
         let input_a = sources.path().join("a.png");
@@ -2801,11 +2824,23 @@ mod tests {
         );
         assert_eq!(
             reopened.load_summary(&b.job_id).unwrap().status,
-            JobStatus::Created
+            JobStatus::Cancelled
         );
         assert!(!request.input.path.exists());
         assert!(!request.output.path.exists());
         assert!(!pipeline.destination_partial.exists());
+        assert_eq!(
+            fs::read_dir(workspace.path().join(&b.job_id).join("work"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let b_manifest: JobManifest =
+            read_json(&workspace.path().join(&b.job_id).join(MANIFEST_FILE)).unwrap();
+        assert_eq!(
+            b_manifest.result.as_deref(),
+            Some("cancelled_after_restart")
+        );
     }
 
     #[cfg(unix)]

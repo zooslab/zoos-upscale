@@ -128,6 +128,16 @@ impl JobOrchestrator {
         }
 
         let mut active_jobs = self.inner.active_jobs.lock().await;
+        // A terminal summary can become observable a few instructions before the spawned task
+        // removes its sender. Drop only those proven-stale entries so the next sequential batch
+        // member does not receive a false JOB_BUSY.
+        active_jobs.retain(|active_job_id, _| {
+            !self
+                .inner
+                .store
+                .load_summary(active_job_id)
+                .is_ok_and(|summary| summary.status.is_terminal())
+        });
         if !active_jobs.is_empty() {
             return Err(OrchestratorError::AnotherJobActive);
         }
@@ -159,6 +169,10 @@ impl JobOrchestrator {
     }
 
     pub async fn cancel_job(&self, job_id: &str) -> Result<JobSummary, OrchestratorError> {
+        let current = self.inner.store.load_summary(job_id)?;
+        if current.status == JobStatus::Created {
+            return self.cancel_created_job(job_id);
+        }
         let cancellation = self
             .inner
             .active_jobs
@@ -778,8 +792,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn goal1b_public_create_api_selects_backend_and_batch_metadata() {
+    #[tokio::test]
+    async fn goal1b_public_create_api_selects_backend_and_batch_metadata() {
         let directory = tempfile::tempdir().expect("temporary directory must be created");
         let input_directory = tempfile::tempdir().expect("input directory must be created");
         let input = input_directory.path().join("input.png");
@@ -868,7 +882,8 @@ mod tests {
             .expect("native x4 CPU capability must satisfy an x2 Goal 1B request");
 
         let cancelled = orchestrator
-            .cancel_created_job(&created.job_id)
+            .cancel_job(&created.job_id)
+            .await
             .expect("a pending batch member must cancel without starting a runner");
         assert_eq!(cancelled.status, JobStatus::Cancelled);
         assert_eq!(cancelled.stage, None);
@@ -892,6 +907,52 @@ mod tests {
             orchestrator.cancel_created_job(&created.job_id),
             Err(OrchestratorError::InvalidState { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn terminal_sender_does_not_block_the_next_sequential_job() {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let orchestrator = JobOrchestrator::new(
+            directory.path(),
+            directory.path().join("missing-runner"),
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+        )
+        .expect("orchestrator must be created");
+        let stale = orchestrator.create_fake_job(FakeBehavior::Success).unwrap();
+        orchestrator
+            .inner
+            .store
+            .update_summary(&stale.job_id, |summary| {
+                summary.status = JobStatus::Completed
+            })
+            .unwrap();
+        let (sender, _receiver) = tokio::sync::watch::channel(false);
+        orchestrator
+            .inner
+            .active_jobs
+            .lock()
+            .await
+            .insert(stale.job_id, sender);
+        let next = orchestrator.create_fake_job(FakeBehavior::Success).unwrap();
+
+        let started = orchestrator
+            .start_job(&next.job_id)
+            .await
+            .expect("proven-terminal sender must be pruned");
+        assert_eq!(started.status, JobStatus::Probing);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let current = orchestrator.inner.store.load_summary(&next.job_id).unwrap();
+                if current.status.is_terminal() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("spawn failure must finish before test teardown");
     }
 
     #[tokio::test]

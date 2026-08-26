@@ -29,6 +29,7 @@ describe('ImageUpscale Goal 1B', () => {
     for (const mock of Object.values(api)) mock.mockReset()
     api.getImageEngineStatus.mockResolvedValue(bothReady); api.listJobs.mockResolvedValue([])
     api.cancelBatch.mockResolvedValue(undefined)
+    api.cancelJob.mockImplementation(async (id: string) => job(id, 'CANCELLED'))
   })
   afterEach(() => { cleanup(); vi.useRealTimers() })
 
@@ -68,7 +69,10 @@ describe('ImageUpscale Goal 1B', () => {
     api.listJobs.mockResolvedValueOnce([]).mockResolvedValueOnce([created])
     await mounted(); await fireEvent.click(screen.getByRole('button', { name: '이미지 선택' }))
     expect((await screen.findByRole('alert')).textContent).toContain('ENGINE_NOT_INSTALLED')
-    expect(api.listJobs).toHaveBeenCalledTimes(2); expect(api.getImageEngineStatus).toHaveBeenCalledTimes(2)
+    await waitFor(() => {
+      expect(api.listJobs).toHaveBeenCalledTimes(2); expect(api.getImageEngineStatus).toHaveBeenCalledTimes(2)
+      expect(api.cancelJob).toHaveBeenCalledWith('image-1')
+    })
   })
 
   it('starts a batch sequentially, shows rejected inputs, and continues after a file fails', async () => {
@@ -95,7 +99,38 @@ describe('ImageUpscale Goal 1B', () => {
     await mounted(); await fireEvent.click(screen.getByRole('button', { name: '폴더 일괄' }))
     await waitFor(() => expect(api.startJob).toHaveBeenCalledTimes(2))
     expect(api.startJob).toHaveBeenNthCalledWith(2, 'second')
+    expect(api.cancelJob).toHaveBeenCalledWith('first')
     expect(screen.getByText('시작 실패')).toBeTruthy()
+  })
+
+  it('retries a transient JOB_BUSY without abandoning the created batch job', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const first = job('first', 'CREATED', { id: 'batch-busy', index: 1, total: 1 })
+    api.pickAndCreateImageBatch.mockResolvedValue({ batch_id: 'batch-busy', jobs: [first], rejected: [] })
+    api.startJob.mockRejectedValueOnce({ code: 'JOB_BUSY', message: '정리 중' }).mockResolvedValueOnce(job('first', 'RUNNING', { id: 'batch-busy', index: 1, total: 1 }))
+    api.listJobs.mockResolvedValueOnce([]).mockResolvedValue([first])
+    await mounted(); await fireEvent.click(screen.getByRole('button', { name: '폴더 일괄' }))
+    await waitFor(() => expect(api.startJob).toHaveBeenCalledTimes(1))
+    expect(api.cancelJob).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(550)
+    await waitFor(() => expect(api.startJob).toHaveBeenCalledTimes(2))
+    expect(api.cancelJob).not.toHaveBeenCalled()
+  })
+
+  it('does not let a quarantined batch record keep polling forever', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const first = job('first', 'CREATED', { id: 'batch-quarantine', index: 1, total: 2 })
+    const second = job('second', 'CREATED', { id: 'batch-quarantine', index: 2, total: 2 })
+    api.pickAndCreateImageBatch.mockResolvedValue({ batch_id: 'batch-quarantine', jobs: [first, second], rejected: [] })
+    api.startJob.mockResolvedValueOnce(job('first', 'RUNNING', { id: 'batch-quarantine', index: 1, total: 2 })).mockResolvedValueOnce(job('second', 'RUNNING', { id: 'batch-quarantine', index: 2, total: 2 }))
+    api.listJobs.mockResolvedValueOnce([]).mockResolvedValueOnce([second]).mockResolvedValue([job('second', 'COMPLETED', { id: 'batch-quarantine', index: 2, total: 2 })])
+    await mounted(); await fireEvent.click(screen.getByRole('button', { name: '폴더 일괄' }))
+    await vi.advanceTimersByTimeAsync(550)
+    await waitFor(() => expect(api.startJob).toHaveBeenCalledTimes(2))
+    await vi.advanceTimersByTimeAsync(550)
+    expect(await screen.findByText('일괄 작업 2/2')).toBeTruthy()
+    expect(screen.getByText('기록 격리됨')).toBeTruthy()
+    expect(screen.getByText('일괄 작업 완료')).toBeTruthy()
   })
 
   it('cancels the active and pending batch through one batch command', async () => {

@@ -38,6 +38,7 @@
   let jobs = $state<JobSummary[]>([])
   let requestPending = $state(false)
   let requestError = $state<JobErrorView | null>(null)
+  let cancellingJobId = $state<string | null>(null)
   let pollTimer: number | null = null
 
   let imageJobs = $derived(jobs.filter((job) => job.kind === 'image_upscale'))
@@ -45,6 +46,7 @@
     imageJobs.find((job) => activeStatuses.has(job.status)) ?? imageJobs[0] ?? null,
   )
   let isActive = $derived(Boolean(currentJob && activeStatuses.has(currentJob.status)))
+  let isCancelling = $derived(currentJob?.job_id === cancellingJobId)
   let shownError = $derived(requestError ?? currentJob?.error ?? null)
   let canSelect = $derived(
     runtimeAvailable && engine?.state === 'READY' && !requestPending && !isActive,
@@ -81,6 +83,7 @@
   async function refreshJobs(): Promise<void> {
     try {
       jobs = await listJobs()
+      clearFinishedCancellation()
     } catch (error) {
       requestError = commandError(error)
     } finally {
@@ -91,31 +94,68 @@
   async function selectImage(): Promise<void> {
     requestPending = true
     requestError = null
+    let created: JobSummary | null = null
     try {
-      const created = await pickAndCreateImageJob(preset, scale)
+      created = await pickAndCreateImageJob(preset, scale)
       if (created === null) return
+      jobs = [created, ...jobs.filter((job) => job.job_id !== created?.job_id)]
       const started = await startJob(created.job_id)
       jobs = [started, ...jobs.filter((job) => job.job_id !== started.job_id)]
       schedulePollIfActive()
     } catch (error) {
       requestError = commandError(error)
+      await resynchronizeAfterStartError(created !== null)
     } finally {
       requestPending = false
     }
   }
 
   async function cancelCurrentJob(): Promise<void> {
-    if (!currentJob || !activeStatuses.has(currentJob.status)) return
+    if (
+      !currentJob ||
+      !activeStatuses.has(currentJob.status) ||
+      cancellingJobId === currentJob.job_id
+    ) return
+    const jobId = currentJob.job_id
+    cancellingJobId = jobId
     requestPending = true
     requestError = null
     try {
-      const cancelled = await cancelJob(currentJob.job_id)
+      const cancelled = await cancelJob(jobId)
       jobs = [cancelled, ...jobs.filter((job) => job.job_id !== cancelled.job_id)]
+      clearFinishedCancellation()
       schedulePollIfActive()
     } catch (error) {
       requestError = commandError(error)
+      try {
+        jobs = await listJobs()
+        clearFinishedCancellation()
+      } catch {
+        // Keep the original cancellation error visible and continue polling the known active job.
+      }
     } finally {
       requestPending = false
+    }
+  }
+
+  function clearFinishedCancellation(): void {
+    if (cancellingJobId === null) return
+    const cancellingJob = jobs.find((job) => job.job_id === cancellingJobId)
+    if (!cancellingJob || !activeStatuses.has(cancellingJob.status)) cancellingJobId = null
+  }
+
+  async function resynchronizeAfterStartError(jobWasCreated: boolean): Promise<void> {
+    if (jobWasCreated) {
+      try {
+        jobs = await listJobs()
+      } catch {
+        // Preserve the command error that caused the failed start.
+      }
+    }
+    try {
+      engine = await getImageEngineStatus()
+    } catch {
+      // Preserve the command error; the last known engine status remains useful context.
     }
   }
 </script>
@@ -188,8 +228,13 @@
         <span style={`width: ${currentJob.progress_percent}%`}></span>
       </div>
       {#if isActive}
-        <button class="cancel-action" type="button" onclick={cancelCurrentJob} disabled={requestPending}>
-          작업 취소
+        <button
+          class="cancel-action"
+          type="button"
+          onclick={cancelCurrentJob}
+          disabled={requestPending || isCancelling}
+        >
+          {isCancelling ? '취소 중…' : '작업 취소'}
         </button>
       {:else if currentJob.status === 'COMPLETED' && currentJob.output_path}
         <div class="output-path">

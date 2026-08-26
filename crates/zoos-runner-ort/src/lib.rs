@@ -24,7 +24,9 @@ const EXIT_ASSET: i32 = 20;
 const EXIT_UPSTREAM: i32 = 30;
 const EXIT_CANCELLED: i32 = 50;
 const CORE_TILE: u32 = 128;
-const TILE_CONTEXT: u32 = 16;
+// Match the pinned ncnn wrapper's shader (`prepadding = 10`): it uses
+// OpenCV BORDER_REFLECT_101 at both outer image edges and tile boundaries.
+const NCNN_PREPADDING: i64 = 10;
 const NATIVE_SCALE: u32 = 4;
 const HEARTBEAT: Duration = Duration::from_secs(2);
 
@@ -487,18 +489,20 @@ struct Tile {
     core_y: u32,
     core_width: u32,
     core_height: u32,
-    expanded_x: u32,
-    expanded_y: u32,
-    expanded_right: u32,
-    expanded_bottom: u32,
+    expanded_x: i64,
+    expanded_y: i64,
+    expanded_right: i64,
+    expanded_bottom: i64,
 }
 
 impl Tile {
     fn expanded_width(self) -> u32 {
-        self.expanded_right - self.expanded_x
+        u32::try_from(self.expanded_right - self.expanded_x)
+            .expect("tile width must remain positive and bounded")
     }
     fn expanded_height(self) -> u32 {
-        self.expanded_bottom - self.expanded_y
+        u32::try_from(self.expanded_bottom - self.expanded_y)
+            .expect("tile height must remain positive and bounded")
     }
 }
 
@@ -513,10 +517,10 @@ fn tile_plan(width: u32, height: u32) -> Vec<Tile> {
                 core_y,
                 core_width,
                 core_height,
-                expanded_x: core_x.saturating_sub(TILE_CONTEXT),
-                expanded_y: core_y.saturating_sub(TILE_CONTEXT),
-                expanded_right: (core_x + core_width + TILE_CONTEXT).min(width),
-                expanded_bottom: (core_y + core_height + TILE_CONTEXT).min(height),
+                expanded_x: i64::from(core_x) - NCNN_PREPADDING,
+                expanded_y: i64::from(core_y) - NCNN_PREPADDING,
+                expanded_right: i64::from(core_x + core_width) + NCNN_PREPADDING,
+                expanded_bottom: i64::from(core_y + core_height) + NCNN_PREPADDING,
             });
         }
     }
@@ -526,17 +530,32 @@ fn tile_plan(width: u32, height: u32) -> Vec<Tile> {
 fn tile_tensor(image: &RgbImage, tile: Tile) -> Vec<f32> {
     let plane = (tile.expanded_width() * tile.expanded_height()) as usize;
     let mut tensor = vec![0.0; plane * 3];
-    for y in tile.expanded_y..tile.expanded_bottom {
-        for x in tile.expanded_x..tile.expanded_right {
-            let pixel = image.get_pixel(x, y);
-            let offset =
-                ((y - tile.expanded_y) * tile.expanded_width() + (x - tile.expanded_x)) as usize;
+    for tile_y in 0..tile.expanded_height() {
+        for tile_x in 0..tile.expanded_width() {
+            let source_x = reflect101_index(tile.expanded_x + i64::from(tile_x), image.width());
+            let source_y = reflect101_index(tile.expanded_y + i64::from(tile_y), image.height());
+            let pixel = image.get_pixel(source_x, source_y);
+            let offset = (tile_y * tile.expanded_width() + tile_x) as usize;
             for channel in 0..3 {
                 tensor[channel * plane + offset] = f32::from(pixel[channel]) / 255.0;
             }
         }
     }
     tensor
+}
+
+fn reflect101_index(coordinate: i64, length: u32) -> u32 {
+    if length <= 1 {
+        return 0;
+    }
+    let period = i64::from(length - 1) * 2;
+    let folded = coordinate.rem_euclid(period);
+    u32::try_from(if folded < i64::from(length) {
+        folded
+    } else {
+        period - folded
+    })
+    .expect("reflected coordinate must fit the source dimension")
 }
 
 struct TileInference {
@@ -624,8 +643,12 @@ fn stitch_tile(
             "ORT output tensor has an invalid length",
         ));
     }
-    let crop_x = (tile.core_x - tile.expanded_x) * NATIVE_SCALE;
-    let crop_y = (tile.core_y - tile.expanded_y) * NATIVE_SCALE;
+    let crop_x = u32::try_from(i64::from(tile.core_x) - tile.expanded_x)
+        .map_err(|_| RunnerFailure::upstream("tile crop is invalid"))?
+        * NATIVE_SCALE;
+    let crop_y = u32::try_from(i64::from(tile.core_y) - tile.expanded_y)
+        .map_err(|_| RunnerFailure::upstream("tile crop is invalid"))?
+        * NATIVE_SCALE;
     for y in 0..tile.core_height * NATIVE_SCALE {
         for x in 0..tile.core_width * NATIVE_SCALE {
             let source = ((crop_y + y) * output_width + crop_x + x) as usize;
@@ -843,18 +866,36 @@ mod tests {
                 core_y: 0,
                 core_width: 64,
                 core_height: 48,
-                expanded_x: 0,
-                expanded_y: 0,
-                expanded_right: 64,
-                expanded_bottom: 48
+                expanded_x: -10,
+                expanded_y: -10,
+                expanded_right: 74,
+                expanded_bottom: 58
             }]
         );
         let tiles = tile_plan(257, 129);
         assert_eq!(tiles.len(), 6);
-        assert_eq!(tiles[1].expanded_x, 112);
-        assert_eq!(tiles[1].expanded_right, 257);
+        assert_eq!(tiles[1].expanded_x, 118);
+        assert_eq!(tiles[1].expanded_right, 266);
         assert_eq!(tiles[5].core_width, 1);
         assert_eq!(tiles[5].core_height, 1);
+    }
+
+    #[test]
+    fn reflect101_padding_excludes_the_edge_pixel_like_ncnn() {
+        assert_eq!(reflect101_index(-1, 4), 1);
+        assert_eq!(reflect101_index(-2, 4), 2);
+        assert_eq!(reflect101_index(0, 4), 0);
+        assert_eq!(reflect101_index(3, 4), 3);
+        assert_eq!(reflect101_index(4, 4), 2);
+        assert_eq!(reflect101_index(5, 4), 1);
+        assert_eq!(reflect101_index(-100, 1), 0);
+
+        let image = RgbImage::from_fn(3, 2, |x, y| image::Rgb([(y * 3 + x) as u8, 0, 0]));
+        let tile = tile_plan(3, 2)[0];
+        let tensor = tile_tensor(&image, tile);
+        let width = tile.expanded_width() as usize;
+        // Local (9, 10) maps to source (-1, 0), which REFLECT_101 maps to (1, 0).
+        assert_eq!(tensor[10 * width + 9], 1.0 / 255.0);
     }
 
     #[test]

@@ -1,34 +1,45 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://zoos-upscale.local/schemas/runner-protocol-v1/fake-job.schema.json",
-  "title": "Zoos Upscale Fake Runner Job",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FakeJobRequest",
   "type": "object",
-  "additionalProperties": false,
   "required": [
-    "protocol_version",
-    "job_id",
-    "task",
     "input",
+    "job_id",
     "output",
     "parameters",
+    "protocol_version",
+    "task",
     "test_behavior"
   ],
   "properties": {
-    "protocol_version": { "const": 1 },
-    "job_id": { "type": "string", "minLength": 1 },
-    "task": { "const": "fake" },
-    "input": { "$ref": "#/$defs/pathObject" },
-    "output": { "$ref": "#/$defs/pathObject" },
+    "input": {
+      "$ref": "#/definitions/RunnerInput"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "output": {
+      "$ref": "#/definitions/RunnerOutput"
+    },
     "parameters": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["steps", "step_delay_ms"],
-      "properties": {
-        "steps": { "type": "integer", "minimum": 1, "maximum": 1000 },
-        "step_delay_ms": { "type": "integer", "minimum": 0, "maximum": 60000 }
-      }
+      "$ref": "#/definitions/FakeParameters"
+    },
+    "protocol_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "task": {
+      "$ref": "#/definitions/FakeTask"
     },
     "test_behavior": {
+      "$ref": "#/definitions/FakeBehavior"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "FakeBehavior": {
+      "type": "string",
       "enum": [
         "success",
         "failed",
@@ -38,16 +49,56 @@
         "completed_then_nonzero",
         "spawn_grandchild_and_hang"
       ]
-    }
-  },
-  "$defs": {
-    "pathObject": {
+    },
+    "FakeParameters": {
       "type": "object",
-      "additionalProperties": false,
-      "required": ["path"],
+      "required": [
+        "step_delay_ms",
+        "steps"
+      ],
       "properties": {
-        "path": { "type": "string", "minLength": 1 }
-      }
+        "step_delay_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "steps": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "FakeTask": {
+      "type": "string",
+      "enum": [
+        "fake"
+      ]
+    },
+    "RunnerInput": {
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RunnerOutput": {
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

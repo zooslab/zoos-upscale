@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const EVENT_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FakeJobRequest {
     pub protocol_version: u32,
@@ -41,32 +42,163 @@ impl FakeJobRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImageUpscaleJobRequest {
+    pub protocol_version: u32,
+    pub job_id: String,
+    pub task: ImageTask,
+    pub input: ImageRunnerInput,
+    pub output: ImageRunnerOutput,
+    pub parameters: ImageUpscaleParameters,
+}
+
+impl ImageUpscaleJobRequest {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(ContractError::UnsupportedProtocol(self.protocol_version));
+        }
+        if self.job_id.trim().is_empty() {
+            return Err(ContractError::EmptyJobId);
+        }
+        if !self.input.path.is_absolute() {
+            return Err(ContractError::RelativePath("input"));
+        }
+        if !self.output.path.is_absolute() {
+            return Err(ContractError::RelativePath("output"));
+        }
+        if self.input.sha256.len() != 64
+            || !self
+                .input
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ContractError::InvalidImageParameter("input.sha256"));
+        }
+        if self.input.width == 0 || self.input.height == 0 {
+            return Err(ContractError::InvalidImageParameter("input dimensions"));
+        }
+        if !matches!(self.parameters.scale, 2 | 4) {
+            return Err(ContractError::InvalidScale(self.parameters.scale));
+        }
+        let mapped_model = match self.parameters.preset {
+            ImagePreset::Photo => ImageModelId::RealEsrganX4plus,
+            ImagePreset::Anime => ImageModelId::RealEsrganX4plusAnime,
+        };
+        if self.parameters.model_id != mapped_model {
+            return Err(ContractError::InvalidImageParameter("model_id"));
+        }
+        if self.parameters.tile_size != 256 {
+            return Err(ContractError::InvalidImageParameter("tile_size"));
+        }
+        if self.parameters.gpu_id != 0 {
+            return Err(ContractError::InvalidImageParameter("gpu_id"));
+        }
+        if self.parameters.threads != "1:2:2" {
+            return Err(ContractError::InvalidImageParameter("threads"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImageRunnerInput {
+    pub path: PathBuf,
+    #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+    pub sha256: String,
+    #[schemars(range(min = 1))]
+    pub width: u32,
+    #[schemars(range(min = 1))]
+    pub height: u32,
+    pub format: ImageInputFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageInputFormat {
+    Png,
+    Jpeg,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImageRunnerOutput {
+    pub path: PathBuf,
+    pub format: ImageOutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageOutputFormat {
+    Png,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageTask {
+    ImageUpscale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImagePreset {
+    Photo,
+    Anime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImageUpscaleParameters {
+    pub preset: ImagePreset,
+    pub model_id: ImageModelId,
+    #[schemars(range(min = 2, max = 4))]
+    pub scale: u8,
+    #[schemars(range(min = 256, max = 256))]
+    pub tile_size: u32,
+    #[schemars(range(max = 0))]
+    pub gpu_id: u32,
+    #[schemars(regex(pattern = "^1:2:2$"))]
+    pub threads: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum ImageModelId {
+    #[serde(rename = "realesrgan-x4plus")]
+    #[schemars(rename = "realesrgan-x4plus")]
+    RealEsrganX4plus,
+    #[serde(rename = "realesrgan-x4plus-anime")]
+    #[schemars(rename = "realesrgan-x4plus-anime")]
+    RealEsrganX4plusAnime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FakeTask {
     Fake,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerInput {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerOutput {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FakeParameters {
     pub steps: u32,
     pub step_delay_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FakeBehavior {
     Success,
@@ -78,7 +210,7 @@ pub enum FakeBehavior {
     SpawnGrandchildAndHang,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RunnerEvent {
     pub protocol_version: u32,
     pub event_version: u32,
@@ -140,6 +272,9 @@ impl RunnerEvent {
                 completed_units,
                 total_units,
                 unit,
+                chunk_id,
+                rate,
+                rate_unit,
                 ..
             } => {
                 if stage.trim().is_empty() {
@@ -150,6 +285,23 @@ impl RunnerEvent {
                 }
                 if *total_units == 0 || completed_units > total_units {
                     return Err(EventContractError::InvalidProgress);
+                }
+                if chunk_id
+                    .as_deref()
+                    .is_some_and(|chunk| chunk.trim().is_empty())
+                {
+                    return Err(EventContractError::EmptyField("chunk_id"));
+                }
+                if rate.is_some_and(|value| !value.is_finite() || value < 0.0)
+                    || rate.is_some() != rate_unit.is_some()
+                {
+                    return Err(EventContractError::InvalidProgress);
+                }
+                if rate_unit
+                    .as_deref()
+                    .is_some_and(|unit| unit.trim().is_empty())
+                {
+                    return Err(EventContractError::EmptyField("rate_unit"));
                 }
                 Ok(())
             }
@@ -174,7 +326,7 @@ impl RunnerEvent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RunnerEventPayload {
     Started {
@@ -186,6 +338,14 @@ pub enum RunnerEventPayload {
         total_units: u64,
         unit: String,
         elapsed_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_unit: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimated_remaining_ms: Option<u64>,
     },
     Warning {
         code: String,
@@ -200,14 +360,55 @@ pub enum RunnerEventPayload {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerCapabilities {
     pub protocol_version: u32,
     pub runner_id: String,
     pub runner_version: String,
-    pub tasks: Vec<FakeTask>,
+    pub tasks: Vec<RunnerTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<UpstreamInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelCapability>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scales: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<DeviceCapability>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub test_behaviors: Vec<FakeBehavior>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerTask {
+    #[serde(alias = "fake")]
+    FakeValidation,
+    ImageUpscale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamInfo {
+    pub name: String,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_commit: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCapability {
+    pub id: String,
+    pub scales: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceCapability {
+    pub index: u32,
+    pub name: String,
+    pub backend: String,
 }
 
 impl RunnerCapabilities {
@@ -216,7 +417,11 @@ impl RunnerCapabilities {
             protocol_version: PROTOCOL_VERSION,
             runner_id: "zoos-runner-fake".into(),
             runner_version: env!("CARGO_PKG_VERSION").into(),
-            tasks: vec![FakeTask::Fake],
+            tasks: vec![RunnerTask::FakeValidation],
+            upstream: None,
+            models: Vec::new(),
+            scales: Vec::new(),
+            devices: Vec::new(),
             test_behaviors: vec![
                 FakeBehavior::Success,
                 FakeBehavior::Failed,
@@ -242,6 +447,44 @@ impl RunnerCapabilities {
         if self.tasks.is_empty() {
             return Err(ContractError::EmptyTasks);
         }
+        if self.tasks.contains(&RunnerTask::ImageUpscale)
+            && (self.upstream.is_none()
+                || self.models.is_empty()
+                || self.scales.is_empty()
+                || self.devices.is_empty())
+        {
+            return Err(ContractError::InvalidCapabilities("image_upscale"));
+        }
+        if self.upstream.as_ref().is_some_and(|upstream| {
+            upstream.name.trim().is_empty() || upstream.version.trim().is_empty()
+        }) {
+            return Err(ContractError::InvalidCapabilities("upstream"));
+        }
+        if self.models.iter().any(|model| {
+            model.id.trim().is_empty()
+                || model.scales.is_empty()
+                || model.scales.iter().any(|scale| !matches!(scale, 2 | 4))
+        }) {
+            return Err(ContractError::InvalidCapabilities("models"));
+        }
+        if self.scales.iter().any(|scale| !matches!(scale, 2 | 4)) {
+            return Err(ContractError::InvalidCapabilities("scales"));
+        }
+        if self.models.iter().any(|model| {
+            model
+                .scales
+                .iter()
+                .any(|scale| !self.scales.contains(scale))
+        }) {
+            return Err(ContractError::InvalidCapabilities("model scales"));
+        }
+        if self
+            .devices
+            .iter()
+            .any(|device| device.name.trim().is_empty() || device.backend.trim().is_empty())
+        {
+            return Err(ContractError::InvalidCapabilities("devices"));
+        }
         Ok(())
     }
 }
@@ -252,10 +495,13 @@ pub enum ContractError {
     EmptyJobId,
     InvalidSteps(u32),
     InvalidDelay(u64),
+    InvalidScale(u8),
+    InvalidImageParameter(&'static str),
     RelativePath(&'static str),
     EmptyRunnerId,
     EmptyRunnerVersion,
     EmptyTasks,
+    InvalidCapabilities(&'static str),
 }
 
 impl std::fmt::Display for ContractError {
@@ -269,10 +515,17 @@ impl std::fmt::Display for ContractError {
             Self::InvalidDelay(delay) => {
                 write!(formatter, "step_delay_ms must not exceed 60000: {delay}")
             }
+            Self::InvalidScale(scale) => write!(formatter, "scale must be 2 or 4: {scale}"),
+            Self::InvalidImageParameter(field) => {
+                write!(formatter, "image upscale parameter is invalid: {field}")
+            }
             Self::RelativePath(field) => write!(formatter, "{field} path must be absolute"),
             Self::EmptyRunnerId => formatter.write_str("runner_id must not be empty"),
             Self::EmptyRunnerVersion => formatter.write_str("runner_version must not be empty"),
             Self::EmptyTasks => formatter.write_str("tasks must not be empty"),
+            Self::InvalidCapabilities(field) => {
+                write!(formatter, "runner capabilities field is invalid: {field}")
+            }
         }
     }
 }
@@ -330,6 +583,10 @@ mod tests {
                 total_units: 4,
                 unit: "step".into(),
                 elapsed_ms: 20,
+                chunk_id: Some("tile-1".into()),
+                rate: Some(50.0),
+                rate_unit: Some("step/s".into()),
+                estimated_remaining_ms: Some(60),
             },
         );
 
@@ -358,5 +615,125 @@ mod tests {
                 actual: 3,
             })
         );
+    }
+
+    #[test]
+    fn image_job_round_trip_matches_fixed_wrapper_contract() {
+        let root = std::env::current_dir().expect("current directory must be absolute");
+        let request = ImageUpscaleJobRequest {
+            protocol_version: PROTOCOL_VERSION,
+            job_id: "image-job-1".into(),
+            task: ImageTask::ImageUpscale,
+            input: ImageRunnerInput {
+                path: root.join("input.jpg"),
+                sha256: "a".repeat(64),
+                width: 640,
+                height: 480,
+                format: ImageInputFormat::Jpeg,
+            },
+            output: ImageRunnerOutput {
+                path: root.join(".output.partial.png"),
+                format: ImageOutputFormat::Png,
+            },
+            parameters: ImageUpscaleParameters {
+                preset: ImagePreset::Anime,
+                model_id: ImageModelId::RealEsrganX4plusAnime,
+                scale: 4,
+                tile_size: 256,
+                gpu_id: 0,
+                threads: "1:2:2".into(),
+            },
+        };
+
+        request.validate().expect("image request must validate");
+        let value = serde_json::to_value(&request).expect("request must serialize");
+        assert_eq!(value["parameters"]["model_id"], "realesrgan-x4plus-anime");
+        assert_eq!(value["parameters"]["tile_size"], 256);
+        assert_eq!(value["parameters"]["gpu_id"], 0);
+        assert_eq!(value["parameters"]["threads"], "1:2:2");
+        let round_trip: ImageUpscaleJobRequest =
+            serde_json::from_value(value).expect("request must deserialize");
+        assert_eq!(round_trip, request);
+
+        let schema = serde_json::to_value(schemars::schema_for!(ImageUpscaleJobRequest))
+            .expect("schema must serialize");
+        let schema_text = schema.to_string();
+        for required in [
+            "sha256",
+            "width",
+            "height",
+            "format",
+            "model_id",
+            "scale",
+            "tile_size",
+            "gpu_id",
+            "threads",
+        ] {
+            assert!(schema_text.contains(required), "schema omitted {required}");
+        }
+    }
+
+    #[test]
+    fn image_job_rejects_a_model_that_does_not_match_the_preset() {
+        let root = std::env::current_dir().expect("current directory must be absolute");
+        let request = ImageUpscaleJobRequest {
+            protocol_version: PROTOCOL_VERSION,
+            job_id: "image-job-1".into(),
+            task: ImageTask::ImageUpscale,
+            input: ImageRunnerInput {
+                path: root.join("input.png"),
+                sha256: "0".repeat(64),
+                width: 1,
+                height: 1,
+                format: ImageInputFormat::Png,
+            },
+            output: ImageRunnerOutput {
+                path: root.join("output.png"),
+                format: ImageOutputFormat::Png,
+            },
+            parameters: ImageUpscaleParameters {
+                preset: ImagePreset::Photo,
+                model_id: ImageModelId::RealEsrganX4plusAnime,
+                scale: 2,
+                tile_size: 256,
+                gpu_id: 0,
+                threads: "1:2:2".into(),
+            },
+        };
+
+        assert_eq!(
+            request.validate(),
+            Err(ContractError::InvalidImageParameter("model_id"))
+        );
+    }
+
+    #[test]
+    fn image_capabilities_cover_upstream_models_scales_and_device() {
+        let capabilities = RunnerCapabilities {
+            protocol_version: PROTOCOL_VERSION,
+            runner_id: "zoos-runner-realesrgan".into(),
+            runner_version: "0.1.0".into(),
+            tasks: vec![RunnerTask::ImageUpscale],
+            upstream: Some(UpstreamInfo {
+                name: "Real-ESRGAN-ncnn-vulkan".into(),
+                version: "0.2.0".into(),
+                source_commit: Some("37026f4".into()),
+            }),
+            models: vec![ModelCapability {
+                id: "realesrgan-x4plus".into(),
+                scales: vec![2, 4],
+            }],
+            scales: vec![2, 4],
+            devices: vec![DeviceCapability {
+                index: 0,
+                name: "Apple M5".into(),
+                backend: "vulkan".into(),
+            }],
+            test_behaviors: Vec::new(),
+        };
+
+        capabilities
+            .validate()
+            .expect("complete image capabilities must validate");
     }
 }

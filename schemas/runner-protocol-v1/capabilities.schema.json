@@ -1,41 +1,153 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://zoos-upscale.local/schemas/runner-protocol-v1/capabilities.schema.json",
-  "title": "Zoos Upscale Runner Capabilities",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RunnerCapabilities",
   "type": "object",
-  "additionalProperties": false,
   "required": [
     "protocol_version",
     "runner_id",
     "runner_version",
-    "tasks",
-    "test_behaviors"
+    "tasks"
   ],
   "properties": {
-    "protocol_version": { "const": 1 },
-    "runner_id": { "type": "string", "minLength": 1 },
-    "runner_version": { "type": "string", "minLength": 1 },
+    "devices": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/DeviceCapability"
+      }
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ModelCapability"
+      }
+    },
+    "protocol_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "runner_id": {
+      "type": "string"
+    },
+    "runner_version": {
+      "type": "string"
+    },
+    "scales": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "minimum": 0.0
+      }
+    },
     "tasks": {
       "type": "array",
-      "minItems": 1,
-      "uniqueItems": true,
-      "items": { "const": "fake" }
+      "items": {
+        "$ref": "#/definitions/RunnerTask"
+      }
     },
     "test_behaviors": {
       "type": "array",
-      "minItems": 1,
-      "uniqueItems": true,
       "items": {
-        "enum": [
-          "success",
-          "failed",
-          "malformed_ndjson",
-          "crash",
-          "hang",
-          "completed_then_nonzero",
-          "spawn_grandchild_and_hang"
-        ]
+        "$ref": "#/definitions/FakeBehavior"
       }
+    },
+    "upstream": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UpstreamInfo"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "DeviceCapability": {
+      "type": "object",
+      "required": [
+        "backend",
+        "index",
+        "name"
+      ],
+      "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FakeBehavior": {
+      "type": "string",
+      "enum": [
+        "success",
+        "failed",
+        "malformed_ndjson",
+        "crash",
+        "hang",
+        "completed_then_nonzero",
+        "spawn_grandchild_and_hang"
+      ]
+    },
+    "ModelCapability": {
+      "type": "object",
+      "required": [
+        "id",
+        "scales"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "scales": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0.0
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RunnerTask": {
+      "type": "string",
+      "enum": [
+        "fake_validation",
+        "image_upscale"
+      ]
+    },
+    "UpstreamInfo": {
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "source_commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

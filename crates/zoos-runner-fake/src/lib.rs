@@ -113,6 +113,10 @@ fn run_success(
                 total_units: u64::from(request.parameters.steps),
                 unit: "step".into(),
                 elapsed_ms: started_at.elapsed().as_millis() as u64,
+                chunk_id: None,
+                rate: None,
+                rate_unit: None,
+                estimated_remaining_ms: None,
             })
             .is_err()
         {

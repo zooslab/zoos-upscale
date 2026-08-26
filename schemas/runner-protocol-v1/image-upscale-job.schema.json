@@ -1,0 +1,164 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ImageUpscaleJobRequest",
+  "type": "object",
+  "required": [
+    "input",
+    "job_id",
+    "output",
+    "parameters",
+    "protocol_version",
+    "task"
+  ],
+  "properties": {
+    "input": {
+      "$ref": "#/definitions/ImageRunnerInput"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "output": {
+      "$ref": "#/definitions/ImageRunnerOutput"
+    },
+    "parameters": {
+      "$ref": "#/definitions/ImageUpscaleParameters"
+    },
+    "protocol_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "task": {
+      "$ref": "#/definitions/ImageTask"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "ImageInputFormat": {
+      "type": "string",
+      "enum": [
+        "png",
+        "jpeg"
+      ]
+    },
+    "ImageModelId": {
+      "type": "string",
+      "enum": [
+        "realesrgan-x4plus",
+        "realesrgan-x4plus-anime"
+      ]
+    },
+    "ImageOutputFormat": {
+      "type": "string",
+      "enum": [
+        "png"
+      ]
+    },
+    "ImagePreset": {
+      "type": "string",
+      "enum": [
+        "photo",
+        "anime"
+      ]
+    },
+    "ImageRunnerInput": {
+      "type": "object",
+      "required": [
+        "format",
+        "height",
+        "path",
+        "sha256",
+        "width"
+      ],
+      "properties": {
+        "format": {
+          "$ref": "#/definitions/ImageInputFormat"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1.0
+        },
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ImageRunnerOutput": {
+      "type": "object",
+      "required": [
+        "format",
+        "path"
+      ],
+      "properties": {
+        "format": {
+          "$ref": "#/definitions/ImageOutputFormat"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ImageTask": {
+      "type": "string",
+      "enum": [
+        "image_upscale"
+      ]
+    },
+    "ImageUpscaleParameters": {
+      "type": "object",
+      "required": [
+        "gpu_id",
+        "model_id",
+        "preset",
+        "scale",
+        "threads",
+        "tile_size"
+      ],
+      "properties": {
+        "gpu_id": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 0.0,
+          "minimum": 0.0
+        },
+        "model_id": {
+          "$ref": "#/definitions/ImageModelId"
+        },
+        "preset": {
+          "$ref": "#/definitions/ImagePreset"
+        },
+        "scale": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 4.0,
+          "minimum": 2.0
+        },
+        "threads": {
+          "type": "string",
+          "pattern": "^1:2:2$"
+        },
+        "tile_size": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 256.0,
+          "minimum": 256.0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

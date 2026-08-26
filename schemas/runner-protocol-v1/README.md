@@ -1,5 +1,8 @@
 # RunnerProtocolV1
 
+The checked-in schemas are generated from the authoritative Rust types. Run
+`cargo xtask schema` after contract changes; CI uses `cargo xtask schema --check`.
+
 `RunnerProtocolV1` is the process boundary between the Rust Orchestrator and native AI runners.
 
 - The Orchestrator writes a typed job JSON file.

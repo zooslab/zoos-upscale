@@ -89,16 +89,15 @@ impl RunnerRegistry {
 #[async_trait]
 impl ExecutionBackend for ProcessExecutionBackend {
     async fn probe(&self, launch: &RunnerLaunchSpec) -> Result<RunnerCapabilities, BackendError> {
-        let output = timeout(
-            self.activity_timeout,
-            Command::new(&launch.executable)
-                .args(["--capabilities", "--json"])
-                .stdin(Stdio::null())
-                .output(),
-        )
-        .await
-        .map_err(|_| BackendError::RunnerTimedOut)?
-        .map_err(|error| BackendError::SpawnFailed(error.to_string()))?;
+        let mut command = Command::new(&launch.executable);
+        command
+            .args(["--capabilities", "--json"])
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = timeout(self.activity_timeout, command.output())
+            .await
+            .map_err(|_| BackendError::RunnerTimedOut)?
+            .map_err(|error| BackendError::SpawnFailed(error.to_string()))?;
         if !output.status.success() {
             return Err(BackendError::ProbeFailed(
                 String::from_utf8_lossy(&output.stderr).trim().to_owned(),

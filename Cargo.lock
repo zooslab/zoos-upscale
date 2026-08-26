@@ -4544,6 +4544,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "schemars 0.8.22",
+ "serde_json",
+ "zoos-runner-protocol",
+]
+
+[[package]]
 name = "yoke"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4658,6 +4667,7 @@ dependencies = [
 name = "zoos-runner-protocol"
 version = "0.1.0"
 dependencies = [
+ "schemars 0.8.22",
  "serde",
  "serde_json",
 ]

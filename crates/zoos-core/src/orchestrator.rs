@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, watch};
-use zoos_runner_protocol::{FakeBehavior, RunnerEvent, RunnerEventPayload};
+use zoos_runner_protocol::{FakeBehavior, RunnerEvent, RunnerEventPayload, RunnerTask};
 
 use crate::domain::{ExecutionRequest, JobErrorView, JobKind, JobStatus, JobSummary};
 use crate::process::{
@@ -157,7 +157,28 @@ impl JobOrchestrator {
                 return;
             }
         };
-        if let Err(error) = self.inner.backend.probe(&launch).await {
+        let expected_task = match stored.progress.summary.kind {
+            JobKind::FakeValidation => RunnerTask::FakeValidation,
+            JobKind::ImageUpscale => RunnerTask::ImageUpscale,
+        };
+        if let Err(error) = self
+            .inner
+            .backend
+            .probe(&launch)
+            .await
+            .and_then(|capabilities| {
+                capabilities
+                    .tasks
+                    .contains(&expected_task)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        BackendError::ProbeFailed(format!(
+                            "runner {} does not support {expected_task:?}",
+                            launch.runner_id
+                        ))
+                    })
+            })
+        {
             let _progress_guard = self.inner.progress_updates.lock().await;
             if let Err(reporting_error) = self.finalize_failed(&job_id, &error, started_at_ms) {
                 eprintln!("could not persist probe failure for job {job_id}: {reporting_error}");

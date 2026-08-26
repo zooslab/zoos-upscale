@@ -6,14 +6,20 @@ use std::path::PathBuf;
 #[cfg(debug_assertions)]
 use std::time::Duration;
 
-#[cfg(debug_assertions)]
 use tauri::Manager;
 #[cfg(debug_assertions)]
 use zoos_core::JobOrchestrator;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(
+        |app, _arguments, _working_directory| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        },
+    ));
 
     #[cfg(debug_assertions)]
     let builder = builder

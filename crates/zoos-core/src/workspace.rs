@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use atomic_write_file::AtomicWriteFile;
-use serde::Serialize;
+use fs4::{FileExt, TryLockError};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 use zoos_runner_protocol::{
@@ -24,10 +25,16 @@ const PROGRESS_FILE: &str = "progress.json";
 const MANIFEST_FILE: &str = "manifest.json";
 const LOGS_FILE: &str = "logs.jsonl";
 const PLAN_REVISIONS_FILE: &str = "plan-revisions.jsonl";
+const LOCK_FILE: &str = ".workspace.lock";
+const STAGING_DIR: &str = "staging";
+const QUARANTINE_DIR: &str = "quarantine";
+const DIAGNOSTIC_SUFFIX: &str = ".diagnostic.json";
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct WorkspaceStore {
     root: PathBuf,
+    // Keeping this descriptor alive holds the process-wide workspace lease.
+    _lock_file: File,
 }
 
 impl WorkspaceStore {
@@ -38,19 +45,39 @@ impl WorkspaceStore {
         }
         fs::create_dir_all(root)?;
         let root = fs::canonicalize(root)?;
-        Ok(Self { root })
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join(LOCK_FILE))?;
+        FileExt::try_lock(&lock_file).map_err(|error| match error {
+            TryLockError::WouldBlock => WorkspaceError::WorkspaceLocked,
+            TryLockError::Error(error) => WorkspaceError::Io(error),
+        })?;
+
+        let store = Self {
+            root,
+            _lock_file: lock_file,
+        };
+        fs::create_dir_all(store.staging_dir())?;
+        fs::create_dir_all(store.quarantine_dir())?;
+        store.recover_staging()?;
+        store.recover_corrupt_jobs()?;
+        Ok(store)
     }
 
     pub fn create_fake_job(&self, behavior: FakeBehavior) -> Result<JobSummary, WorkspaceError> {
         let job_id = Uuid::new_v4().to_string();
-        let job_dir = self.root.join(&job_id);
+        let job_dir = self.staging_dir().join(&job_id);
+        let published_dir = self.root.join(&job_id);
         fs::create_dir(&job_dir)?;
         fs::create_dir(job_dir.join("final"))?;
 
         let created_at_ms = now_ms();
-        let input_path = job_dir.join("input.txt");
-        let output_path = job_dir.join("final/result.txt");
-        fs::write(&input_path, b"Zoos Upscale fake input\n")?;
+        let input_path = published_dir.join("input.txt");
+        let output_path = published_dir.join("final/result.txt");
+        write_file_synced(&job_dir.join("input.txt"), b"Zoos Upscale fake input\n")?;
 
         let job_spec = ProductJobSpec {
             schema_version: 2,
@@ -124,24 +151,39 @@ impl WorkspaceStore {
         create_empty_file(&job_dir.join(LOGS_FILE))?;
         create_empty_file(&job_dir.join(PLAN_REVISIONS_FILE))?;
 
+        sync_directory(&job_dir.join("final"))?;
+        sync_directory(&job_dir)?;
+        fs::rename(&job_dir, &published_dir)?;
+        sync_directory(&self.staging_dir())?;
+        sync_directory(&self.root)?;
+
         Ok(summary)
     }
 
     pub fn list_jobs(&self) -> Result<Vec<JobSummary>, WorkspaceError> {
         let mut jobs = Vec::new();
         for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    eprintln!("could not inspect workspace entry: {error}");
+                    continue;
+                }
+            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if Uuid::parse_str(&name).is_err() {
                 continue;
             }
-            let progress_path = entry.path().join(PROGRESS_FILE);
-            if !progress_path.exists() {
+            if let Err(error) = self.validate_job_directory(&entry.path(), &name) {
+                if let Err(quarantine_error) = self.quarantine(&entry.path(), &error.to_string()) {
+                    eprintln!(
+                        "could not quarantine corrupt job {name}: {quarantine_error}; original error: {error}"
+                    );
+                }
                 continue;
             }
-            let progress: JobProgress = read_json(&progress_path)?;
-            if entry.file_name().to_string_lossy() != progress.summary.job_id {
-                return Err(WorkspaceError::UnsafeRunnerRequest);
-            }
+            let progress: JobProgress = read_json(&entry.path().join(PROGRESS_FILE))?;
             jobs.push(progress.summary);
         }
         jobs.sort_by_key(|job| std::cmp::Reverse(job.created_at_ms));
@@ -226,6 +268,129 @@ impl WorkspaceStore {
         Ok(())
     }
 
+    fn recover_staging(&self) -> Result<(), WorkspaceError> {
+        for entry in fs::read_dir(self.staging_dir())? {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    eprintln!("could not inspect staging workspace: {error}");
+                    continue;
+                }
+            };
+            if let Err(error) = self.quarantine(
+                &entry.path(),
+                "incomplete staging workspace found during startup",
+            ) {
+                eprintln!(
+                    "could not quarantine incomplete staging workspace {}: {error}",
+                    entry.path().display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn recover_corrupt_jobs(&self) -> Result<(), WorkspaceError> {
+        for entry in fs::read_dir(&self.root)? {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    eprintln!("could not inspect workspace entry during recovery: {error}");
+                    continue;
+                }
+            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if Uuid::parse_str(&name).is_err() {
+                continue;
+            }
+            if let Err(error) = self.validate_job_directory(&entry.path(), &name)
+                && let Err(quarantine_error) = self.quarantine(&entry.path(), &error.to_string())
+            {
+                eprintln!(
+                    "could not quarantine corrupt job {name}: {quarantine_error}; original error: {error}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_job_directory(&self, job_dir: &Path, job_id: &str) -> Result<(), WorkspaceError> {
+        let metadata = fs::symlink_metadata(job_dir)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(WorkspaceError::UnsafeRunnerRequest);
+        }
+
+        for required_file in [
+            JOB_SPEC_FILE,
+            PLAN_FILE,
+            PROGRESS_FILE,
+            MANIFEST_FILE,
+            RUNNER_JOB_FILE,
+            LOGS_FILE,
+            PLAN_REVISIONS_FILE,
+        ] {
+            require_regular_file(&job_dir.join(required_file))?;
+        }
+
+        let spec: ProductJobSpec = read_json(&job_dir.join(JOB_SPEC_FILE))?;
+        let plan: JobPlan = read_json(&job_dir.join(PLAN_FILE))?;
+        let progress: JobProgress = read_json(&job_dir.join(PROGRESS_FILE))?;
+        let manifest: JobManifest = read_json(&job_dir.join(MANIFEST_FILE))?;
+        let runner_request: FakeJobRequest = read_json(&job_dir.join(RUNNER_JOB_FILE))?;
+        runner_request
+            .validate()
+            .map_err(|error| WorkspaceError::InvalidRunnerContract(error.to_string()))?;
+
+        if spec.job_id != job_id
+            || plan.job_id != job_id
+            || progress.summary.job_id != job_id
+            || manifest.job_id != job_id
+            || runner_request.job_id != job_id
+            || runner_request.output.path != job_dir.join("final/result.txt")
+        {
+            return Err(WorkspaceError::UnsafeRunnerRequest);
+        }
+
+        recover_jsonl(&job_dir.join(LOGS_FILE))?;
+        recover_jsonl(&job_dir.join(PLAN_REVISIONS_FILE))?;
+        Ok(())
+    }
+
+    fn quarantine(&self, path: &Path, reason: &str) -> Result<(), WorkspaceError> {
+        let original_name = path
+            .file_name()
+            .ok_or(WorkspaceError::UnsafeRunnerRequest)?
+            .to_string_lossy();
+        let quarantine_name = format!("{original_name}-{}", Uuid::new_v4());
+        let destination = self.quarantine_dir().join(&quarantine_name);
+        fs::rename(path, &destination)?;
+
+        let diagnostic = QuarantineDiagnostic {
+            schema_version: 1,
+            original_name: original_name.into_owned(),
+            quarantined_name: quarantine_name.clone(),
+            reason: reason.into(),
+            quarantined_at_ms: now_ms(),
+        };
+        write_json_atomic(
+            &self
+                .quarantine_dir()
+                .join(format!("{quarantine_name}{DIAGNOSTIC_SUFFIX}")),
+            &diagnostic,
+        )?;
+        sync_directory(&self.quarantine_dir())?;
+        Ok(())
+    }
+
+    fn staging_dir(&self) -> PathBuf {
+        self.root.join(STAGING_DIR)
+    }
+
+    fn quarantine_dir(&self) -> PathBuf {
+        self.root.join(QUARANTINE_DIR)
+    }
+
     fn job_dir(&self, job_id: &str) -> Result<PathBuf, WorkspaceError> {
         Uuid::parse_str(job_id).map_err(|_| WorkspaceError::InvalidJobId)?;
         let job_dir = self.root.join(job_id);
@@ -261,6 +426,7 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), Workspac
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, WorkspaceError> {
+    require_regular_file(path)?;
     let file = File::open(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             WorkspaceError::JobNotFound(path.display().to_string())
@@ -271,8 +437,30 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, WorkspaceError> {
     Ok(serde_json::from_reader(BufReader::new(file))?)
 }
 
+fn require_regular_file(path: &Path) -> Result<(), WorkspaceError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            WorkspaceError::JobNotFound(path.display().to_string())
+        } else {
+            WorkspaceError::Io(error)
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(WorkspaceError::UnsafeRunnerRequest);
+    }
+    Ok(())
+}
+
 fn create_empty_file(path: &Path) -> Result<(), WorkspaceError> {
-    OpenOptions::new().create_new(true).write(true).open(path)?;
+    let file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn write_file_synced(path: &Path, contents: &[u8]) -> Result<(), WorkspaceError> {
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -283,6 +471,51 @@ fn append_json_line(path: &Path, value: &impl Serialize) -> Result<(), Workspace
     writeln!(writer)?;
     writer.flush()?;
     writer.get_ref().sync_data()?;
+    Ok(())
+}
+
+fn recover_jsonl(path: &Path) -> Result<(), WorkspaceError> {
+    require_regular_file(path)?;
+    let bytes = fs::read(path)?;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    let ends_with_newline = bytes.ends_with(b"\n");
+    let complete_end = if ends_with_newline {
+        bytes.len()
+    } else {
+        bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1)
+    };
+
+    if complete_end > 0 {
+        for line in bytes[..complete_end - 1].split(|byte| *byte == b'\n') {
+            serde_json::from_slice::<serde_json::Value>(line)?;
+        }
+    }
+
+    if ends_with_newline {
+        return Ok(());
+    }
+
+    let tail = &bytes[complete_end..];
+    if serde_json::from_slice::<serde_json::Value>(tail).is_ok() {
+        let mut file = OpenOptions::new().append(true).open(path)?;
+        file.write_all(b"\n")?;
+        file.sync_data()?;
+    } else {
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(complete_end as u64)?;
+        file.sync_data()?;
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), WorkspaceError> {
+    File::open(path)?.sync_all()?;
     Ok(())
 }
 
@@ -301,10 +534,21 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct QuarantineDiagnostic {
+    schema_version: u32,
+    original_name: String,
+    quarantined_name: String,
+    reason: String,
+    quarantined_at_ms: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
     #[error("workspace root must be absolute")]
     RootMustBeAbsolute,
+    #[error("workspace is already open by another process")]
+    WorkspaceLocked,
     #[error("invalid job id")]
     InvalidJobId,
     #[error("job not found: {0}")]
@@ -322,6 +566,13 @@ pub enum WorkspaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quarantine_entries(root: &Path) -> Vec<PathBuf> {
+        fs::read_dir(root.join(QUARANTINE_DIR))
+            .expect("quarantine directory must be readable")
+            .map(|entry| entry.expect("quarantine entry must be readable").path())
+            .collect()
+    }
 
     #[test]
     fn progress_update_remains_valid_json() {
@@ -367,6 +618,59 @@ mod tests {
     }
 
     #[test]
+    fn complete_v1_fake_workspace_loads_without_being_rewritten() {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let store = WorkspaceStore::new(directory.path()).expect("store must be created");
+        let created = store
+            .create_fake_job(FakeBehavior::Success)
+            .expect("job must be created");
+        let job_dir = directory.path().join(&created.job_id);
+        drop(store);
+
+        let v1_spec = serde_json::json!({
+            "schema_version": 1,
+            "job_id": created.job_id.clone(),
+            "kind": "fake_validation",
+            "scenario": "success",
+            "created_at_ms": created.created_at_ms
+        });
+        let v1_progress = serde_json::json!({
+            "schema_version": 1,
+            "job_id": created.job_id.clone(),
+            "scenario": "success",
+            "status": "CREATED",
+            "progress_percent": 0,
+            "stage": null,
+            "message": "Ready to start",
+            "error": null,
+            "created_at_ms": created.created_at_ms,
+            "updated_at_ms": created.updated_at_ms
+        });
+        fs::write(
+            job_dir.join(JOB_SPEC_FILE),
+            serde_json::to_vec_pretty(&v1_spec).expect("v1 spec must serialize"),
+        )
+        .expect("v1 spec must be written");
+        let v1_progress_bytes =
+            serde_json::to_vec_pretty(&v1_progress).expect("v1 progress must serialize");
+        fs::write(job_dir.join(PROGRESS_FILE), &v1_progress_bytes)
+            .expect("v1 progress must be written");
+
+        let reopened = WorkspaceStore::new(directory.path()).expect("v1 workspace must open");
+        let listed = reopened.list_jobs().expect("v1 job must list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, JobKind::FakeValidation);
+        assert_eq!(listed[0].scenario, Some(FakeBehavior::Success));
+        reopened
+            .load_stored_job(&listed[0].job_id)
+            .expect("v1 runner request must load");
+        assert_eq!(
+            fs::read(job_dir.join(PROGRESS_FILE)).expect("v1 progress must remain"),
+            v1_progress_bytes
+        );
+    }
+
+    #[test]
     fn startup_recovery_marks_active_job_interrupted() {
         let directory = tempfile::tempdir().expect("temporary directory must be created");
         let store = WorkspaceStore::new(directory.path()).expect("store must be created");
@@ -387,6 +691,204 @@ mod tests {
                 .expect("progress must load")
                 .status,
             JobStatus::Interrupted
+        );
+    }
+
+    #[test]
+    fn workspace_lock_is_held_for_store_lifetime() {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let store = WorkspaceStore::new(directory.path()).expect("store must be created");
+
+        assert!(matches!(
+            WorkspaceStore::new(directory.path()),
+            Err(WorkspaceError::WorkspaceLocked)
+        ));
+
+        drop(store);
+        WorkspaceStore::new(directory.path()).expect("lock must be released with the store");
+    }
+
+    #[test]
+    fn job_is_published_from_staging_as_a_complete_uuid_directory() {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let store = WorkspaceStore::new(directory.path()).expect("store must be created");
+        let created = store
+            .create_fake_job(FakeBehavior::Success)
+            .expect("job must be created");
+
+        assert!(directory.path().join(&created.job_id).is_dir());
+        assert!(
+            fs::read_dir(directory.path().join(STAGING_DIR))
+                .expect("staging directory must be readable")
+                .next()
+                .is_none()
+        );
+        for required in [
+            JOB_SPEC_FILE,
+            PLAN_FILE,
+            RUNNER_JOB_FILE,
+            PROGRESS_FILE,
+            MANIFEST_FILE,
+            LOGS_FILE,
+            PLAN_REVISIONS_FILE,
+        ] {
+            assert!(
+                directory
+                    .path()
+                    .join(&created.job_id)
+                    .join(required)
+                    .is_file()
+            );
+        }
+    }
+
+    #[test]
+    fn startup_quarantines_incomplete_staging_with_diagnostic() {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let store = WorkspaceStore::new(directory.path()).expect("store must be created");
+        let staged = store.staging_dir().join(Uuid::new_v4().to_string());
+        fs::create_dir(&staged).expect("incomplete staging directory must be created");
+        fs::write(staged.join("partial"), b"unfinished").expect("partial file must be written");
+        drop(store);
+
+        let reopened = WorkspaceStore::new(directory.path()).expect("recovery must succeed");
+        assert!(
+            fs::read_dir(reopened.staging_dir())
+                .expect("staging directory must be readable")
+                .next()
+                .is_none()
+        );
+        let entries = quarantine_entries(directory.path());
+        assert_eq!(entries.iter().filter(|path| path.is_dir()).count(), 1);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn corrupt_job_is_quarantined_without_hiding_good_jobs() {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let store = WorkspaceStore::new(directory.path()).expect("store must be created");
+        let good = store
+            .create_fake_job(FakeBehavior::Success)
+            .expect("good job must be created");
+        let corrupt = store
+            .create_fake_job(FakeBehavior::Failed)
+            .expect("corrupt job fixture must be created");
+        fs::write(
+            directory.path().join(&corrupt.job_id).join(PROGRESS_FILE),
+            b"not json",
+        )
+        .expect("progress must be corrupted");
+        drop(store);
+
+        let reopened = WorkspaceStore::new(directory.path()).expect("startup must recover");
+        let jobs = reopened
+            .list_jobs()
+            .expect("good jobs must remain listable");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, good.job_id);
+        assert!(!directory.path().join(&corrupt.job_id).exists());
+        assert_eq!(
+            quarantine_entries(directory.path())
+                .iter()
+                .filter(|path| path.is_dir())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn startup_truncates_only_an_incomplete_jsonl_tail() {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let store = WorkspaceStore::new(directory.path()).expect("store must be created");
+        let created = store
+            .create_fake_job(FakeBehavior::Success)
+            .expect("job must be created");
+        let logs = directory.path().join(&created.job_id).join(LOGS_FILE);
+        fs::write(&logs, b"{\"sequence\":1}\n{\"sequence\":")
+            .expect("interrupted log must be written");
+        drop(store);
+
+        let reopened = WorkspaceStore::new(directory.path()).expect("startup must recover tail");
+        assert_eq!(
+            fs::read(&logs).expect("log must remain"),
+            b"{\"sequence\":1}\n"
+        );
+        assert_eq!(reopened.list_jobs().expect("job must remain").len(), 1);
+        assert!(quarantine_entries(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn malformed_jsonl_before_later_records_quarantines_job() {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let store = WorkspaceStore::new(directory.path()).expect("store must be created");
+        let created = store
+            .create_fake_job(FakeBehavior::Success)
+            .expect("job must be created");
+        let logs = directory.path().join(&created.job_id).join(LOGS_FILE);
+        fs::write(&logs, b"{\"sequence\":1}\nnot-json\n{\"sequence\":3}\n")
+            .expect("corrupt log must be written");
+        drop(store);
+
+        let reopened = WorkspaceStore::new(directory.path()).expect("startup must continue");
+        assert!(
+            reopened
+                .list_jobs()
+                .expect("listing must continue")
+                .is_empty()
+        );
+        assert!(!directory.path().join(&created.job_id).exists());
+        assert_eq!(
+            quarantine_entries(directory.path())
+                .iter()
+                .filter(|path| path.is_dir())
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_symlink_is_quarantined_without_touching_the_external_file() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let outside = tempfile::tempdir().expect("outside directory must be created");
+        let external_log = outside.path().join("external.jsonl");
+        let external_contents = b"{\"sequence\":1}\n{\"unfinished\":";
+        fs::write(&external_log, external_contents).expect("external log must be written");
+
+        let store = WorkspaceStore::new(directory.path()).expect("store must be created");
+        let created = store
+            .create_fake_job(FakeBehavior::Success)
+            .expect("job must be created");
+        let logs = directory.path().join(&created.job_id).join(LOGS_FILE);
+        fs::remove_file(&logs).expect("managed log must be removed");
+        symlink(&external_log, &logs).expect("test symlink must be created");
+        drop(store);
+
+        let reopened = WorkspaceStore::new(directory.path()).expect("startup must continue");
+        assert!(
+            reopened
+                .list_jobs()
+                .expect("listing must continue")
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read(&external_log).expect("external log must remain readable"),
+            external_contents
+        );
+        assert_eq!(
+            quarantine_entries(directory.path())
+                .iter()
+                .filter(|path| path.is_dir())
+                .count(),
+            1
         );
     }
 

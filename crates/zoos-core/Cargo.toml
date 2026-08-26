@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 atomic-write-file.workspace = true
+fs4.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

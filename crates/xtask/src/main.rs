@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use schemars::{JsonSchema, schema_for};
 use zoos_runner_protocol::{
-    FakeJobRequest, ImageUpscaleJobRequest, RunnerCapabilities, RunnerEvent,
+    FakeJobRequest, ImageUpscaleJobRequest, ImageUpscaleJobRequestV2, RunnerCapabilities,
+    RunnerEvent,
 };
 
 fn main() {
@@ -29,8 +30,27 @@ fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Box<dyn std::e
         generated_schema::<ImageUpscaleJobRequest>("image-upscale-job.schema.json")?,
     ];
 
+    sync_schemas(&schema_directory, schemas, check)?;
+    sync_schemas(
+        &workspace_root().join("schemas/runner-protocol-v2"),
+        [generated_schema::<ImageUpscaleJobRequestV2>(
+            "image-upscale-job.schema.json",
+        )?],
+        check,
+    )?;
+    Ok(())
+}
+
+fn sync_schemas<const N: usize>(
+    directory: &Path,
+    schemas: [(&'static str, Vec<u8>); N],
+    check: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !check {
+        fs::create_dir_all(directory)?;
+    }
     for (name, contents) in schemas {
-        let path = schema_directory.join(name);
+        let path = directory.join(name);
         if check {
             let committed = fs::read(&path).map_err(|error| {
                 format!(

@@ -292,7 +292,7 @@ fn checked_output_dimensions(
     Ok((output_width, output_height))
 }
 
-fn sha256_file(path: &Path) -> Result<String, ImageSafetyError> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String, ImageSafetyError> {
     let mut file = File::open(path)?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];

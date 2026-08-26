@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use zoos_runner_protocol::{FakeBehavior, FakeJobRequest, ImageUpscaleJobRequest};
+use zoos_runner_protocol::{
+    FakeBehavior, FakeJobRequest, ImageUpscaleJobRequest, ImageUpscaleJobRequestV2,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,10 +20,44 @@ pub enum ImagePreset {
     Anime,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageBackend {
+    #[default]
+    Auto,
+    VulkanGpu,
+    OrtCpu,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageOutputFormat {
+    #[default]
+    Png,
+    Jpeg,
+    Webp,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataPolicy {
+    #[default]
+    Preserve,
+    Strip,
+}
+
+pub const JPEG_OUTPUT_QUALITY: u8 = 95;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageSettings {
     pub preset: ImagePreset,
     pub scale: u8,
+    #[serde(default)]
+    pub backend: ImageBackend,
+    #[serde(default)]
+    pub output_format: ImageOutputFormat,
+    #[serde(default)]
+    pub metadata: MetadataPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +108,14 @@ pub struct JobSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_settings: Option<ImageSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_total: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_backend: Option<ImageBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scenario: Option<FakeBehavior>,
     pub status: JobStatus,
     pub progress_percent: u8,
@@ -95,6 +139,14 @@ pub(crate) struct ProductJobSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_settings: Option<ImageSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_total: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_backend: Option<ImageBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scenario: Option<FakeBehavior>,
     pub created_at_ms: u64,
 }
@@ -104,6 +156,7 @@ pub(crate) struct JobPlan {
     pub schema_version: u32,
     pub job_id: String,
     pub execution_backend: String,
+    #[serde(default)]
     pub runner_id: String,
 }
 
@@ -124,6 +177,20 @@ pub(crate) struct JobManifest {
     pub exit_code: Option<i32>,
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_backend: Option<ImageBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_param_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_bin_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_onnx_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -143,12 +210,14 @@ pub(crate) struct StoredJob {
     pub progress: JobProgress,
     pub runner_request: StoredRunnerRequest,
     pub runner_job_path: PathBuf,
+    pub runner_id: String,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum StoredRunnerRequest {
     Fake(FakeJobRequest),
     ImageUpscale(ImageUpscaleJobRequest),
+    ImageUpscaleV2(ImageUpscaleJobRequestV2),
 }
 
 impl StoredRunnerRequest {
@@ -156,6 +225,49 @@ impl StoredRunnerRequest {
         match self {
             Self::Fake(request) => &request.output.path,
             Self::ImageUpscale(request) => &request.output.path,
+            Self::ImageUpscaleV2(request) => &request.output.path,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_image_settings_receive_goal_1b_defaults() {
+        let settings: ImageSettings = serde_json::from_value(serde_json::json!({
+            "preset": "photo",
+            "scale": 2
+        }))
+        .expect("Goal 1A settings must remain readable");
+
+        assert_eq!(settings.backend, ImageBackend::Auto);
+        assert_eq!(settings.output_format, ImageOutputFormat::Png);
+        assert_eq!(settings.metadata, MetadataPolicy::Preserve);
+        assert_eq!(JPEG_OUTPUT_QUALITY, 95);
+    }
+
+    #[test]
+    fn legacy_manifest_receives_empty_execution_evidence() {
+        let manifest: JobManifest = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "job_id": "job-1",
+            "runner_id": "zoos-runner-realesrgan",
+            "runner_version": "0.1.0",
+            "result": null,
+            "exit_code": null,
+            "started_at_ms": null,
+            "finished_at_ms": null
+        }))
+        .expect("Goal 1A manifest must remain readable");
+
+        assert_eq!(manifest.actual_backend, None);
+        assert_eq!(manifest.actual_device, None);
+        assert_eq!(manifest.runtime_sha256, None);
+        assert_eq!(manifest.model_param_sha256, None);
+        assert_eq!(manifest.model_bin_sha256, None);
+        assert_eq!(manifest.model_onnx_sha256, None);
+        assert_eq!(manifest.fallback_reason, None);
     }
 }

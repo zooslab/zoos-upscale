@@ -6,12 +6,13 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, watch};
 use zoos_runner_protocol::{
-    FakeBehavior, ImageModelId, RunnerCapabilities, RunnerEvent, RunnerEventPayload, RunnerTask,
+    FakeBehavior, ImageDeviceV2, ImageModelId, ImageSemanticModelV2, RunnerCapabilities,
+    RunnerEvent, RunnerEventPayload, RunnerTask,
 };
 
 use crate::domain::{
-    ExecutionRequest, ImagePreset, ImageSettings, JobErrorView, JobKind, JobStatus, JobSummary,
-    StoredRunnerRequest,
+    ExecutionRequest, ImageBackend, ImageOutputFormat, ImagePreset, ImageSettings, JobErrorView,
+    JobKind, JobStatus, JobSummary, MetadataPolicy, StoredRunnerRequest,
 };
 use crate::process::{
     BackendError, ExecutionBackend, ProcessExecutionBackend, RunnerLaunchSpec, RunnerRegistry,
@@ -75,10 +76,16 @@ impl JobOrchestrator {
         preset: ImagePreset,
         scale: u8,
     ) -> Result<JobSummary, OrchestratorError> {
-        Ok(self
-            .inner
-            .store
-            .create_image_job(input_path.as_ref(), ImageSettings { preset, scale })?)
+        Ok(self.inner.store.create_image_job(
+            input_path.as_ref(),
+            ImageSettings {
+                preset,
+                scale,
+                backend: ImageBackend::Auto,
+                output_format: ImageOutputFormat::Png,
+                metadata: MetadataPolicy::Preserve,
+            },
+        )?)
     }
 
     pub fn list_jobs(&self) -> Result<Vec<JobSummary>, OrchestratorError> {
@@ -99,7 +106,7 @@ impl JobOrchestrator {
             return Err(OrchestratorError::AnotherJobActive);
         }
 
-        self.inner.runners.resolve(stored.progress.summary.kind)?;
+        self.inner.runners.resolve(&stored.runner_id)?;
 
         let _progress_guard = self.inner.progress_updates.lock().await;
         let probing = self.inner.store.update_summary(job_id, |summary| {
@@ -164,7 +171,7 @@ impl JobOrchestrator {
                 return;
             }
         };
-        let launch = match self.inner.runners.resolve(stored.progress.summary.kind) {
+        let launch = match self.inner.runners.resolve(&stored.runner_id) {
             Ok(launch) => launch.clone(),
             Err(error) => {
                 self.finish_with_internal_error(&job_id, error.to_string(), started_at_ms)
@@ -502,25 +509,56 @@ fn validate_capabilities(
         )));
     }
 
-    let StoredRunnerRequest::ImageUpscale(request) = &stored.runner_request else {
-        return Ok(());
-    };
-    let model_id = match request.parameters.model_id {
-        ImageModelId::RealEsrganX4plus => "realesrgan-x4plus",
-        ImageModelId::RealEsrganX4plusAnime => "realesrgan-x4plus-anime",
-    };
+    let (model_ids, scale, device_backend, device_index): (&[&str], u8, &[&str], Option<u32>) =
+        match &stored.runner_request {
+            StoredRunnerRequest::ImageUpscale(request) => {
+                let model_ids: &[&str] = match request.parameters.model_id {
+                    ImageModelId::RealEsrganX4plus => &["realesrgan-x4plus"],
+                    ImageModelId::RealEsrganX4plusAnime => &["realesrgan-x4plus-anime"],
+                };
+                (
+                    model_ids,
+                    request.parameters.scale,
+                    &["vulkan"],
+                    Some(request.parameters.gpu_id),
+                )
+            }
+            StoredRunnerRequest::ImageUpscaleV2(request) => {
+                let model_ids: &[&str] = match request.parameters.semantic_model {
+                    ImageSemanticModelV2::Photo => &["photo", "realesrgan-x4plus"],
+                    ImageSemanticModelV2::Anime => &["anime", "realesrgan-x4plus-anime"],
+                };
+                let (backends, index): (&[&str], Option<u32>) = match request.parameters.device {
+                    ImageDeviceV2::Vulkan { index } => (&["vulkan"], Some(index)),
+                    ImageDeviceV2::Cpu => (&["cpu", "ort_cpu", "onnxruntime"], None),
+                };
+                (
+                    model_ids,
+                    request.parameters.requested_scale,
+                    backends,
+                    index,
+                )
+            }
+            StoredRunnerRequest::Fake(_) => return Ok(()),
+        };
     let model_supported = capabilities
         .models
         .iter()
-        .any(|model| model.id == model_id && model.scales.contains(&request.parameters.scale));
-    let scale_supported = capabilities.scales.contains(&request.parameters.scale);
+        .any(|model| model_ids.contains(&model.id.as_str()) && model.scales.contains(&scale));
+    let scale_supported = capabilities.scales.contains(&scale);
     let device_supported = capabilities.devices.iter().any(|device| {
-        device.index == request.parameters.gpu_id && device.backend.eq_ignore_ascii_case("vulkan")
+        device_backend
+            .iter()
+            .any(|backend| device.backend.eq_ignore_ascii_case(backend))
+            && device_index.is_none_or(|index| device.index == index)
     });
     if !model_supported || !scale_supported || !device_supported {
         return Err(BackendError::ProbeFailed(format!(
-            "runner {} does not support model {model_id}, scale {}, Vulkan device {}",
-            launch.runner_id, request.parameters.scale, request.parameters.gpu_id
+            "runner {} does not support models {}, scale {scale}, backend {}, device {:?}",
+            launch.runner_id,
+            model_ids.join("/"),
+            device_backend.join("/"),
+            device_index
         )));
     }
     Ok(())

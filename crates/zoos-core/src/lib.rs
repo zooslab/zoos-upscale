@@ -4,7 +4,10 @@ mod orchestrator;
 mod process;
 mod workspace;
 
-pub use domain::{ImagePreset, ImageSettings, JobErrorView, JobKind, JobStatus, JobSummary};
+pub use domain::{
+    ImageBackend, ImageOutputFormat, ImagePreset, ImageSettings, JPEG_OUTPUT_QUALITY, JobErrorView,
+    JobKind, JobStatus, JobSummary, MetadataPolicy,
+};
 pub use image_safety::{
     ImageOutputPlan, ImageSafetyError, ImageVerification, ValidatedImageInput,
     cleanup_owned_output, plan_image_output, publish_verified_output, recheck_input,

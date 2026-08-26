@@ -12,7 +12,8 @@ use uuid::Uuid;
 use zoos_runner_protocol::{
     FakeBehavior, FakeJobRequest, FakeParameters, FakeTask, ImageModelId, ImageOutputFormat,
     ImagePreset as ProtocolImagePreset, ImageRunnerInput, ImageRunnerOutput, ImageTask,
-    ImageUpscaleJobRequest, ImageUpscaleParameters, RunnerEvent, RunnerInput, RunnerOutput,
+    ImageUpscaleJobRequest, ImageUpscaleJobRequestV2, ImageUpscaleParameters, RunnerEvent,
+    RunnerInput, RunnerOutput,
 };
 
 use crate::domain::{
@@ -36,6 +37,11 @@ const LOCK_FILE: &str = ".workspace.lock";
 const STAGING_DIR: &str = "staging";
 const QUARANTINE_DIR: &str = "quarantine";
 const DIAGNOSTIC_SUFFIX: &str = ".diagnostic.json";
+
+#[derive(Deserialize)]
+struct RunnerRequestVersion {
+    protocol_version: u32,
+}
 
 #[derive(Debug)]
 pub(crate) struct WorkspaceStore {
@@ -93,6 +99,10 @@ impl WorkspaceStore {
             input_name: Some("input.txt".into()),
             output_path: Some(output_path.clone()),
             image_settings: None,
+            batch_id: None,
+            batch_index: None,
+            batch_total: None,
+            selected_backend: None,
             scenario: Some(behavior),
             created_at_ms,
         };
@@ -126,6 +136,10 @@ impl WorkspaceStore {
             input_name: Some("input.txt".into()),
             output_path: Some(output_path),
             image_settings: None,
+            batch_id: None,
+            batch_index: None,
+            batch_total: None,
+            selected_backend: None,
             scenario: Some(behavior),
             status: JobStatus::Created,
             progress_percent: 0,
@@ -148,6 +162,13 @@ impl WorkspaceStore {
             exit_code: None,
             started_at_ms: None,
             finished_at_ms: None,
+            actual_backend: None,
+            actual_device: None,
+            runtime_sha256: None,
+            model_param_sha256: None,
+            model_bin_sha256: None,
+            model_onnx_sha256: None,
+            fallback_reason: None,
         };
 
         write_json_atomic(&job_dir.join(JOB_SPEC_FILE), &job_spec)?;
@@ -193,6 +214,10 @@ impl WorkspaceStore {
             input_name: Some(input_name.clone()),
             output_path: Some(output_plan.final_path.clone()),
             image_settings: Some(settings),
+            batch_id: None,
+            batch_index: None,
+            batch_total: None,
+            selected_backend: None,
             scenario: None,
             created_at_ms,
         };
@@ -243,6 +268,10 @@ impl WorkspaceStore {
             input_name: Some(input_name),
             output_path: Some(output_plan.final_path),
             image_settings: Some(settings),
+            batch_id: None,
+            batch_index: None,
+            batch_total: None,
+            selected_backend: None,
             scenario: None,
             status: JobStatus::Created,
             progress_percent: 0,
@@ -265,6 +294,13 @@ impl WorkspaceStore {
             exit_code: None,
             started_at_ms: None,
             finished_at_ms: None,
+            actual_backend: None,
+            actual_device: None,
+            runtime_sha256: None,
+            model_param_sha256: None,
+            model_bin_sha256: None,
+            model_onnx_sha256: None,
+            fallback_reason: None,
         };
 
         write_json_atomic(&job_dir.join(JOB_SPEC_FILE), &job_spec)?;
@@ -319,12 +355,19 @@ impl WorkspaceStore {
     pub fn load_stored_job(&self, job_id: &str) -> Result<StoredJob, WorkspaceError> {
         let job_dir = self.job_dir(job_id)?;
         let progress: JobProgress = read_json(&job_dir.join(PROGRESS_FILE))?;
+        let plan: JobPlan = read_json(&job_dir.join(PLAN_FILE))?;
         let runner_request = self.read_runner_request(&job_dir, &progress.summary)?;
+        let runner_id = if plan.runner_id.trim().is_empty() {
+            default_runner_id(progress.summary.kind).into()
+        } else {
+            plan.runner_id
+        };
 
         Ok(StoredJob {
             progress,
             runner_request,
             runner_job_path: job_dir.join(RUNNER_JOB_FILE),
+            runner_id,
         })
     }
 
@@ -373,18 +416,32 @@ impl WorkspaceStore {
                 let plan = image_plan_from_request(job_id, &stored.progress.summary, request)?;
                 cleanup_owned_output(&plan, &job_dir.join(VERIFICATION_FILE))?;
             }
+            StoredRunnerRequest::ImageUpscaleV2(request) => {
+                remove_if_exists(&request.output.path)?;
+                remove_if_exists(&job_dir.join(VERIFICATION_FILE))?;
+            }
         }
         Ok(())
     }
 
     pub fn recheck_image_input(&self, job_id: &str) -> Result<(), WorkspaceError> {
         let stored = self.load_stored_job(job_id)?;
-        let StoredRunnerRequest::ImageUpscale(request) = stored.runner_request else {
-            return Ok(());
-        };
-        let plan = image_plan_from_request(job_id, &stored.progress.summary, request)?;
-        recheck_input(&plan.input)?;
-        Ok(())
+        match stored.runner_request {
+            StoredRunnerRequest::ImageUpscale(request) => {
+                let plan = image_plan_from_request(job_id, &stored.progress.summary, request)?;
+                recheck_input(&plan.input)?;
+                Ok(())
+            }
+            StoredRunnerRequest::ImageUpscaleV2(request) => {
+                let actual = crate::image_safety::sha256_file(&request.input.path)?;
+                if actual == request.input.sha256 {
+                    Ok(())
+                } else {
+                    Err(ImageSafetyError::InputChanged.into())
+                }
+            }
+            StoredRunnerRequest::Fake(_) => Ok(()),
+        }
     }
 
     pub fn publish_image_output(
@@ -393,14 +450,17 @@ impl WorkspaceStore {
     ) -> Result<Option<ImageVerification>, WorkspaceError> {
         let job_dir = self.job_dir(job_id)?;
         let stored = self.load_stored_job(job_id)?;
-        let StoredRunnerRequest::ImageUpscale(request) = stored.runner_request else {
-            return Ok(None);
-        };
-        let plan = image_plan_from_request(job_id, &stored.progress.summary, request)?;
-        Ok(Some(publish_verified_output(
-            &plan,
-            &job_dir.join(VERIFICATION_FILE),
-        )?))
+        match stored.runner_request {
+            StoredRunnerRequest::ImageUpscale(request) => {
+                let plan = image_plan_from_request(job_id, &stored.progress.summary, request)?;
+                Ok(Some(publish_verified_output(
+                    &plan,
+                    &job_dir.join(VERIFICATION_FILE),
+                )?))
+            }
+            StoredRunnerRequest::ImageUpscaleV2(_) => Err(WorkspaceError::UnsafeRunnerRequest),
+            StoredRunnerRequest::Fake(_) => Ok(None),
+        }
     }
 
     pub fn recover_interrupted(&self) -> Result<(), WorkspaceError> {
@@ -504,6 +564,10 @@ impl WorkspaceStore {
                 if request.job_id == job_id
                     && progress.summary.output_path.as_ref() != Some(&request.output.path)
                     && is_safe_image_request(&progress.summary, &request) => {}
+            StoredRunnerRequest::ImageUpscaleV2(request)
+                if request.job_id == job_id
+                    && progress.summary.output_path.as_ref() != Some(&request.output.path)
+                    && is_safe_image_request_v2(&progress.summary, &request) => {}
             _ => return Err(WorkspaceError::UnsafeRunnerRequest),
         }
 
@@ -531,17 +595,40 @@ impl WorkspaceStore {
                 Ok(StoredRunnerRequest::Fake(request))
             }
             JobKind::ImageUpscale => {
-                let request: ImageUpscaleJobRequest = read_json(&job_dir.join(RUNNER_JOB_FILE))?;
-                request
-                    .validate()
-                    .map_err(|error| WorkspaceError::InvalidRunnerContract(error.to_string()))?;
-                if request.job_id != summary.job_id
-                    || summary.image_settings.is_none()
-                    || !is_safe_image_request(summary, &request)
-                {
-                    return Err(WorkspaceError::UnsafeRunnerRequest);
+                let version: RunnerRequestVersion = read_json(&job_dir.join(RUNNER_JOB_FILE))?;
+                match version.protocol_version {
+                    1 => {
+                        let request: ImageUpscaleJobRequest =
+                            read_json(&job_dir.join(RUNNER_JOB_FILE))?;
+                        request.validate().map_err(|error| {
+                            WorkspaceError::InvalidRunnerContract(error.to_string())
+                        })?;
+                        if request.job_id != summary.job_id
+                            || summary.image_settings.is_none()
+                            || !is_safe_image_request(summary, &request)
+                        {
+                            return Err(WorkspaceError::UnsafeRunnerRequest);
+                        }
+                        Ok(StoredRunnerRequest::ImageUpscale(request))
+                    }
+                    2 => {
+                        let request: ImageUpscaleJobRequestV2 =
+                            read_json(&job_dir.join(RUNNER_JOB_FILE))?;
+                        request.validate().map_err(|error| {
+                            WorkspaceError::InvalidRunnerContract(error.to_string())
+                        })?;
+                        if request.job_id != summary.job_id
+                            || summary.image_settings.is_none()
+                            || !is_safe_image_request_v2(summary, &request)
+                        {
+                            return Err(WorkspaceError::UnsafeRunnerRequest);
+                        }
+                        Ok(StoredRunnerRequest::ImageUpscaleV2(request))
+                    }
+                    version => Err(WorkspaceError::InvalidRunnerContract(format!(
+                        "unsupported protocol version: {version}"
+                    ))),
                 }
-                Ok(StoredRunnerRequest::ImageUpscale(request))
             }
         }
     }
@@ -641,6 +728,13 @@ fn image_plan_from_request(
     })
 }
 
+fn default_runner_id(kind: JobKind) -> &'static str {
+    match kind {
+        JobKind::FakeValidation => "zoos-runner-fake",
+        JobKind::ImageUpscale => "zoos-runner-realesrgan",
+    }
+}
+
 fn is_safe_image_request(summary: &JobSummary, request: &ImageUpscaleJobRequest) -> bool {
     let Some(final_path) = summary.output_path.as_deref() else {
         return false;
@@ -670,6 +764,21 @@ fn is_safe_image_request(summary: &JobSummary, request: &ImageUpscaleJobRequest)
     }
     request.output.path
         == final_path.with_file_name(format!(".{final_name}.zoos-{}.partial.png", summary.job_id))
+}
+
+fn is_safe_image_request_v2(summary: &JobSummary, request: &ImageUpscaleJobRequestV2) -> bool {
+    let Some(final_path) = summary.output_path.as_deref() else {
+        return false;
+    };
+    let Some(final_name) = final_path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    request.input.path != request.output.path
+        && request.output.path
+            == final_path.with_file_name(format!(
+                ".{final_name}.zoos-{}.native-x4.partial.png",
+                summary.job_id
+            ))
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), WorkspaceError> {
@@ -853,6 +962,9 @@ mod tests {
                 ImageSettings {
                     preset: ImagePreset::Photo,
                     scale: 2,
+                    backend: crate::domain::ImageBackend::Auto,
+                    output_format: crate::domain::ImageOutputFormat::Png,
+                    metadata: crate::domain::MetadataPolicy::Preserve,
                 },
             )
             .expect("image job must be created");
@@ -898,6 +1010,95 @@ mod tests {
                 .is_file()
         );
         assert_eq!(store.list_jobs().expect("jobs must list").len(), 1);
+    }
+
+    #[test]
+    fn image_v2_runner_request_and_selected_plan_runner_load() {
+        use zoos_runner_protocol::{
+            IMAGE_PROTOCOL_VERSION_V2, ImageBackendSettingsV2, ImageDeviceV2,
+            ImageInferenceFormatV2, ImageInferenceInputV2, ImageIntermediateOutputV2,
+            ImagePixelFormatV2, ImageSemanticModelV2, ImageUpscaleJobRequestV2,
+            ImageUpscaleParametersV2,
+        };
+
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let input_directory = tempfile::tempdir().expect("input directory must be created");
+        let input = input_directory.path().join("input.png");
+        rgb_png(&input, 2, 3, [1, 2, 3]);
+        let store = WorkspaceStore::new(directory.path()).expect("store must be created");
+        let created = store
+            .create_image_job(
+                &input,
+                ImageSettings {
+                    preset: ImagePreset::Photo,
+                    scale: 2,
+                    backend: crate::domain::ImageBackend::OrtCpu,
+                    output_format: crate::domain::ImageOutputFormat::Png,
+                    metadata: crate::domain::MetadataPolicy::Preserve,
+                },
+            )
+            .expect("image job must be created");
+        let job_dir = directory.path().join(&created.job_id);
+        let StoredRunnerRequest::ImageUpscale(v1) = store
+            .load_stored_job(&created.job_id)
+            .expect("v1 image job must load")
+            .runner_request
+        else {
+            panic!("new job must initially use v1")
+        };
+        let final_path = created.output_path.as_ref().expect("final path must exist");
+        let final_name = final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("final name must be UTF-8");
+        let v2 = ImageUpscaleJobRequestV2 {
+            protocol_version: IMAGE_PROTOCOL_VERSION_V2,
+            job_id: created.job_id.clone(),
+            task: ImageTask::ImageUpscale,
+            input: ImageInferenceInputV2 {
+                path: v1.input.path,
+                sha256: v1.input.sha256,
+                width: v1.input.width,
+                height: v1.input.height,
+                format: ImageInferenceFormatV2::Png,
+                pixel_format: ImagePixelFormatV2::Rgb8,
+            },
+            output: ImageIntermediateOutputV2 {
+                path: final_path.with_file_name(format!(
+                    ".{final_name}.zoos-{}.native-x4.partial.png",
+                    created.job_id
+                )),
+                format: ImageInferenceFormatV2::Png,
+                pixel_format: ImagePixelFormatV2::Rgb8,
+            },
+            parameters: ImageUpscaleParametersV2 {
+                semantic_model: ImageSemanticModelV2::Photo,
+                requested_scale: 2,
+                native_scale: 4,
+                device: ImageDeviceV2::Cpu,
+                backend_settings: ImageBackendSettingsV2::OrtCpu {
+                    tile_size: 128,
+                    intra_threads: 4,
+                    inter_threads: 1,
+                },
+            },
+        };
+        write_json_atomic(&job_dir.join(RUNNER_JOB_FILE), &v2)
+            .expect("v2 runner request must save");
+        let mut plan: JobPlan = read_json(&job_dir.join(PLAN_FILE)).expect("plan must deserialize");
+        plan.runner_id = "zoos-runner-ort".into();
+        write_json_atomic(&job_dir.join(PLAN_FILE), &plan).expect("plan must save");
+        drop(store);
+
+        let reopened = WorkspaceStore::new(directory.path()).expect("v2 workspace must open");
+        let stored = reopened
+            .load_stored_job(&created.job_id)
+            .expect("v2 image job must load");
+        assert_eq!(stored.runner_id, "zoos-runner-ort");
+        assert!(matches!(
+            stored.runner_request,
+            StoredRunnerRequest::ImageUpscaleV2(_)
+        ));
     }
 
     #[test]
@@ -1033,6 +1234,9 @@ mod tests {
                 ImageSettings {
                     preset: ImagePreset::Anime,
                     scale: 2,
+                    backend: crate::domain::ImageBackend::Auto,
+                    output_format: crate::domain::ImageOutputFormat::Png,
+                    metadata: crate::domain::MetadataPolicy::Preserve,
                 },
             )
             .expect("image job must be created");

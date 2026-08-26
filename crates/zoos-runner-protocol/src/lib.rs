@@ -4,6 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
+pub const IMAGE_PROTOCOL_VERSION_V2: u32 = 2;
 pub const EVENT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -100,6 +101,152 @@ impl ImageUpscaleJobRequest {
         }
         Ok(())
     }
+}
+
+/// Backend-neutral image request produced by core after it has normalized the source image.
+/// Runner events intentionally continue to use the stable v1 event protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImageUpscaleJobRequestV2 {
+    pub protocol_version: u32,
+    pub job_id: String,
+    pub task: ImageTask,
+    pub input: ImageInferenceInputV2,
+    pub output: ImageIntermediateOutputV2,
+    pub parameters: ImageUpscaleParametersV2,
+}
+
+impl ImageUpscaleJobRequestV2 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.protocol_version != IMAGE_PROTOCOL_VERSION_V2 {
+            return Err(ContractError::UnsupportedProtocol(self.protocol_version));
+        }
+        if self.job_id.trim().is_empty() {
+            return Err(ContractError::EmptyJobId);
+        }
+        if !self.input.path.is_absolute() {
+            return Err(ContractError::RelativePath("input"));
+        }
+        if !self.output.path.is_absolute() {
+            return Err(ContractError::RelativePath("output"));
+        }
+        validate_sha256(&self.input.sha256)?;
+        if self.input.width == 0 || self.input.height == 0 {
+            return Err(ContractError::InvalidImageParameter("input dimensions"));
+        }
+        if !matches!(self.parameters.requested_scale, 2 | 4) {
+            return Err(ContractError::InvalidScale(self.parameters.requested_scale));
+        }
+        if self.parameters.native_scale != 4 {
+            return Err(ContractError::InvalidImageParameter("native_scale"));
+        }
+        match (&self.parameters.device, &self.parameters.backend_settings) {
+            (
+                ImageDeviceV2::Vulkan { index: 0 },
+                ImageBackendSettingsV2::Vulkan { tile_size, threads },
+            ) if *tile_size > 0 && !threads.trim().is_empty() => {}
+            (
+                ImageDeviceV2::Cpu,
+                ImageBackendSettingsV2::OrtCpu {
+                    tile_size,
+                    intra_threads,
+                    inter_threads,
+                },
+            ) if *tile_size > 0 && *intra_threads > 0 && *inter_threads > 0 => {}
+            _ => return Err(ContractError::InvalidImageParameter("backend_settings")),
+        }
+        Ok(())
+    }
+}
+
+fn validate_sha256(value: &str) -> Result<(), ContractError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(ContractError::InvalidImageParameter("input.sha256"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImageInferenceInputV2 {
+    pub path: PathBuf,
+    #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+    pub sha256: String,
+    #[schemars(range(min = 1))]
+    pub width: u32,
+    #[schemars(range(min = 1))]
+    pub height: u32,
+    pub format: ImageInferenceFormatV2,
+    pub pixel_format: ImagePixelFormatV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImageIntermediateOutputV2 {
+    pub path: PathBuf,
+    pub format: ImageInferenceFormatV2,
+    pub pixel_format: ImagePixelFormatV2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageInferenceFormatV2 {
+    Png,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ImagePixelFormatV2 {
+    Rgb8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImageUpscaleParametersV2 {
+    pub semantic_model: ImageSemanticModelV2,
+    #[schemars(range(min = 2, max = 4))]
+    pub requested_scale: u8,
+    #[schemars(range(min = 4, max = 4))]
+    pub native_scale: u8,
+    pub device: ImageDeviceV2,
+    pub backend_settings: ImageBackendSettingsV2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageSemanticModelV2 {
+    Photo,
+    Anime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ImageDeviceV2 {
+    Vulkan { index: u32 },
+    Cpu,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ImageBackendSettingsV2 {
+    Vulkan {
+        #[schemars(range(min = 1))]
+        tile_size: u32,
+        threads: String,
+    },
+    OrtCpu {
+        #[schemars(range(min = 1))]
+        tile_size: u32,
+        #[schemars(range(min = 1))]
+        intra_threads: u32,
+        #[schemars(range(min = 1))]
+        inter_threads: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -735,5 +882,103 @@ mod tests {
         capabilities
             .validate()
             .expect("complete image capabilities must validate");
+    }
+
+    #[test]
+    fn image_v2_contract_round_trips_for_vulkan_and_cpu() {
+        let root = std::env::current_dir().expect("current directory must be absolute");
+        let base = ImageUpscaleJobRequestV2 {
+            protocol_version: IMAGE_PROTOCOL_VERSION_V2,
+            job_id: "image-v2".into(),
+            task: ImageTask::ImageUpscale,
+            input: ImageInferenceInputV2 {
+                path: root.join("normalized.png"),
+                sha256: "a".repeat(64),
+                width: 64,
+                height: 48,
+                format: ImageInferenceFormatV2::Png,
+                pixel_format: ImagePixelFormatV2::Rgb8,
+            },
+            output: ImageIntermediateOutputV2 {
+                path: root.join("native-x4.partial.png"),
+                format: ImageInferenceFormatV2::Png,
+                pixel_format: ImagePixelFormatV2::Rgb8,
+            },
+            parameters: ImageUpscaleParametersV2 {
+                semantic_model: ImageSemanticModelV2::Photo,
+                requested_scale: 2,
+                native_scale: 4,
+                device: ImageDeviceV2::Vulkan { index: 0 },
+                backend_settings: ImageBackendSettingsV2::Vulkan {
+                    tile_size: 256,
+                    threads: "1:2:2".into(),
+                },
+            },
+        };
+
+        for request in [
+            base.clone(),
+            ImageUpscaleJobRequestV2 {
+                parameters: ImageUpscaleParametersV2 {
+                    semantic_model: ImageSemanticModelV2::Anime,
+                    requested_scale: 4,
+                    native_scale: 4,
+                    device: ImageDeviceV2::Cpu,
+                    backend_settings: ImageBackendSettingsV2::OrtCpu {
+                        tile_size: 128,
+                        intra_threads: 4,
+                        inter_threads: 1,
+                    },
+                },
+                ..base.clone()
+            },
+        ] {
+            request.validate().expect("v2 request must validate");
+            let json = serde_json::to_value(&request).expect("v2 request must serialize");
+            assert_eq!(json["protocol_version"], 2);
+            assert_eq!(json["input"]["format"], "png");
+            assert_eq!(json["input"]["pixel_format"], "rgb8");
+            let round_trip: ImageUpscaleJobRequestV2 =
+                serde_json::from_value(json).expect("v2 request must deserialize");
+            assert_eq!(round_trip, request);
+        }
+    }
+
+    #[test]
+    fn image_v2_contract_rejects_a_device_settings_mismatch() {
+        let root = std::env::current_dir().expect("current directory must be absolute");
+        let request = ImageUpscaleJobRequestV2 {
+            protocol_version: IMAGE_PROTOCOL_VERSION_V2,
+            job_id: "image-v2".into(),
+            task: ImageTask::ImageUpscale,
+            input: ImageInferenceInputV2 {
+                path: root.join("normalized.png"),
+                sha256: "0".repeat(64),
+                width: 1,
+                height: 1,
+                format: ImageInferenceFormatV2::Png,
+                pixel_format: ImagePixelFormatV2::Rgb8,
+            },
+            output: ImageIntermediateOutputV2 {
+                path: root.join("native-x4.png"),
+                format: ImageInferenceFormatV2::Png,
+                pixel_format: ImagePixelFormatV2::Rgb8,
+            },
+            parameters: ImageUpscaleParametersV2 {
+                semantic_model: ImageSemanticModelV2::Photo,
+                requested_scale: 2,
+                native_scale: 4,
+                device: ImageDeviceV2::Cpu,
+                backend_settings: ImageBackendSettingsV2::Vulkan {
+                    tile_size: 256,
+                    threads: "1:2:2".into(),
+                },
+            },
+        };
+
+        assert_eq!(
+            request.validate(),
+            Err(ContractError::InvalidImageParameter("backend_settings"))
+        );
     }
 }

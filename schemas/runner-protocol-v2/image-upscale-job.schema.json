@@ -1,0 +1,259 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ImageUpscaleJobRequestV2",
+  "description": "Backend-neutral image request produced by core after it has normalized the source image. Runner events intentionally continue to use the stable v1 event protocol.",
+  "type": "object",
+  "required": [
+    "input",
+    "job_id",
+    "output",
+    "parameters",
+    "protocol_version",
+    "task"
+  ],
+  "properties": {
+    "input": {
+      "$ref": "#/definitions/ImageInferenceInputV2"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "output": {
+      "$ref": "#/definitions/ImageIntermediateOutputV2"
+    },
+    "parameters": {
+      "$ref": "#/definitions/ImageUpscaleParametersV2"
+    },
+    "protocol_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "task": {
+      "$ref": "#/definitions/ImageTask"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "ImageBackendSettingsV2": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "backend",
+            "threads",
+            "tile_size"
+          ],
+          "properties": {
+            "backend": {
+              "type": "string",
+              "enum": [
+                "vulkan"
+              ]
+            },
+            "threads": {
+              "type": "string"
+            },
+            "tile_size": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "backend",
+            "inter_threads",
+            "intra_threads",
+            "tile_size"
+          ],
+          "properties": {
+            "backend": {
+              "type": "string",
+              "enum": [
+                "ort_cpu"
+              ]
+            },
+            "inter_threads": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1.0
+            },
+            "intra_threads": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1.0
+            },
+            "tile_size": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1.0
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ImageDeviceV2": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "backend",
+            "index"
+          ],
+          "properties": {
+            "backend": {
+              "type": "string",
+              "enum": [
+                "vulkan"
+              ]
+            },
+            "index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "backend"
+          ],
+          "properties": {
+            "backend": {
+              "type": "string",
+              "enum": [
+                "cpu"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ImageInferenceFormatV2": {
+      "type": "string",
+      "enum": [
+        "png"
+      ]
+    },
+    "ImageInferenceInputV2": {
+      "type": "object",
+      "required": [
+        "format",
+        "height",
+        "path",
+        "pixel_format",
+        "sha256",
+        "width"
+      ],
+      "properties": {
+        "format": {
+          "$ref": "#/definitions/ImageInferenceFormatV2"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1.0
+        },
+        "path": {
+          "type": "string"
+        },
+        "pixel_format": {
+          "$ref": "#/definitions/ImagePixelFormatV2"
+        },
+        "sha256": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ImageIntermediateOutputV2": {
+      "type": "object",
+      "required": [
+        "format",
+        "path",
+        "pixel_format"
+      ],
+      "properties": {
+        "format": {
+          "$ref": "#/definitions/ImageInferenceFormatV2"
+        },
+        "path": {
+          "type": "string"
+        },
+        "pixel_format": {
+          "$ref": "#/definitions/ImagePixelFormatV2"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ImagePixelFormatV2": {
+      "type": "string",
+      "enum": [
+        "rgb8"
+      ]
+    },
+    "ImageSemanticModelV2": {
+      "type": "string",
+      "enum": [
+        "photo",
+        "anime"
+      ]
+    },
+    "ImageTask": {
+      "type": "string",
+      "enum": [
+        "image_upscale"
+      ]
+    },
+    "ImageUpscaleParametersV2": {
+      "type": "object",
+      "required": [
+        "backend_settings",
+        "device",
+        "native_scale",
+        "requested_scale",
+        "semantic_model"
+      ],
+      "properties": {
+        "backend_settings": {
+          "$ref": "#/definitions/ImageBackendSettingsV2"
+        },
+        "device": {
+          "$ref": "#/definitions/ImageDeviceV2"
+        },
+        "native_scale": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 4.0,
+          "minimum": 4.0
+        },
+        "requested_scale": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 4.0,
+          "minimum": 2.0
+        },
+        "semantic_model": {
+          "$ref": "#/definitions/ImageSemanticModelV2"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -79,24 +79,35 @@ impl RunnerLaunchSpec {
 
 #[derive(Debug, Clone, Default)]
 pub struct RunnerRegistry {
-    runners: HashMap<JobKind, RunnerLaunchSpec>,
+    runners: HashMap<String, RunnerLaunchSpec>,
 }
 
 impl RunnerRegistry {
-    pub fn with_runner(kind: JobKind, launch: RunnerLaunchSpec) -> Self {
+    /// Compatibility constructor. Routing is based on the launch's stable runner id, not job kind.
+    pub fn with_runner(_kind: JobKind, launch: RunnerLaunchSpec) -> Self {
+        Self::with_runner_id(launch)
+    }
+
+    pub fn with_runner_id(launch: RunnerLaunchSpec) -> Self {
+        let runner_id = launch.runner_id.clone();
         Self {
-            runners: HashMap::from([(kind, launch)]),
+            runners: HashMap::from([(runner_id, launch)]),
         }
     }
 
-    pub fn register(&mut self, kind: JobKind, launch: RunnerLaunchSpec) {
-        self.runners.insert(kind, launch);
+    /// Compatibility registration API; multiple runners may now serve the same job kind.
+    pub fn register(&mut self, _kind: JobKind, launch: RunnerLaunchSpec) {
+        self.register_runner(launch);
     }
 
-    pub fn resolve(&self, kind: JobKind) -> Result<&RunnerLaunchSpec, BackendError> {
+    pub fn register_runner(&mut self, launch: RunnerLaunchSpec) {
+        self.runners.insert(launch.runner_id.clone(), launch);
+    }
+
+    pub fn resolve(&self, runner_id: &str) -> Result<&RunnerLaunchSpec, BackendError> {
         self.runners
-            .get(&kind)
-            .ok_or(BackendError::RunnerNotRegistered(kind))
+            .get(runner_id)
+            .ok_or_else(|| BackendError::RunnerNotRegistered(runner_id.into()))
     }
 }
 
@@ -628,8 +639,8 @@ fn process_group_exists(child_id: u32) -> bool {
 pub enum BackendError {
     #[error("runner path must be absolute")]
     InvalidRunnerPath,
-    #[error("no runner is registered for {0:?}")]
-    RunnerNotRegistered(JobKind),
+    #[error("no runner is registered with id {0}")]
+    RunnerNotRegistered(String),
     #[error("runner capability probe failed: {0}")]
     ProbeFailed(String),
     #[error("runner could not start: {0}")]
@@ -741,5 +752,31 @@ mod tests {
             exit_code: Some(30),
         };
         assert_eq!(error.code(), "GPU_UNAVAILABLE");
+    }
+
+    #[test]
+    fn registry_keeps_multiple_image_runners_by_runner_id() {
+        let root = std::env::current_dir().expect("current directory must be absolute");
+        let vulkan = RunnerLaunchSpec::new("zoos-runner-realesrgan", root.join("vulkan-runner"))
+            .expect("Vulkan launch must validate");
+        let cpu = RunnerLaunchSpec::new("zoos-runner-ort", root.join("cpu-runner"))
+            .expect("CPU launch must validate");
+        let mut registry = RunnerRegistry::with_runner(JobKind::ImageUpscale, vulkan);
+        registry.register(JobKind::ImageUpscale, cpu);
+
+        assert_eq!(
+            registry
+                .resolve("zoos-runner-realesrgan")
+                .expect("Vulkan runner must remain registered")
+                .runner_id,
+            "zoos-runner-realesrgan"
+        );
+        assert_eq!(
+            registry
+                .resolve("zoos-runner-ort")
+                .expect("CPU runner must be independently registered")
+                .runner_id,
+            "zoos-runner-ort"
+        );
     }
 }

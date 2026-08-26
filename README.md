@@ -2,7 +2,7 @@
 
 > 사진과 영상을 더 선명하고 부드럽게 만드는 로컬 AI 업스케일러
 
-**현재 상태: 구현 기준 확정 · 첫 개발 진행 중**
+**현재 상태: Goal 0 기본 실행 경로 완료 · 이미지 MVP 준비 중**
 
 > [!IMPORTANT]
 > 아직 다운로드할 수 있는 배포본은 없습니다. 현재는 제품 설계를 마치고 첫 구현을 진행하는 단계입니다.
@@ -85,7 +85,7 @@ flowchart LR
 flowchart TB
     A["1. 제품 설계<br/>완료"] --> B["2. Tauri · Rust · Svelte<br/>Apache-2.0 확정"]
     B --> C["3. Apple M5 엔진 확인<br/>Real-ESRGAN · RIFE 완료"]
-    C --> D["4. Tauri 앱 · Fake Runner<br/>성공 · 실패 · 취소"]
+    C --> D["4. Tauri 앱 · Fake Runner<br/>기본 경로 완료"]
     D --> E["5. 이미지 MVP<br/>GPU + CPU"]
     E --> F["6. 영상 처리<br/>FFmpeg + RIFE"]
     F --> G["7. Queue · 복구 · Preview<br/>macOS 첫 Beta"]
@@ -102,8 +102,8 @@ flowchart TB
 - [x] 작업 중단·복구 및 원본 보호 정책 설계
 - [x] Tauri·Rust·Svelte 생산 스택과 Apache-2.0 라이선스 확정
 - [x] Apple M5에서 Real-ESRGAN·RIFE native 엔진 1차 검증
+- [x] 데스크톱 기본 화면과 native Fake Runner 성공·실패·timeout·취소 검증
 - [ ] FFmpeg를 포함한 Mac 개발 환경 완성
-- [ ] 데스크톱 앱 기본 화면
 - [ ] 실제 이미지 업스케일
 - [ ] GPU 실패 시 CPU 처리
 - [ ] 영상 프레임 보간과 업스케일
@@ -120,6 +120,30 @@ NVIDIA 장치가 있어도 처음부터 CUDA 전용 구현을 만들지 않습�
 3. **Linux x64**
 
 실제 장치에서 검증하지 않은 환경은 지원된다고 표시하지 않을 예정입니다.
+
+## 개발 환경에서 실행
+
+현재 검증 기준은 Node.js 22.22.3, pnpm 11.19.0, Rust 1.96.0입니다. 각 버전은 저장소의 설정과 lockfile로 고정됩니다.
+
+```bash
+pnpm install --frozen-lockfile
+pnpm tauri dev
+```
+
+Goal 0 개발 화면에서 정상 완료, 실패 처리, 응답 없음·취소를 직접 재현할 수 있습니다. 전체 검증은 다음 명령으로 실행합니다.
+
+```bash
+pnpm check
+pnpm test
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+모델 개발 도구는 제품과 분리된 uv 환경을 사용합니다.
+
+```bash
+uv sync --project tools/model --locked
+```
 
 ## 자주 묻는 질문
 

@@ -106,7 +106,7 @@ flowchart LR
 - 취소 시 자식과 손자 프로세스까지 함께 종료합니다.
 - 실행 파일, 모델, 빌드 옵션과 SHA-256을 배포 manifest에 고정합니다.
 
-### RunnerProtocolV1의 계획된 역할
+### RunnerProtocolV1의 현재 역할
 
 | 구간 | 형식 | 목적 |
 |---|---|---|
@@ -116,7 +116,7 @@ flowchart LR
 | 오류 분류 | 표준 오류 코드 | 입력 오류, 모델 누락, GPU 오류, OOM, 취소 등 구분 |
 | 취소 | Process tree 종료 | 고아 프로세스와 불완전 결과 방지 |
 
-프로토콜의 정확한 JSON Schema와 상태 전이는 Goal 0에서 테스트와 함께 고정합니다.
+현재 `RunnerProtocolV1` 타입과 JSON Schema, native Fake Runner가 구현되었습니다. 성공·명시 실패·malformed NDJSON·crash·hang·timeout·취소·terminal event와 exit code 충돌을 실제 자식 process로 검증합니다. macOS에서는 별도 process group을 사용해 손자 process까지 종료합니다.
 
 ## 4. 이미지 데이터 흐름
 

@@ -7,7 +7,8 @@
       "kind": "development-test-runner",
       "source": "crates/zoos-runner-fake",
       "license": "Apache-2.0",
-      "bundled_in_release": true,
+      "approved_for_distribution": false,
+      "bundled_in_release": false,
       "release_policy": "Development validation only; remove before the first public beta"
     }
   ]

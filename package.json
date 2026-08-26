@@ -13,9 +13,13 @@
     "dev": "vite",
     "build": "pnpm check && vite build",
     "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",
+    "distribution:check": "node scripts/check-distribution.mjs",
+    "license:check": "node scripts/license-inventory.mjs --check && pnpm distribution:check && pnpm test:scripts",
+    "license:inventory": "node scripts/license-inventory.mjs",
     "preview": "vite preview",
     "sidecar:prepare": "node scripts/prepare-sidecars.mjs",
     "test": "vitest run",
+    "test:scripts": "node --test scripts/*.test.mjs",
     "test:watch": "vitest",
     "tauri": "tauri"
   },

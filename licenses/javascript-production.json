@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "dependencies": [
+    {
+      "name": "@jridgewell/gen-mapping",
+      "version": "0.3.13",
+      "license": "MIT",
+      "homepage": "https://github.com/jridgewell/sourcemaps/tree/main/packages/gen-mapping"
+    },
+    {
+      "name": "@jridgewell/remapping",
+      "version": "2.3.5",
+      "license": "MIT",
+      "homepage": "https://github.com/jridgewell/sourcemaps/tree/main/packages/remapping"
+    },
+    {
+      "name": "@jridgewell/resolve-uri",
+      "version": "3.1.2",
+      "license": "MIT",
+      "homepage": "https://github.com/jridgewell/resolve-uri#readme"
+    },
+    {
+      "name": "@jridgewell/sourcemap-codec",
+      "version": "1.5.5",
+      "license": "MIT",
+      "homepage": "https://github.com/jridgewell/sourcemaps/tree/main/packages/sourcemap-codec"
+    },
+    {
+      "name": "@jridgewell/trace-mapping",
+      "version": "0.3.31",
+      "license": "MIT",
+      "homepage": "https://github.com/jridgewell/sourcemaps/tree/main/packages/trace-mapping"
+    },
+    {
+      "name": "@sveltejs/acorn-typescript",
+      "version": "1.0.13",
+      "license": "MIT",
+      "homepage": "https://github.com/sveltejs/acorn-typescript#readme"
+    },
+    {
+      "name": "@tauri-apps/api",
+      "version": "2.11.1",
+      "license": "Apache-2.0 OR MIT",
+      "homepage": "https://github.com/tauri-apps/tauri#readme"
+    },
+    {
+      "name": "@types/estree",
+      "version": "1.0.9",
+      "license": "MIT",
+      "homepage": "https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/estree"
+    },
+    {
+      "name": "@types/trusted-types",
+      "version": "2.0.7",
+      "license": "MIT",
+      "homepage": "https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/trusted-types"
+    },
+    {
+      "name": "acorn",
+      "version": "8.18.0",
+      "license": "MIT",
+      "homepage": "https://github.com/acornjs/acorn"
+    },
+    {
+      "name": "aria-query",
+      "version": "5.3.1",
+      "license": "Apache-2.0",
+      "homepage": "https://github.com/A11yance/aria-query#readme"
+    },
+    {
+      "name": "axobject-query",
+      "version": "4.1.0",
+      "license": "Apache-2.0",
+      "homepage": "https://github.com/A11yance/axobject-query#readme"
+    },
+    {
+      "name": "clsx",
+      "version": "2.1.1",
+      "license": "MIT",
+      "homepage": "https://github.com/lukeed/clsx#readme"
+    },
+    {
+      "name": "devalue",
+      "version": "5.9.1",
+      "license": "MIT",
+      "homepage": "https://github.com/sveltejs/devalue#readme"
+    },
+    {
+      "name": "esm-env",
+      "version": "1.2.2",
+      "license": "MIT",
+      "homepage": "https://github.com/benmccann/esm-env"
+    },
+    {
+      "name": "esrap",
+      "version": "2.3.6",
+      "license": "MIT",
+      "homepage": "https://github.com/sveltejs/esrap#readme"
+    },
+    {
+      "name": "is-reference",
+      "version": "3.0.3",
+      "license": "MIT",
+      "homepage": "https://github.com/Rich-Harris/is-reference#readme"
+    },
+    {
+      "name": "locate-character",
+      "version": "3.0.0",
+      "license": "MIT",
+      "homepage": "https://gitlab.com/Rich-Harris/locate-character#README"
+    },
+    {
+      "name": "magic-string",
+      "version": "0.30.21",
+      "license": "MIT",
+      "homepage": "https://github.com/Rich-Harris/magic-string#readme"
+    },
+    {
+      "name": "svelte",
+      "version": "5.56.10",
+      "license": "MIT",
+      "homepage": "https://svelte.dev"
+    },
+    {
+      "name": "zimmerframe",
+      "version": "1.1.4",
+      "license": "MIT",
+      "homepage": "https://github.com/sveltejs/zimmerframe#readme"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+# Development asset catalogs
+
+These catalogs are the only network allowlist for local development assets. The Tauri build and application never download them.
+
+- `pnpm engine:fetch`: Goal 1A Vulkan engine and ncnn models.
+- `pnpm goal1b:fetch`: Goal 1B macOS arm64 ONNX Runtime and official PyTorch source weights.
+
+Every source and installed file is pinned by byte length and SHA-256. Existing caches are reused without network access only after their complete contents, paths, hashes, and architecture have been verified. Goal 1B assets remain development-cache-only with `approved_for_distribution: false`; neither weights nor binaries may enter Git or a public application bundle.

@@ -17,6 +17,7 @@
     "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",
     "distribution:check": "node scripts/check-distribution.mjs",
     "engine:fetch": "node scripts/fetch-engine.mjs",
+    "goal1b:fetch": "node scripts/fetch-goal1b-assets.mjs",
     "license:check": "node scripts/license-inventory.mjs --check && pnpm distribution:check && pnpm test:scripts",
     "license:inventory": "node scripts/license-inventory.mjs",
     "preview": "vite preview",

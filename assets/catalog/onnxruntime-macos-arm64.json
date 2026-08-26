@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "id": "onnxruntime-macos-arm64",
+  "version": "1.29.0",
+  "platform": "macos",
+  "architectures": ["arm64"],
+  "approved_for_distribution": false,
+  "bundled_in_release": false,
+  "source": {
+    "repository": "https://github.com/microsoft/onnxruntime",
+    "release": "v1.29.0",
+    "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.29.0/onnxruntime-osx-arm64-1.29.0.tgz",
+    "archive_size": 41578864,
+    "sha256": "d0706fc34f315d8c88639d0a8c81f2e09e815f282cabed3493c06a054352cf92"
+  },
+  "license_review": {
+    "runtime": "MIT",
+    "approved_for_distribution": false,
+    "note": "Development cache only until the application distribution review is complete."
+  },
+  "files": [
+    {
+      "archive_path": "./onnxruntime-osx-arm64-1.29.0/lib/libonnxruntime.1.29.0.dylib",
+      "destination": "lib/libonnxruntime.1.29.0.dylib",
+      "kind": "runtime",
+      "size": 43184400,
+      "sha256": "68f6e54e695583adc371aef610ec4abb1ffaa3df656582922de7690f7e2000eb",
+      "architecture": "arm64"
+    }
+  ]
+}

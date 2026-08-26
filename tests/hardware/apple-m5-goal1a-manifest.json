@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "gate_id": "apple-m5-goal1a",
+  "scope": {
+    "platform": "macos-arm64",
+    "gpu_index": 0,
+    "gpu_name": "Apple M5",
+    "backend": "vulkan",
+    "regression_only": true,
+    "cross_gpu_support_evidence": false
+  },
+  "repeats_per_case": 3,
+  "thresholds": {
+    "max_abs_error": 1,
+    "mean_abs_error": 0.01,
+    "psnr_db": 70.0
+  },
+  "runtime_assets": [
+    {
+      "path": "bin/realesrgan-ncnn-vulkan",
+      "size": 26787080,
+      "sha256": "c1c35d92079085de96b9d547fd7e4464bc8a2e9ccf28d7b8c712d72ade91b7cc"
+    },
+    {
+      "path": "models/realesrgan-x4plus.param",
+      "size": 116029,
+      "sha256": "35330ececcea33b6c397a72548e788d5d53becee4734c50b7fada36e89f10a86"
+    },
+    {
+      "path": "models/realesrgan-x4plus.bin",
+      "size": 33424520,
+      "sha256": "713ee713b0353afaa27976f0563a64a5043bd70b9bd8936c2e26e25ebcdbcddf"
+    },
+    {
+      "path": "models/realesrgan-x4plus-anime.param",
+      "size": 30290,
+      "sha256": "2b8fb6e0ae4d2d85704ca08c119a2f5ea40add4f2ecd512eb7f4cd44b6127ed4"
+    },
+    {
+      "path": "models/realesrgan-x4plus-anime.bin",
+      "size": 8943500,
+      "sha256": "fe01c269cfd10cdef8e018ab66ebe750cf79c7af4d1f9c16c737e1295229bacc"
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "rgb8-png",
+      "format": "png",
+      "path": "tests/hardware/fixtures/rgb8-pattern-64x48.png",
+      "size": 4575,
+      "width": 64,
+      "height": 48,
+      "sha256": "45509f989382199bc534485c1ef956c5cdb0f3dd8bd895eecc815d70baba3ea7",
+      "pixel_sha256": "f938741bf57dd310090bc6266ae816ebb0e10908e7c8462d8857c780b97cf21b"
+    },
+    {
+      "id": "rgb8-jpeg",
+      "format": "jpeg",
+      "path": "tests/hardware/fixtures/rgb8-pattern-64x48.jpg",
+      "size": 5244,
+      "width": 64,
+      "height": 48,
+      "sha256": "70a652829aeaf507f0624e47aa2ffd3a90b32004e20488864ca6676221c7d5d8",
+      "pixel_sha256": "15121e436158f776b1386c6c19388021ffc44669980ea3ecb31c23616885983d"
+    }
+  ],
+  "cases": [
+    {
+      "id": "photo-x2-png",
+      "preset": "photo",
+      "scale": 2,
+      "fixture": "rgb8-png",
+      "golden_path": "tests/golden/apple-m5-goal1a/photo-x2-png.png",
+      "width": 128,
+      "height": 96,
+      "size": 26907,
+      "sha256": "47a23ad4c78d5fcb9c152c689fcf9a781df72a6146abd7ec92d5a363415fd9aa",
+      "pixel_sha256": "10fe65b80135d93dd1eb016d4e7261e018ce14d32e99a882fed04dd78d94b2a2"
+    },
+    {
+      "id": "photo-x2-jpeg",
+      "preset": "photo",
+      "scale": 2,
+      "fixture": "rgb8-jpeg",
+      "golden_path": "tests/golden/apple-m5-goal1a/photo-x2-jpg.png",
+      "width": 128,
+      "height": 96,
+      "size": 27242,
+      "sha256": "9e514bebd773bd5a7b6f8e6d707e63de22ea5e731b9946db890f6d668148d0bc",
+      "pixel_sha256": "0fd1a46658f9ed3215f7ddd3c51867d056b1c6bb7137915cee57d4b94cd5a537"
+    },
+    {
+      "id": "photo-x4-png",
+      "preset": "photo",
+      "scale": 4,
+      "fixture": "rgb8-png",
+      "golden_path": "tests/golden/apple-m5-goal1a/photo-x4-png.png",
+      "width": 256,
+      "height": 192,
+      "size": 122052,
+      "sha256": "e5c872df2743653fc11adbf0c4d02cb1ee4934307abcc8d9c3ee97a56d4fc7a2",
+      "pixel_sha256": "4fe5311039106f9ac6bf302ad40560e48d9563a5d9e720a3ba612675ce8f1f96"
+    },
+    {
+      "id": "photo-x4-jpeg",
+      "preset": "photo",
+      "scale": 4,
+      "fixture": "rgb8-jpeg",
+      "golden_path": "tests/golden/apple-m5-goal1a/photo-x4-jpg.png",
+      "width": 256,
+      "height": 192,
+      "size": 122115,
+      "sha256": "83254d6e54117ab12d721bf2a1d3f36c3784255be319829118f299be23aec52d",
+      "pixel_sha256": "dd6f3eef10db409780089240a0aa60296e39572890bc00bb5e33a955522e20d0"
+    },
+    {
+      "id": "anime-x2-png",
+      "preset": "anime",
+      "scale": 2,
+      "fixture": "rgb8-png",
+      "golden_path": "tests/golden/apple-m5-goal1a/anime-x2-png.png",
+      "width": 128,
+      "height": 96,
+      "size": 23874,
+      "sha256": "61a6a6e92eab36fb165b14343890a1065290f0623ec7d9c2da9fef63250e4909",
+      "pixel_sha256": "5d3dadcb9af1079c6af53652bdb3e670bebcd8a412324e23f32dffabe092f761"
+    },
+    {
+      "id": "anime-x2-jpeg",
+      "preset": "anime",
+      "scale": 2,
+      "fixture": "rgb8-jpeg",
+      "golden_path": "tests/golden/apple-m5-goal1a/anime-x2-jpg.png",
+      "width": 128,
+      "height": 96,
+      "size": 24194,
+      "sha256": "3e2b5d941d6cde68d291d6928391f4f0b8ef264f2fdde68810fe48e5fa8a3f7e",
+      "pixel_sha256": "446bb262e898d41dc7808894bcdc3d489275970ca8ac56dd66626946392b4db8"
+    },
+    {
+      "id": "anime-x4-png",
+      "preset": "anime",
+      "scale": 4,
+      "fixture": "rgb8-png",
+      "golden_path": "tests/golden/apple-m5-goal1a/anime-x4-png.png",
+      "width": 256,
+      "height": 192,
+      "size": 116170,
+      "sha256": "8f051d7242172af04a351560175f43c49355727acf12841269afe1351a5385d4",
+      "pixel_sha256": "d5c834b297d24dc3d9faf7e1d023dc3bf382de6c25d9c0786d1fa1f064939975"
+    },
+    {
+      "id": "anime-x4-jpeg",
+      "preset": "anime",
+      "scale": 4,
+      "fixture": "rgb8-jpeg",
+      "golden_path": "tests/golden/apple-m5-goal1a/anime-x4-jpg.png",
+      "width": 256,
+      "height": 192,
+      "size": 116732,
+      "sha256": "268713c8ca5ffded6eeb8aff4561b6f1824e794d00d1fd56c0e1ffe9cf7f71f2",
+      "pixel_sha256": "33cb44175fceb125774a84151b7e0e892e641e584e40e82c770868047d3c8942"
+    }
+  ]
+}

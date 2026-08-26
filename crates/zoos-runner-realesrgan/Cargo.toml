@@ -19,4 +19,7 @@ sha2.workspace = true
 zoos-runner-protocol = { path = "../zoos-runner-protocol" }
 
 [dev-dependencies]
+image.workspace = true
+serde.workspace = true
 tempfile = "=3.27.0"
+zoos-core = { path = "../zoos-core" }

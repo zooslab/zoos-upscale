@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "gate_id": "apple-m5-goal1a",
+  "observed_at": "2026-08-26",
+  "host": {
+    "platform": "macOS 26.6 (25G72)",
+    "architecture": "arm64",
+    "cpu": "Apple M5",
+    "gpu_index": 0,
+    "gpu_name": "Apple M5",
+    "backend": "vulkan"
+  },
+  "upstream": {
+    "package": "Real-ESRGAN v0.2.5.0 macOS",
+    "runner_release": "Real-ESRGAN-ncnn-vulkan v0.2.0",
+    "source_commit": "37026f49824c5cf84062e7c6a5dd71445dcf610f",
+    "ncnn_commit": "6125c9f47cd14b589de0521350668cf9d3d37e3c"
+  },
+  "matrix": {
+    "cases": 8,
+    "repeats_per_case": 3,
+    "all_succeeded": true,
+    "all_file_deterministic": true,
+    "all_pixel_deterministic": true,
+    "all_rgb8": true,
+    "all_nonblack": true,
+    "all_dimensions_exact": true,
+    "all_input_hashes_unchanged": true,
+    "observed_max_abs_error": 0,
+    "observed_mean_abs_error": 0.0,
+    "observed_psnr_db": "infinity"
+  },
+  "stderr_observation": {
+    "device_prefix": "[0 Apple M5]",
+    "progress_lines": ["0.00%", "25.00%", "50.00%", "75.00%"],
+    "success_emits_100_percent": false,
+    "stdout_empty_for_direct_upstream": true,
+    "unstable_diagnostic_fields_excluded": ["bugbilz"]
+  },
+  "cancellation": {
+    "signal": "SIGTERM",
+    "process_group": true,
+    "signal_sent_after_device_event": "gpu:0 Apple M5",
+    "required_sigkill_escalation": false,
+    "remaining_processes_after_200_ms": 0,
+    "partial_files": 0,
+    "final_files": 0
+  },
+  "thresholds": {
+    "max_abs_error": 1,
+    "mean_abs_error": 0.01,
+    "psnr_db": 70.0
+  },
+  "scope": {
+    "use": "Apple M5 regression evidence only",
+    "supports_other_gpu_claims": false,
+    "engine_or_models_committed": false
+  }
+}

@@ -5241,10 +5241,13 @@ dependencies = [
 name = "zoos-runner-realesrgan"
 version = "0.1.0"
 dependencies = [
+ "image",
  "libc",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "zoos-core",
  "zoos-runner-protocol",
 ]
 

@@ -1,4 +1,4 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -399,19 +399,17 @@ fn encode_output(
                 .write_image(bytes, width, height, color.into())
                 .map_err(|_| Goal1bImageError::Encode)?;
             inject_jpeg_metadata(&mut encoded, metadata)?;
-            fs::write(path, encoded)?;
-            Ok(())
+            write_new_file(path, &encoded)
         }
         OutputEncoding::Webp => {
             let mut encoded = Vec::new();
             WebPEncoder::new_lossless(&mut encoded)
                 .write_image(bytes, width, height, color.into())
                 .map_err(|_| Goal1bImageError::Encode)?;
-            fs::write(
+            write_new_file(
                 path,
-                inject_webp_metadata(&encoded, width, height, color.has_alpha(), metadata)?,
-            )?;
-            Ok(())
+                &inject_webp_metadata(&encoded, width, height, color.has_alpha(), metadata)?,
+            )
         }
     }
 }
@@ -439,7 +437,21 @@ fn encode_png(
     if let Some(exif) = metadata.exif.as_ref() {
         chunks.push((*b"eXIf", exif.clone()));
     }
-    fs::write(path, inject_png_chunks(&encoded, &chunks)?)?;
+    write_new_file(path, &inject_png_chunks(&encoded, &chunks)?)?;
+    Ok(())
+}
+
+/// Claim a previously absent path without following an existing final-component symlink.
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), Goal1bImageError> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    if let Err(error) = (|| -> io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()
+    })() {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -944,6 +956,7 @@ mod tests {
     }
 
     fn write_png(path: &Path, image: &DynamicImage, metadata: &ImageMetadata) {
+        let _ = fs::remove_file(path);
         encode_output(path, image, OutputEncoding::Png, metadata).expect("fixture must encode");
     }
 
@@ -1242,6 +1255,44 @@ mod tests {
             ),
             Err(Goal1bImageError::InvalidRunnerOutput)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_encoder_never_follows_or_replaces_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let prepared = prepare_fixture(
+            &directory,
+            DynamicImage::ImageRgb8(base_rgb()),
+            ImageMetadata::default(),
+        );
+        let runner = directory.path().join("runner.png");
+        runner_x4(&prepared, &runner);
+        let external = directory.path().join("outside-created-by-link.png");
+        let output = directory.path().join("partial.png");
+        symlink(&external, &output).expect("dangling output symlink");
+
+        assert!(matches!(
+            render_pipeline_output(
+                &prepared,
+                &runner,
+                &output,
+                4,
+                OutputEncoding::Png,
+                MetadataPolicy::Strip,
+                ImagePipelineLimits::default(),
+            ),
+            Err(Goal1bImageError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert!(!external.exists());
+        assert!(
+            fs::symlink_metadata(output)
+                .expect("symlink must remain untouched")
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

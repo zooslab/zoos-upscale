@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -52,6 +52,15 @@ test('rejects ORT wrapper and dylib paths', async () => {
       /forbidden runtime asset/,
     )
   }
+})
+
+test('rejects symbolic links instead of skipping bundle entries', async () => {
+  const bundle = await fixtureBundle('safe application')
+  await symlink('/tmp/not-installed-onnx-model', join(bundle, 'model.onnx'))
+  await assert.rejects(
+    validateBundleContents(bundle, fixtureCatalog(Buffer.from('engine'))),
+    /symbolic link/,
+  )
 })
 
 function fixtureCatalog(engine) {

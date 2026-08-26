@@ -1,8 +1,8 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -425,12 +425,28 @@ fn run_upstream(
         let _ = events.failed(code, &error);
         return EXIT_ASSET;
     }
-    if job.output.exists() {
-        let _ = events.failed("OUTPUT_EXISTS", "destination already exists");
-        return EXIT_UPSTREAM;
+    match fs::symlink_metadata(job.output) {
+        Ok(_) => {
+            let _ = events.failed("OUTPUT_EXISTS", "destination already exists");
+            return EXIT_UPSTREAM;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let _ = events.failed(
+                "UPSTREAM_FAILED",
+                &format!("could not inspect output: {error}"),
+            );
+            return EXIT_UPSTREAM;
+        }
     }
-    let partial = job.output.to_path_buf();
-    let args = upstream_args(&job, assets);
+    let partial = match claim_private_upstream_output(job.output) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = events.failed("UPSTREAM_FAILED", &error);
+            return EXIT_UPSTREAM;
+        }
+    };
+    let args = upstream_args(&job, assets, &partial);
     let mut child = match Command::new(&assets.engine)
         .args(&args)
         .stdin(Stdio::null())
@@ -440,6 +456,7 @@ fn run_upstream(
     {
         Ok(child) => child,
         Err(error) => {
+            let _ = fs::remove_file(&partial);
             let _ = events.failed(
                 "ENGINE_NOT_INSTALLED",
                 &format!("could not start verified engine: {error}"),
@@ -553,10 +570,19 @@ fn run_upstream(
         }
         thread::sleep(Duration::from_millis(25));
     }
-    if !partial.is_file() {
+    if !partial.is_file() || fs::metadata(&partial).is_ok_and(|metadata| metadata.len() == 0) {
+        let _ = fs::remove_file(&partial);
         let _ = events.failed(
             "UPSTREAM_FAILED",
             "engine succeeded without producing output",
+        );
+        return EXIT_UPSTREAM;
+    }
+    if let Err(error) = File::open(&partial).and_then(|file| file.sync_all()) {
+        let _ = fs::remove_file(&partial);
+        let _ = events.failed(
+            "UPSTREAM_FAILED",
+            &format!("could not sync native output: {error}"),
         );
         return EXIT_UPSTREAM;
     }
@@ -567,6 +593,24 @@ fn run_upstream(
         let _ = events.failed("UPSTREAM_FAILED", &error);
         return EXIT_UPSTREAM;
     }
+    if let Err(error) = fs::hard_link(&partial, job.output) {
+        let _ = fs::remove_file(&partial);
+        let code = if error.kind() == io::ErrorKind::AlreadyExists {
+            "OUTPUT_EXISTS"
+        } else {
+            "UPSTREAM_FAILED"
+        };
+        let _ = events.failed(code, &format!("could not publish native output: {error}"));
+        return EXIT_UPSTREAM;
+    }
+    if let Err(error) = fs::remove_file(&partial) {
+        let _ = fs::remove_file(job.output);
+        let _ = events.failed(
+            "UPSTREAM_FAILED",
+            &format!("could not remove private native output: {error}"),
+        );
+        return EXIT_UPSTREAM;
+    }
     if events
         .emit(RunnerEventPayload::Completed {
             output: RunnerOutput {
@@ -575,6 +619,7 @@ fn run_upstream(
         })
         .is_err()
     {
+        let _ = fs::remove_file(job.output);
         return EXIT_UPSTREAM;
     }
     EXIT_SUCCESS
@@ -602,12 +647,16 @@ fn verify_v2_output(path: &Path, expected: (u32, u32)) -> Result<(), String> {
     Ok(())
 }
 
-fn upstream_args(job: &UpstreamJob<'_>, assets: &Assets) -> Vec<std::ffi::OsString> {
+fn upstream_args(
+    job: &UpstreamJob<'_>,
+    assets: &Assets,
+    engine_output: &Path,
+) -> Vec<std::ffi::OsString> {
     [
         "-i".into(),
         job.input.as_os_str().to_owned(),
         "-o".into(),
-        job.output.as_os_str().to_owned(),
+        engine_output.as_os_str().to_owned(),
         "-m".into(),
         assets.models.as_os_str().to_owned(),
         "-n".into(),
@@ -624,6 +673,38 @@ fn upstream_args(job: &UpstreamJob<'_>, assets: &Assets) -> Vec<std::ffi::OsStri
         "png".into(),
     ]
     .into()
+}
+
+static PRIVATE_OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn claim_private_upstream_output(destination: &Path) -> Result<PathBuf, String> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "native output has no parent directory".to_string())?;
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "native output filename is invalid".to_string())?;
+    for _ in 0..100 {
+        let sequence = PRIVATE_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{name}.zoos-upstream-{}-{sequence}.partial.png",
+            std::process::id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                if let Err(error) = file.sync_all() {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(error.to_string());
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("could not claim private native output: {error}")),
+        }
+    }
+    Err("could not allocate a private native output path".into())
 }
 
 fn verify_assets(
@@ -853,7 +934,7 @@ mod tests {
             threads: &request.parameters.threads,
             expected_output_dimensions: None,
         };
-        let args = upstream_args(&job, &assets);
+        let args = upstream_args(&job, &assets, job.output);
         assert_eq!(
             args,
             vec![
@@ -901,7 +982,7 @@ mod tests {
             expected_output_dimensions: Some((8, 12)),
         };
         assert_eq!(
-            upstream_args(&job, &assets),
+            upstream_args(&job, &assets, job.output),
             vec![
                 "-i",
                 "/tmp/v2 gpu/normalized.png",
@@ -970,6 +1051,49 @@ mod tests {
         );
         assert!(String::from_utf8(output).unwrap().contains("INPUT_CHANGED"));
         assert!(!request.output.path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn requested_output_dangling_symlink_is_not_followed_or_removed() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("결과 폴더")).unwrap();
+        fs::create_dir(root.join("models")).unwrap();
+        let engine = root.join("engine");
+        fs::write(&engine, "#!/bin/sh\nexit 99\n").unwrap();
+        fs::set_permissions(&engine, fs::Permissions::from_mode(0o755)).unwrap();
+        let model = root.join("models/model");
+        fs::write(&model, b"model").unwrap();
+        let request = request(root);
+        let external = root.join("outside.png");
+        symlink(&external, &request.output.path).unwrap();
+        let assets = Assets {
+            engine: engine.clone(),
+            models: root.join("models"),
+        };
+        let mut output = Vec::new();
+
+        assert_eq!(
+            run_job(
+                &request,
+                &assets,
+                &hash(&fs::read(engine).unwrap()),
+                &[("model", &hash(b"model"))],
+                &mut output,
+            ),
+            EXIT_UPSTREAM
+        );
+        assert!(String::from_utf8(output).unwrap().contains("OUTPUT_EXISTS"));
+        assert!(!external.exists());
+        assert!(
+            fs::symlink_metadata(request.output.path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

@@ -1457,10 +1457,9 @@ fn is_safe_image_request_v2(
     ]
     .into_iter()
     .flatten()
-    .all(|path| {
-        !path.exists()
-            || fs::symlink_metadata(path)
-                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    .all(|path| match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.is_file() && !metadata.file_type().is_symlink(),
+        Err(error) => error.kind() == io::ErrorKind::NotFound,
     });
     let final_name_is_safe = pipeline
         .source_path
@@ -2571,6 +2570,37 @@ mod tests {
         let reopened = WorkspaceStore::new(workspace.path()).expect("startup must continue");
         assert!(reopened.list_jobs().unwrap().is_empty());
         assert_eq!(fs::read(external).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn goal1b_dangling_managed_output_symlink_is_quarantined() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace must be created");
+        let sources = tempfile::tempdir().expect("sources must be created");
+        let input = sources.path().join("input.png");
+        rgb_png(&input, 2, 2, [1, 2, 3]);
+        let store = WorkspaceStore::new(workspace.path()).expect("store must open");
+        let created = store
+            .create_image_job_v2(
+                &input,
+                goal1b_settings(ProductOutputFormat::Png),
+                ImageBackend::OrtCpu,
+                None,
+            )
+            .unwrap();
+        let output = workspace
+            .path()
+            .join(&created.job_id)
+            .join("work/sr-native-x4.png");
+        let external = sources.path().join("must-not-be-created.png");
+        symlink(&external, &output).expect("dangling managed symlink");
+        drop(store);
+
+        let reopened = WorkspaceStore::new(workspace.path()).expect("startup must continue");
+        assert!(reopened.list_jobs().unwrap().is_empty());
+        assert!(!external.exists());
     }
 
     #[cfg(unix)]

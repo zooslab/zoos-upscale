@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,7 +6,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use image::{ColorType, ImageDecoder, ImageFormat, ImageReader, RgbImage};
+use image::codecs::png::PngEncoder;
+use image::{ColorType, ImageDecoder, ImageEncoder, ImageFormat, ImageReader, RgbImage};
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::value::Tensor;
 use sha2::{Digest, Sha256};
@@ -190,9 +191,19 @@ fn run_job(request: &ImageUpscaleJobRequestV2, assets: &Assets, output: &mut imp
         let _ = events.failed("UNSUPPORTED_IMAGE_MODE", &error);
         return EXIT_INVALID_INPUT;
     }
-    if request.output.path.exists() {
-        let _ = events.failed("OUTPUT_EXISTS", "intermediate output already exists");
-        return EXIT_UPSTREAM;
+    match fs::symlink_metadata(&request.output.path) {
+        Ok(_) => {
+            let _ = events.failed("OUTPUT_EXISTS", "intermediate output already exists");
+            return EXIT_UPSTREAM;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let _ = events.failed(
+                "UPSTREAM_FAILED",
+                &format!("could not inspect output: {error}"),
+            );
+            return EXIT_UPSTREAM;
+        }
     }
 
     let result = run_inference(request, assets, &mut events);
@@ -213,7 +224,6 @@ fn run_job(request: &ImageUpscaleJobRequestV2, assets: &Assets, output: &mut imp
             }
         }
         Err(error) => {
-            let _ = fs::remove_file(&request.output.path);
             let _ = events.failed(error.code, &error.message);
             error.exit_code
         }
@@ -289,13 +299,40 @@ fn run_inference<W: Write>(
     if CANCELLED.load(Ordering::SeqCst) {
         return Err(RunnerFailure::cancelled());
     }
-    destination
-        .save_with_format(&request.output.path, ImageFormat::Png)
-        .map_err(|error| RunnerFailure::upstream(format!("could not encode RGB8 PNG: {error}")))?;
+    encode_rgb_png_create_new(&request.output.path, &destination)?;
     if CANCELLED.load(Ordering::SeqCst) {
+        let _ = fs::remove_file(&request.output.path);
         return Err(RunnerFailure::cancelled());
     }
     Ok(())
+}
+
+fn encode_rgb_png_create_new(path: &Path, image: &RgbImage) -> Result<(), RunnerFailure> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            RunnerFailure::upstream(format!("could not claim output path: {error}"))
+        })?;
+    let result = PngEncoder::new(&mut file)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            ColorType::Rgb8.into(),
+        )
+        .map_err(|error| RunnerFailure::upstream(format!("could not encode RGB8 PNG: {error}")))
+        .and_then(|()| {
+            file.sync_all().map_err(|error| {
+                RunnerFailure::upstream(format!("could not sync RGB8 PNG: {error}"))
+            })
+        });
+    if result.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+    }
+    result
 }
 
 fn create_session_with_heartbeat<W: Write>(
@@ -858,6 +895,27 @@ mod tests {
             verify_hash(&input, &"0".repeat(64))
                 .unwrap_err()
                 .contains("hash mismatch")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_encoder_does_not_follow_or_remove_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let output = temp.path().join("output.png");
+        let external = temp.path().join("outside.png");
+        symlink(&external, &output).unwrap();
+
+        let error = encode_rgb_png_create_new(&output, &RgbImage::new(2, 2)).unwrap_err();
+        assert!(error.message.contains("claim output path"));
+        assert!(!external.exists());
+        assert!(
+            fs::symlink_metadata(output)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 

@@ -58,7 +58,9 @@ async function listBundleFiles(directory) {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name)
     const info = await lstat(path)
-    if (info.isSymbolicLink()) continue
+    if (info.isSymbolicLink()) {
+      throw new Error(`Production bundle contains a symbolic link: ${path}`)
+    }
     if (info.isDirectory()) files.push(...(await listBundleFiles(path)))
     else if (info.isFile()) files.push(path)
   }

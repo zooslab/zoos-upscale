@@ -152,6 +152,7 @@ impl JobOrchestrator {
     pub fn create_video_job(
         &self,
         descriptor: MediaDescriptor,
+        expected_source_sha256: String,
         settings: VideoSettings,
         selected_backend: VideoBackend,
     ) -> Result<JobSummary, OrchestratorError> {
@@ -160,10 +161,12 @@ impl JobOrchestrator {
             .job_creation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(self
-            .inner
-            .store
-            .create_video_job(descriptor, settings, selected_backend)?)
+        Ok(self.inner.store.create_video_job(
+            descriptor,
+            expected_source_sha256,
+            settings,
+            selected_backend,
+        )?)
     }
 
     pub fn list_jobs(&self) -> Result<Vec<JobSummary>, OrchestratorError> {

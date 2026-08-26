@@ -355,7 +355,12 @@ pub async fn pick_and_create_video_job(
         ));
     }
     let created = orchestrator
-        .create_video_job(descriptor, VideoSettings { backend }, selected_backend)
+        .create_video_job(
+            descriptor,
+            after.sha256,
+            VideoSettings { backend },
+            selected_backend,
+        )
         .map_err(CommandError::from)?;
     match orchestrator.start_job(&created.job_id).await {
         Ok(started) => Ok(Some(started)),

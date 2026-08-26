@@ -739,6 +739,7 @@ impl WorkspaceStore {
     pub fn create_video_job(
         &self,
         descriptor: MediaDescriptor,
+        expected_source_sha256: String,
         settings: VideoSettings,
         selected_backend: VideoBackend,
     ) -> Result<JobSummary, WorkspaceError> {
@@ -800,6 +801,9 @@ impl WorkspaceStore {
                 bounded_workspace_bytes,
                 &self.active_output_reservations()?,
             )?;
+            if output.input.sha256 != expected_source_sha256 {
+                return Err(VideoSafetyError::InputChanged.into());
+            }
             if descriptor.input_path != output.input.path
                 || descriptor.width == 0
                 || descriptor.height == 0
@@ -2296,21 +2300,47 @@ fn is_safe_video_request(
                 || (2..=999).any(|suffix| name == format!("{base}_{suffix}.{extension}"))
         });
     let evidence_path = work.join(VIDEO_RUNNER_EVIDENCE_FILE);
-    let work_safe = fs::symlink_metadata(&work)
-        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
-    let optional_directories_safe = [input_frames.as_path(), output_frames.as_path()]
-        .iter()
-        .all(|path| match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata.is_dir() && !metadata.file_type().is_symlink(),
-            Err(error) => error.kind() == io::ErrorKind::NotFound,
-        });
-    let optional_files_safe = [request.output.path.as_path(), evidence_path.as_path()]
-        .iter()
-        .all(|path| match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata.is_file() && !metadata.file_type().is_symlink(),
-            Err(error) => error.kind() == io::ErrorKind::NotFound,
-        });
-    let managed_paths_safe = work_safe && optional_directories_safe && optional_files_safe;
+    let managed_paths_safe = match fs::symlink_metadata(&work) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            let optional_directories_safe = [input_frames.as_path(), output_frames.as_path()]
+                .iter()
+                .all(|path| match fs::symlink_metadata(path) {
+                    Ok(metadata) => metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    Err(error) => error.kind() == io::ErrorKind::NotFound,
+                });
+            let optional_files_safe = [request.output.path.as_path(), evidence_path.as_path()]
+                .iter()
+                .all(|path| match fs::symlink_metadata(path) {
+                    Ok(metadata) => metadata.is_file() && !metadata.file_type().is_symlink(),
+                    Err(error) => error.kind() == io::ErrorKind::NotFound,
+                });
+            optional_directories_safe && optional_files_safe
+        }
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                && matches!(
+                    summary.status,
+                    JobStatus::Failed | JobStatus::Cancelled | JobStatus::Interrupted
+                ) =>
+        {
+            // Failure/cancellation recovery removes the entire owned work directory. Accept that
+            // state only when every managed descendant is also absent; a surviving symlink or
+            // path outside the exact job/work contract remains rejected by the branches above and
+            // the equality checks below.
+            [
+                input_frames.as_path(),
+                output_frames.as_path(),
+                request.output.path.as_path(),
+                evidence_path.as_path(),
+            ]
+            .iter()
+            .all(|path| {
+                fs::symlink_metadata(path)
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+            })
+        }
+        _ => false,
+    };
 
     pipeline.schema_version == 1
         && pipeline.job_id == summary.job_id
@@ -2640,6 +2670,7 @@ mod tests {
         let first = store
             .create_video_job(
                 video_descriptor(&input),
+                crate::image_safety::sha256_file(&input).expect("source hash"),
                 video_settings(),
                 VideoBackend::VulkanGpu,
             )
@@ -2647,6 +2678,7 @@ mod tests {
         let second = store
             .create_video_job(
                 video_descriptor(&input),
+                crate::image_safety::sha256_file(&input).expect("source hash"),
                 video_settings(),
                 VideoBackend::NcnnCpu,
             )
@@ -2695,9 +2727,19 @@ mod tests {
         let input = inputs.path().join("clip.mkv");
         fs::write(&input, b"source-video").expect("video fixture");
         let store = WorkspaceStore::new(root.path()).expect("workspace");
+        assert!(matches!(
+            store.create_video_job(
+                video_descriptor(&input),
+                "0".repeat(64),
+                video_settings(),
+                VideoBackend::VulkanGpu,
+            ),
+            Err(WorkspaceError::Video(VideoSafetyError::InputChanged))
+        ));
         let job = store
             .create_video_job(
                 video_descriptor(&input),
+                crate::image_safety::sha256_file(&input).expect("source hash"),
                 video_settings(),
                 VideoBackend::VulkanGpu,
             )
@@ -2799,6 +2841,7 @@ mod tests {
         let job = store
             .create_video_job(
                 video_descriptor(&input),
+                crate::image_safety::sha256_file(&input).expect("source hash"),
                 video_settings(),
                 VideoBackend::VulkanGpu,
             )
@@ -2912,6 +2955,7 @@ mod tests {
         let job = store
             .create_video_job(
                 video_descriptor(&input),
+                crate::image_safety::sha256_file(&input).expect("source hash"),
                 video_settings(),
                 VideoBackend::VulkanGpu,
             )
@@ -2926,6 +2970,71 @@ mod tests {
             .expect("video cleanup");
         assert_eq!(fs::read(&input).expect("source remains"), b"changed-video");
         assert!(!root.path().join(&job.job_id).join("work").exists());
+    }
+
+    #[test]
+    fn cleaned_terminal_video_jobs_remain_listable_but_missing_active_work_is_quarantined() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let inputs = tempfile::tempdir().expect("input root");
+        let input = inputs.path().join("clip.mkv");
+        fs::write(&input, b"source-video").expect("video fixture");
+        let store = WorkspaceStore::new(root.path()).expect("workspace");
+
+        let mut expected = Vec::new();
+        for status in [
+            JobStatus::Failed,
+            JobStatus::Cancelled,
+            JobStatus::Interrupted,
+        ] {
+            let job = store
+                .create_video_job(
+                    video_descriptor(&input),
+                    crate::image_safety::sha256_file(&input).expect("source hash"),
+                    video_settings(),
+                    VideoBackend::VulkanGpu,
+                )
+                .expect("terminal video job");
+            store
+                .update_summary(&job.job_id, |summary| summary.status = status)
+                .expect("terminal status");
+            store
+                .cleanup_unverified_output(&job.job_id)
+                .expect("terminal cleanup");
+            assert!(!root.path().join(&job.job_id).join("work").exists());
+            expected.push((job.job_id, status));
+        }
+
+        let active = store
+            .create_video_job(
+                video_descriptor(&input),
+                crate::image_safety::sha256_file(&input).expect("source hash"),
+                video_settings(),
+                VideoBackend::VulkanGpu,
+            )
+            .expect("active video job");
+        store
+            .update_summary(&active.job_id, |summary| {
+                summary.status = JobStatus::Running
+            })
+            .expect("active status");
+        fs::remove_dir_all(root.path().join(&active.job_id).join("work"))
+            .expect("simulate unsafe missing active work");
+
+        let listed = store.list_jobs().expect("terminal jobs remain listable");
+        for (job_id, status) in expected {
+            assert_eq!(
+                listed
+                    .iter()
+                    .find(|job| job.job_id == job_id)
+                    .map(|job| job.status),
+                Some(status)
+            );
+        }
+        assert!(listed.iter().all(|job| job.job_id != active.job_id));
+        assert!(quarantine_entries(root.path()).iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&active.job_id))
+        }));
     }
 
     fn write_native_x4(store: &WorkspaceStore, job_id: &str) -> ImageUpscaleJobRequestV2 {

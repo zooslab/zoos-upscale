@@ -30,4 +30,8 @@ pub use video_safety::{
     validate_video_file,
 };
 pub use workspace::{ImagePipelineVerification, WorkspaceError};
+pub use zoos_media::{
+    Ffprobe, MediaChapterDescriptor, MediaDescriptor, MediaError, MediaStreamDescriptor,
+    verify_interpolated_output,
+};
 pub use zoos_runner_protocol::FakeBehavior;

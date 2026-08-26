@@ -149,6 +149,8 @@ pub struct JobSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_backend: Option<ImageBackend>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_video_backend: Option<VideoBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scenario: Option<FakeBehavior>,
     pub status: JobStatus,
     pub progress_percent: u8,
@@ -188,6 +190,8 @@ pub(crate) struct ProductJobSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_backend: Option<ImageBackend>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_video_backend: Option<VideoBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scenario: Option<FakeBehavior>,
     pub created_at_ms: u64,
 }
@@ -221,6 +225,8 @@ pub(crate) struct JobManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_backend: Option<ImageBackend>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_video_backend: Option<VideoBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_device: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_sha256: Option<String>,
@@ -230,6 +236,16 @@ pub(crate) struct JobManifest {
     pub model_bin_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_onnx_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffmpeg_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffprobe_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rife_engine_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rife_model_param_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rife_model_bin_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,6 +260,18 @@ pub(crate) struct JobManifest {
     pub exif_preserved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alpha_preserved: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rate: Option<RationalRate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_rate: Option<RationalRate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_frames: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_frames: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_cut_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_count: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

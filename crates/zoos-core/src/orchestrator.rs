@@ -13,12 +13,13 @@ use zoos_runner_protocol::{
 use crate::domain::{
     ExecutionRequest, ImageBackend, ImageBatchMetadata, ImageOutputFormat, ImagePreset,
     ImageSettings, JobErrorView, JobKind, JobStatus, JobSummary, MetadataPolicy,
-    StoredRunnerRequest,
+    StoredRunnerRequest, VideoBackend, VideoSettings,
 };
 use crate::process::{
     BackendError, ExecutionBackend, ProcessExecutionBackend, RunnerLaunchSpec, RunnerRegistry,
 };
 use crate::workspace::{WorkspaceError, WorkspaceStore, now_ms};
+use crate::{Ffprobe, MediaDescriptor};
 
 #[derive(Clone)]
 pub struct JobOrchestrator {
@@ -28,6 +29,7 @@ pub struct JobOrchestrator {
 struct Inner {
     store: WorkspaceStore,
     backend: Arc<dyn ExecutionBackend>,
+    media_probe: Option<Ffprobe>,
     runners: RunnerRegistry,
     job_creation: StdMutex<()>,
     active_jobs: Mutex<HashMap<String, watch::Sender<bool>>>,
@@ -54,6 +56,38 @@ impl JobOrchestrator {
         activity_timeout: Duration,
         termination_grace: Duration,
     ) -> Result<Self, OrchestratorError> {
+        Self::with_runner_registry_and_optional_media_probe(
+            workspace_root,
+            runners,
+            None,
+            activity_timeout,
+            termination_grace,
+        )
+    }
+
+    pub fn with_runner_registry_and_media_probe(
+        workspace_root: impl AsRef<Path>,
+        runners: RunnerRegistry,
+        media_probe: Ffprobe,
+        activity_timeout: Duration,
+        termination_grace: Duration,
+    ) -> Result<Self, OrchestratorError> {
+        Self::with_runner_registry_and_optional_media_probe(
+            workspace_root,
+            runners,
+            Some(media_probe),
+            activity_timeout,
+            termination_grace,
+        )
+    }
+
+    fn with_runner_registry_and_optional_media_probe(
+        workspace_root: impl AsRef<Path>,
+        runners: RunnerRegistry,
+        media_probe: Option<Ffprobe>,
+        activity_timeout: Duration,
+        termination_grace: Duration,
+    ) -> Result<Self, OrchestratorError> {
         let backend = ProcessExecutionBackend::new(activity_timeout, termination_grace);
         let store = WorkspaceStore::new(workspace_root)?;
         store.recover_interrupted()?;
@@ -61,6 +95,7 @@ impl JobOrchestrator {
             inner: Arc::new(Inner {
                 store,
                 backend: Arc::new(backend),
+                media_probe,
                 runners,
                 job_creation: StdMutex::new(()),
                 active_jobs: Mutex::new(HashMap::new()),
@@ -112,6 +147,23 @@ impl JobOrchestrator {
             selected_backend,
             batch,
         )?)
+    }
+
+    pub fn create_video_job(
+        &self,
+        descriptor: MediaDescriptor,
+        settings: VideoSettings,
+        selected_backend: VideoBackend,
+    ) -> Result<JobSummary, OrchestratorError> {
+        let _creation_guard = self
+            .inner
+            .job_creation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(self
+            .inner
+            .store
+            .create_video_job(descriptor, settings, selected_backend)?)
     }
 
     pub fn list_jobs(&self) -> Result<Vec<JobSummary>, OrchestratorError> {
@@ -321,20 +373,27 @@ impl JobOrchestrator {
             return;
         }
 
-        let _progress_guard = self.inner.progress_updates.lock().await;
         let finalization = match result {
-            Ok(Ok(report)) => self.finalize_completed(&job_id, report.exit_code, started_at_ms),
-            Ok(Err(BackendError::Cancelled)) => self.finalize_cancelled(&job_id, started_at_ms),
-            Ok(Err(error)) => self.finalize_failed(&job_id, &error, started_at_ms),
+            Ok(Ok(report)) => {
+                self.finalize_completed(&job_id, report.exit_code, started_at_ms)
+                    .await
+            }
+            Ok(Err(BackendError::Cancelled)) => {
+                let _progress_guard = self.inner.progress_updates.lock().await;
+                self.finalize_cancelled(&job_id, started_at_ms)
+            }
+            Ok(Err(error)) => {
+                let _progress_guard = self.inner.progress_updates.lock().await;
+                self.finalize_failed(&job_id, &error, started_at_ms)
+            }
             Err(error) => {
+                let _progress_guard = self.inner.progress_updates.lock().await;
                 self.finish_with_internal_error_locked(&job_id, error.to_string(), started_at_ms)
             }
         };
-        if let Err(error) = finalization
-            && let Err(reporting_error) =
-                self.finish_with_workspace_error_locked(&job_id, &error, started_at_ms)
-        {
-            eprintln!("could not persist terminal state for job {job_id}: {reporting_error}");
+        if let Err(error) = finalization {
+            self.finish_with_workspace_error(&job_id, &error, started_at_ms)
+                .await;
         }
     }
 
@@ -416,6 +475,16 @@ impl JobOrchestrator {
             WorkspaceError::Pipeline(image_error) => {
                 (image_error.code().to_owned(), image_error.to_string())
             }
+            WorkspaceError::Video(video_error) => {
+                (video_error.code().to_owned(), video_error.to_string())
+            }
+            WorkspaceError::Media(media_error) => {
+                (media_error.code().to_owned(), media_error.to_string())
+            }
+            WorkspaceError::MediaVerifierUnavailable => (
+                "ENGINE_NOT_INSTALLED".into(),
+                "The verified ffprobe runtime is not configured.".into(),
+            ),
             _ => {
                 return self.finish_with_internal_error_locked(
                     job_id,
@@ -424,16 +493,22 @@ impl JobOrchestrator {
                 );
             }
         };
+        let kind = self.inner.store.load_summary(job_id)?.kind;
         let cleanup = self.inner.store.cleanup_unverified_output(job_id);
         let progress = self.inner.store.update_summary(job_id, |summary| {
             summary.status = JobStatus::Failed;
             summary.stage = None;
-            summary.message = "Image upscale failed".into();
+            summary.message = match kind {
+                JobKind::VideoInterpolate => "Video interpolation failed",
+                JobKind::ImageUpscale => "Image upscale failed",
+                JobKind::FakeValidation => "Validation failed",
+            }
+            .into();
             summary.error = Some(JobErrorView { code, message });
         });
         let manifest = self.inner.store.finish_manifest(
             job_id,
-            &format!("image_error: {error}"),
+            &format!("job_error: {error}"),
             None,
             started_at_ms,
         );
@@ -442,13 +517,32 @@ impl JobOrchestrator {
         manifest
     }
 
-    fn finalize_completed(
+    async fn finalize_completed(
         &self,
         job_id: &str,
         exit_code: Option<i32>,
         started_at_ms: u64,
     ) -> Result<(), WorkspaceError> {
-        self.inner.store.publish_output(job_id)?;
+        let kind = self.inner.store.load_summary(job_id)?.kind;
+        let output_descriptor = if kind == JobKind::VideoInterpolate {
+            let probe = self
+                .inner
+                .media_probe
+                .as_ref()
+                .ok_or(WorkspaceError::MediaVerifierUnavailable)?;
+            let output = self.inner.store.video_output_to_probe(job_id)?;
+            Some(probe.probe_output(&output).await?)
+        } else {
+            None
+        };
+        let _progress_guard = self.inner.progress_updates.lock().await;
+        if let Some(output_descriptor) = output_descriptor.as_ref() {
+            self.inner
+                .store
+                .publish_verified_video_output(job_id, output_descriptor)?;
+        } else {
+            self.inner.store.publish_output(job_id)?;
+        }
         self.inner
             .store
             .finish_manifest(job_id, "completed", exit_code, started_at_ms)?;
@@ -581,7 +675,28 @@ fn video_backend_error_code(error: &BackendError) -> &str {
         | BackendError::RunnerNotRegistered(_)
         | BackendError::SpawnFailed(_) => "ENGINE_NOT_INSTALLED",
         BackendError::ProbeFailed(_) => "ASSET_HASH_MISMATCH",
-        BackendError::RunnerFailed { error_code, .. } => error_code,
+        BackendError::RunnerFailed { error_code, .. }
+            if matches!(
+                error_code.as_str(),
+                "ENGINE_NOT_INSTALLED"
+                    | "ASSET_HASH_MISMATCH"
+                    | "INPUT_CHANGED"
+                    | "UNSUPPORTED_MEDIA"
+                    | "MEDIA_TOO_LARGE"
+                    | "INSUFFICIENT_DISK"
+                    | "OUTPUT_EXISTS"
+                    | "GPU_UNAVAILABLE"
+                    | "FFPROBE_FAILED"
+                    | "FFMPEG_FAILED"
+                    | "RIFE_FAILED"
+                    | "MUX_FAILED"
+                    | "INVALID_OUTPUT"
+                    | "UPSTREAM_FAILED"
+                    | "CANCELLED"
+            ) =>
+        {
+            error_code
+        }
         BackendError::Cancelled => "CANCELLED",
         _ => "UPSTREAM_FAILED",
     }

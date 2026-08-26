@@ -8,6 +8,7 @@ mod workspace;
 pub use domain::{
     ImageBackend, ImageBatchMetadata, ImageOutputFormat, ImagePreset, ImageSettings,
     JPEG_OUTPUT_QUALITY, JobErrorView, JobKind, JobStatus, JobSummary, MetadataPolicy,
+    RationalRate, VideoBackend, VideoContainer, VideoSettings,
 };
 pub use image_pipeline::{
     Goal1bImageError, ImageMetadata, ImagePipelineLimits, MetadataPolicy as PipelineMetadataPolicy,

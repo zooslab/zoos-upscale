@@ -16,7 +16,7 @@ use zoos_runner_protocol::{
     ImageIntermediateOutputV2, ImageModelId, ImageOutputFormat, ImagePixelFormatV2,
     ImagePreset as ProtocolImagePreset, ImageRunnerInput, ImageRunnerOutput, ImageSemanticModelV2,
     ImageTask, ImageUpscaleJobRequest, ImageUpscaleJobRequestV2, ImageUpscaleParameters,
-    ImageUpscaleParametersV2, RunnerEvent, RunnerInput, RunnerOutput,
+    ImageUpscaleParametersV2, RunnerEvent, RunnerInput, RunnerOutput, VideoInterpolateJobRequest,
 };
 
 use crate::domain::{
@@ -159,6 +159,10 @@ impl WorkspaceStore {
             input_name: Some("input.txt".into()),
             output_path: Some(output_path.clone()),
             image_settings: None,
+            video_settings: None,
+            source_rate: None,
+            target_rate: None,
+            video_container: None,
             batch_id: None,
             batch_index: None,
             batch_total: None,
@@ -196,6 +200,10 @@ impl WorkspaceStore {
             input_name: Some("input.txt".into()),
             output_path: Some(output_path),
             image_settings: None,
+            video_settings: None,
+            source_rate: None,
+            target_rate: None,
+            video_container: None,
             batch_id: None,
             batch_index: None,
             batch_total: None,
@@ -280,6 +288,10 @@ impl WorkspaceStore {
             input_name: Some(input_name.clone()),
             output_path: Some(output_plan.final_path.clone()),
             image_settings: Some(settings),
+            video_settings: None,
+            source_rate: None,
+            target_rate: None,
+            video_container: None,
             batch_id: None,
             batch_index: None,
             batch_total: None,
@@ -334,6 +346,10 @@ impl WorkspaceStore {
             input_name: Some(input_name),
             output_path: Some(output_plan.final_path),
             image_settings: Some(settings),
+            video_settings: None,
+            source_rate: None,
+            target_rate: None,
+            video_container: None,
             batch_id: None,
             batch_index: None,
             batch_total: None,
@@ -536,6 +552,10 @@ impl WorkspaceStore {
                 input_name: Some(input_name.clone()),
                 output_path: Some(final_path.clone()),
                 image_settings: Some(settings),
+                video_settings: None,
+                source_rate: None,
+                target_rate: None,
+                video_container: None,
                 batch_id: batch_id.clone(),
                 batch_index,
                 batch_total,
@@ -555,6 +575,10 @@ impl WorkspaceStore {
                 input_name: Some(input_name),
                 output_path: Some(final_path),
                 image_settings: Some(settings),
+                video_settings: None,
+                source_rate: None,
+                target_rate: None,
+                video_container: None,
                 batch_id,
                 batch_index,
                 batch_total,
@@ -848,8 +872,24 @@ impl WorkspaceStore {
                 }
                 remove_if_exists(&job_dir.join(VERIFICATION_FILE))?;
             }
+            StoredRunnerRequest::VideoInterpolate(_) => {
+                return Err(WorkspaceError::UnsupportedLifecycle(
+                    JobKind::VideoInterpolate,
+                ));
+            }
         }
         Ok(())
+    }
+
+    pub fn prepare_execution(&self, job_id: &str) -> Result<(), WorkspaceError> {
+        let kind = self.load_summary(job_id)?.kind;
+        match kind {
+            JobKind::FakeValidation => Ok(()),
+            JobKind::ImageUpscale => self.recheck_image_input(job_id),
+            JobKind::VideoInterpolate => Err(WorkspaceError::UnsupportedLifecycle(
+                JobKind::VideoInterpolate,
+            )),
+        }
     }
 
     pub fn recheck_image_input(&self, job_id: &str) -> Result<(), WorkspaceError> {
@@ -874,6 +914,20 @@ impl WorkspaceStore {
                 }
             }
             StoredRunnerRequest::Fake(_) => Ok(()),
+            StoredRunnerRequest::VideoInterpolate(_) => Err(WorkspaceError::UnsupportedLifecycle(
+                JobKind::VideoInterpolate,
+            )),
+        }
+    }
+
+    pub fn publish_output(&self, job_id: &str) -> Result<(), WorkspaceError> {
+        let kind = self.load_summary(job_id)?.kind;
+        match kind {
+            JobKind::FakeValidation => Ok(()),
+            JobKind::ImageUpscale => self.publish_image_output(job_id).map(drop),
+            JobKind::VideoInterpolate => Err(WorkspaceError::UnsupportedLifecycle(
+                JobKind::VideoInterpolate,
+            )),
         }
     }
 
@@ -976,6 +1030,9 @@ impl WorkspaceStore {
                 Ok(None)
             }
             StoredRunnerRequest::Fake(_) => Ok(None),
+            StoredRunnerRequest::VideoInterpolate(_) => Err(WorkspaceError::UnsupportedLifecycle(
+                JobKind::VideoInterpolate,
+            )),
         }
     }
 
@@ -1091,6 +1148,10 @@ impl WorkspaceStore {
         if spec.input_name != progress.summary.input_name
             || spec.output_path != progress.summary.output_path
             || spec.image_settings != progress.summary.image_settings
+            || spec.video_settings != progress.summary.video_settings
+            || spec.source_rate != progress.summary.source_rate
+            || spec.target_rate != progress.summary.target_rate
+            || spec.video_container != progress.summary.video_container
             || spec.batch_id != progress.summary.batch_id
             || spec.batch_index != progress.summary.batch_index
             || spec.batch_total != progress.summary.batch_total
@@ -1116,6 +1177,11 @@ impl WorkspaceStore {
                             | (Some(ImageBackend::OrtCpu), "zoos-runner-ort")
                     ) || (progress.summary.selected_backend.is_none()
                         && !job_dir.join(IMAGE_PIPELINE_FILE).exists())) => {}
+            StoredRunnerRequest::VideoInterpolate(_) => {
+                return Err(WorkspaceError::UnsupportedLifecycle(
+                    JobKind::VideoInterpolate,
+                ));
+            }
             _ => return Err(WorkspaceError::UnsafeRunnerRequest),
         }
 
@@ -1177,6 +1243,14 @@ impl WorkspaceStore {
                         "unsupported protocol version: {version}"
                     ))),
                 }
+            }
+            JobKind::VideoInterpolate => {
+                let request: VideoInterpolateJobRequest =
+                    read_json(&job_dir.join(RUNNER_JOB_FILE))?;
+                request
+                    .validate()
+                    .map_err(|error| WorkspaceError::InvalidRunnerContract(error.to_string()))?;
+                Ok(StoredRunnerRequest::VideoInterpolate(request))
             }
         }
     }
@@ -1492,6 +1566,7 @@ fn default_runner_id(kind: JobKind) -> &'static str {
     match kind {
         JobKind::FakeValidation => "zoos-runner-fake",
         JobKind::ImageUpscale => "zoos-runner-realesrgan",
+        JobKind::VideoInterpolate => "zoos-runner-rife",
     }
 }
 
@@ -1794,6 +1869,8 @@ pub enum WorkspaceError {
     InvalidSelectedBackend,
     #[error("batch metadata is invalid")]
     InvalidBatchMetadata,
+    #[error("job lifecycle is not implemented for {0:?}")]
+    UnsupportedLifecycle(JobKind),
     #[error(transparent)]
     Image(#[from] ImageSafetyError),
     #[error(transparent)]

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use schemars::{JsonSchema, schema_for};
 use zoos_runner_protocol::{
     FakeJobRequest, ImageUpscaleJobRequest, ImageUpscaleJobRequestV2, RunnerCapabilities,
-    RunnerEvent,
+    RunnerEvent, VideoInterpolateJobRequest,
 };
 
 fn main() {
@@ -28,6 +28,7 @@ fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Box<dyn std::e
         generated_schema::<RunnerEvent>("event.schema.json")?,
         generated_schema::<FakeJobRequest>("fake-job.schema.json")?,
         generated_schema::<ImageUpscaleJobRequest>("image-upscale-job.schema.json")?,
+        generated_schema::<VideoInterpolateJobRequest>("video-interpolate-job.schema.json")?,
     ];
 
     sync_schemas(&schema_directory, schemas, check)?;

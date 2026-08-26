@@ -124,7 +124,8 @@
       "type": "string",
       "enum": [
         "fake_validation",
-        "image_upscale"
+        "image_upscale",
+        "video_interpolate"
       ]
     },
     "UpstreamInfo": {

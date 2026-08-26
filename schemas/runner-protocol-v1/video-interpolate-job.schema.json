@@ -1,0 +1,303 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "VideoInterpolateJobRequest",
+  "type": "object",
+  "required": [
+    "input",
+    "job_id",
+    "mux_plan",
+    "output",
+    "parameters",
+    "protocol_version",
+    "task",
+    "work"
+  ],
+  "properties": {
+    "input": {
+      "$ref": "#/definitions/VideoRunnerInput"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "mux_plan": {
+      "$ref": "#/definitions/MuxPlan"
+    },
+    "output": {
+      "$ref": "#/definitions/VideoRunnerOutput"
+    },
+    "parameters": {
+      "$ref": "#/definitions/VideoInterpolateParameters"
+    },
+    "protocol_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "task": {
+      "$ref": "#/definitions/RunnerTask"
+    },
+    "work": {
+      "$ref": "#/definitions/VideoWorkPaths"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "MuxPlan": {
+      "type": "object",
+      "required": [
+        "copy_chapters",
+        "copy_metadata",
+        "streams"
+      ],
+      "properties": {
+        "copy_chapters": {
+          "type": "boolean"
+        },
+        "copy_metadata": {
+          "type": "boolean"
+        },
+        "streams": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/MuxStreamPlan"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "MuxStreamAction": {
+      "type": "string",
+      "enum": [
+        "interpolate_video",
+        "copy",
+        "transcode_mov_text"
+      ]
+    },
+    "MuxStreamKind": {
+      "type": "string",
+      "enum": [
+        "video",
+        "audio",
+        "subtitle"
+      ]
+    },
+    "MuxStreamPlan": {
+      "type": "object",
+      "required": [
+        "action",
+        "input_index",
+        "kind"
+      ],
+      "properties": {
+        "action": {
+          "$ref": "#/definitions/MuxStreamAction"
+        },
+        "input_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "kind": {
+          "$ref": "#/definitions/MuxStreamKind"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RationalRate": {
+      "type": "object",
+      "required": [
+        "denominator",
+        "numerator"
+      ],
+      "properties": {
+        "denominator": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1.0
+        },
+        "numerator": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "RifeModel": {
+      "type": "string",
+      "enum": [
+        "rife_v46"
+      ]
+    },
+    "RunnerTask": {
+      "type": "string",
+      "enum": [
+        "fake_validation",
+        "image_upscale",
+        "video_interpolate"
+      ]
+    },
+    "VideoContainer": {
+      "type": "string",
+      "enum": [
+        "mp4",
+        "mov",
+        "mkv"
+      ]
+    },
+    "VideoDevice": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "backend",
+            "index"
+          ],
+          "properties": {
+            "backend": {
+              "type": "string",
+              "enum": [
+                "vulkan"
+              ]
+            },
+            "index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "backend"
+          ],
+          "properties": {
+            "backend": {
+              "type": "string",
+              "enum": [
+                "ncnn_cpu"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "VideoInterpolateParameters": {
+      "type": "object",
+      "required": [
+        "chunk_frames",
+        "device",
+        "frame_count",
+        "model",
+        "scene_threshold_permille",
+        "source_rate",
+        "target_rate"
+      ],
+      "properties": {
+        "chunk_frames": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1.0
+        },
+        "device": {
+          "$ref": "#/definitions/VideoDevice"
+        },
+        "frame_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1.0
+        },
+        "model": {
+          "$ref": "#/definitions/RifeModel"
+        },
+        "scene_threshold_permille": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 1000.0,
+          "minimum": 0.0
+        },
+        "source_rate": {
+          "$ref": "#/definitions/RationalRate"
+        },
+        "target_rate": {
+          "$ref": "#/definitions/RationalRate"
+        }
+      },
+      "additionalProperties": false
+    },
+    "VideoRunnerInput": {
+      "type": "object",
+      "required": [
+        "container",
+        "height",
+        "path",
+        "sha256",
+        "width"
+      ],
+      "properties": {
+        "container": {
+          "$ref": "#/definitions/VideoContainer"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1.0
+        },
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "VideoRunnerOutput": {
+      "type": "object",
+      "required": [
+        "container",
+        "path"
+      ],
+      "properties": {
+        "container": {
+          "$ref": "#/definitions/VideoContainer"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "VideoWorkPaths": {
+      "type": "object",
+      "required": [
+        "input_frames",
+        "output_frames",
+        "root"
+      ],
+      "properties": {
+        "input_frames": {
+          "type": "string"
+        },
+        "output_frames": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const IMAGE_PROTOCOL_VERSION_V2: u32 = 2;
+pub const VIDEO_PROTOCOL_VERSION: u32 = 1;
 pub const EVENT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -157,6 +158,233 @@ impl ImageUpscaleJobRequestV2 {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VideoInterpolateJobRequest {
+    pub protocol_version: u32,
+    pub job_id: String,
+    pub task: RunnerTask,
+    pub input: VideoRunnerInput,
+    pub output: VideoRunnerOutput,
+    pub work: VideoWorkPaths,
+    pub parameters: VideoInterpolateParameters,
+    pub mux_plan: MuxPlan,
+}
+
+impl VideoInterpolateJobRequest {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.protocol_version != VIDEO_PROTOCOL_VERSION {
+            return Err(ContractError::UnsupportedProtocol(self.protocol_version));
+        }
+        if self.job_id.trim().is_empty() {
+            return Err(ContractError::EmptyJobId);
+        }
+        if self.task != RunnerTask::VideoInterpolate {
+            return Err(ContractError::InvalidVideoParameter("task"));
+        }
+        if self.input.path == self.output.path {
+            return Err(ContractError::InvalidVideoParameter("output.path"));
+        }
+        for (name, path) in [
+            ("input", &self.input.path),
+            ("output", &self.output.path),
+            ("work.root", &self.work.root),
+            ("work.input_frames", &self.work.input_frames),
+            ("work.output_frames", &self.work.output_frames),
+        ] {
+            if !path.is_absolute() {
+                return Err(ContractError::RelativePath(name));
+            }
+        }
+        if self.work.input_frames == self.work.output_frames
+            || !self.work.input_frames.starts_with(&self.work.root)
+            || !self.work.output_frames.starts_with(&self.work.root)
+        {
+            return Err(ContractError::InvalidVideoParameter("work"));
+        }
+        validate_sha256(&self.input.sha256)
+            .map_err(|_| ContractError::InvalidVideoParameter("input.sha256"))?;
+        if self.input.width == 0 || self.input.height == 0 {
+            return Err(ContractError::InvalidVideoParameter("input dimensions"));
+        }
+        self.parameters.source_rate.validate("source_rate")?;
+        self.parameters.target_rate.validate("target_rate")?;
+        let doubled_numerator = u64::from(self.parameters.source_rate.numerator)
+            .checked_mul(2)
+            .ok_or(ContractError::InvalidVideoParameter("target_rate"))?;
+        let target_cross = u64::from(self.parameters.target_rate.numerator)
+            .checked_mul(u64::from(self.parameters.source_rate.denominator))
+            .ok_or(ContractError::InvalidVideoParameter("target_rate"))?;
+        let source_cross = doubled_numerator
+            .checked_mul(u64::from(self.parameters.target_rate.denominator))
+            .ok_or(ContractError::InvalidVideoParameter("target_rate"))?;
+        if target_cross != source_cross {
+            return Err(ContractError::InvalidVideoParameter("target_rate"));
+        }
+        if self.parameters.frame_count == 0 {
+            return Err(ContractError::InvalidVideoParameter("frame_count"));
+        }
+        if self.parameters.chunk_frames == 0 {
+            return Err(ContractError::InvalidVideoParameter("chunk_frames"));
+        }
+        if self.parameters.scene_threshold_permille > 1_000 {
+            return Err(ContractError::InvalidVideoParameter(
+                "scene_threshold_permille",
+            ));
+        }
+        if matches!(self.parameters.device, VideoDevice::Vulkan { index } if index != 0) {
+            return Err(ContractError::InvalidVideoParameter("device"));
+        }
+        self.mux_plan.validate()?;
+        if self.input.container != self.output.container {
+            return Err(ContractError::InvalidVideoParameter("output.container"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VideoRunnerInput {
+    pub path: PathBuf,
+    #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+    pub sha256: String,
+    #[schemars(range(min = 1))]
+    pub width: u32,
+    #[schemars(range(min = 1))]
+    pub height: u32,
+    pub container: VideoContainer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VideoRunnerOutput {
+    pub path: PathBuf,
+    pub container: VideoContainer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VideoWorkPaths {
+    pub root: PathBuf,
+    pub input_frames: PathBuf,
+    pub output_frames: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoContainer {
+    Mp4,
+    Mov,
+    Mkv,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RationalRate {
+    #[schemars(range(min = 1))]
+    pub numerator: u32,
+    #[schemars(range(min = 1))]
+    pub denominator: u32,
+}
+
+impl RationalRate {
+    fn validate(&self, field: &'static str) -> Result<(), ContractError> {
+        if self.numerator == 0 || self.denominator == 0 {
+            Err(ContractError::InvalidVideoParameter(field))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VideoInterpolateParameters {
+    pub source_rate: RationalRate,
+    pub target_rate: RationalRate,
+    #[schemars(range(min = 1))]
+    pub frame_count: u64,
+    #[schemars(range(min = 1))]
+    pub chunk_frames: u32,
+    #[schemars(range(max = 1000))]
+    pub scene_threshold_permille: u16,
+    pub model: RifeModel,
+    pub device: VideoDevice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RifeModel {
+    RifeV46,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VideoDevice {
+    Vulkan { index: u32 },
+    NcnnCpu,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MuxPlan {
+    pub streams: Vec<MuxStreamPlan>,
+    pub copy_metadata: bool,
+    pub copy_chapters: bool,
+}
+
+impl MuxPlan {
+    fn validate(&self) -> Result<(), ContractError> {
+        if self.streams.is_empty() {
+            return Err(ContractError::InvalidVideoParameter("mux_plan.streams"));
+        }
+        let mut indices = std::collections::HashSet::new();
+        let mut interpolated_video_count = 0;
+        for stream in &self.streams {
+            if !indices.insert(stream.input_index) {
+                return Err(ContractError::InvalidVideoParameter("mux_plan.input_index"));
+            }
+            match stream.action {
+                MuxStreamAction::InterpolateVideo if stream.kind == MuxStreamKind::Video => {
+                    interpolated_video_count += 1;
+                }
+                MuxStreamAction::TranscodeMovText if stream.kind == MuxStreamKind::Subtitle => {}
+                MuxStreamAction::Copy if stream.kind != MuxStreamKind::Video => {}
+                _ => return Err(ContractError::InvalidVideoParameter("mux_plan.action")),
+            }
+        }
+        if interpolated_video_count != 1 {
+            return Err(ContractError::InvalidVideoParameter("mux_plan.video"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MuxStreamPlan {
+    pub input_index: u32,
+    pub kind: MuxStreamKind,
+    pub action: MuxStreamAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MuxStreamKind {
+    Video,
+    Audio,
+    Subtitle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MuxStreamAction {
+    InterpolateVideo,
+    Copy,
+    TranscodeMovText,
 }
 
 fn validate_sha256(value: &str) -> Result<(), ContractError> {
@@ -532,6 +760,7 @@ pub enum RunnerTask {
     #[serde(alias = "fake")]
     FakeValidation,
     ImageUpscale,
+    VideoInterpolate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -594,7 +823,8 @@ impl RunnerCapabilities {
         if self.tasks.is_empty() {
             return Err(ContractError::EmptyTasks);
         }
-        if self.tasks.contains(&RunnerTask::ImageUpscale)
+        if (self.tasks.contains(&RunnerTask::ImageUpscale)
+            || self.tasks.contains(&RunnerTask::VideoInterpolate))
             && (self.upstream.is_none()
                 || self.models.is_empty()
                 || self.scales.is_empty()
@@ -644,6 +874,7 @@ pub enum ContractError {
     InvalidDelay(u64),
     InvalidScale(u8),
     InvalidImageParameter(&'static str),
+    InvalidVideoParameter(&'static str),
     RelativePath(&'static str),
     EmptyRunnerId,
     EmptyRunnerVersion,
@@ -665,6 +896,12 @@ impl std::fmt::Display for ContractError {
             Self::InvalidScale(scale) => write!(formatter, "scale must be 2 or 4: {scale}"),
             Self::InvalidImageParameter(field) => {
                 write!(formatter, "image upscale parameter is invalid: {field}")
+            }
+            Self::InvalidVideoParameter(field) => {
+                write!(
+                    formatter,
+                    "video interpolation parameter is invalid: {field}"
+                )
             }
             Self::RelativePath(field) => write!(formatter, "{field} path must be absolute"),
             Self::EmptyRunnerId => formatter.write_str("runner_id must not be empty"),
@@ -719,6 +956,62 @@ impl std::error::Error for EventContractError {}
 mod tests {
     use super::*;
 
+    fn video_request() -> VideoInterpolateJobRequest {
+        let root = std::env::current_dir().expect("current directory must be absolute");
+        VideoInterpolateJobRequest {
+            protocol_version: VIDEO_PROTOCOL_VERSION,
+            job_id: "video-job-1".into(),
+            task: RunnerTask::VideoInterpolate,
+            input: VideoRunnerInput {
+                path: root.join("input.mkv"),
+                sha256: "a".repeat(64),
+                width: 1920,
+                height: 1080,
+                container: VideoContainer::Mkv,
+            },
+            output: VideoRunnerOutput {
+                path: root.join(".output.partial.mkv"),
+                container: VideoContainer::Mkv,
+            },
+            work: VideoWorkPaths {
+                root: root.join("work"),
+                input_frames: root.join("work/input-frames"),
+                output_frames: root.join("work/output-frames"),
+            },
+            parameters: VideoInterpolateParameters {
+                source_rate: RationalRate {
+                    numerator: 30_000,
+                    denominator: 1_001,
+                },
+                target_rate: RationalRate {
+                    numerator: 60_000,
+                    denominator: 1_001,
+                },
+                frame_count: 1_800,
+                chunk_frames: 120,
+                scene_threshold_permille: 350,
+                model: RifeModel::RifeV46,
+                device: VideoDevice::Vulkan { index: 0 },
+            },
+            mux_plan: MuxPlan {
+                streams: vec![
+                    MuxStreamPlan {
+                        input_index: 0,
+                        kind: MuxStreamKind::Video,
+                        action: MuxStreamAction::InterpolateVideo,
+                    },
+                    MuxStreamPlan {
+                        input_index: 1,
+                        kind: MuxStreamKind::Audio,
+                        action: MuxStreamAction::Copy,
+                    },
+                ],
+                copy_metadata: true,
+                copy_chapters: true,
+            },
+        }
+    }
+
     #[test]
     fn event_serialization_keeps_common_and_tagged_fields() {
         let event = RunnerEvent::new(
@@ -743,6 +1036,78 @@ mod tests {
         assert_eq!(value["event"], "progress");
         assert_eq!(value["sequence"], 2);
         event.validate("job-1", 2).expect("event must validate");
+    }
+
+    #[test]
+    fn video_job_round_trips_with_exact_rational_rate_and_mux_plan() {
+        let request = video_request();
+        request.validate().expect("video request must validate");
+        let value = serde_json::to_value(&request).expect("request must serialize");
+        assert_eq!(value["task"], "video_interpolate");
+        assert_eq!(value["parameters"]["model"], "rife_v46");
+        assert_eq!(value["parameters"]["target_rate"]["numerator"], 60_000);
+        assert_eq!(
+            value["mux_plan"]["streams"][0]["action"],
+            "interpolate_video"
+        );
+        let round_trip: VideoInterpolateJobRequest =
+            serde_json::from_value(value).expect("request must deserialize");
+        assert_eq!(round_trip, request);
+    }
+
+    #[test]
+    fn video_job_rejects_non_double_rate_and_invalid_mux_actions() {
+        let mut request = video_request();
+        request.parameters.target_rate.numerator = 60;
+        request.parameters.target_rate.denominator = 1;
+        assert_eq!(
+            request.validate(),
+            Err(ContractError::InvalidVideoParameter("target_rate"))
+        );
+
+        let mut request = video_request();
+        request.mux_plan.streams[1].action = MuxStreamAction::InterpolateVideo;
+        assert_eq!(
+            request.validate(),
+            Err(ContractError::InvalidVideoParameter("mux_plan.action"))
+        );
+    }
+
+    #[test]
+    fn video_job_schema_denies_unknown_fields() {
+        let mut value = serde_json::to_value(video_request()).expect("request must serialize");
+        value["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<VideoInterpolateJobRequest>(value).is_err());
+    }
+
+    #[test]
+    fn video_capabilities_require_model_scale_and_device_evidence() {
+        let capabilities = RunnerCapabilities {
+            protocol_version: PROTOCOL_VERSION,
+            runner_id: "zoos-runner-rife".into(),
+            runner_version: "0.1.0".into(),
+            tasks: vec![RunnerTask::VideoInterpolate],
+            upstream: Some(UpstreamInfo {
+                name: "rife-ncnn-vulkan".into(),
+                version: "20221029".into(),
+                source_commit: None,
+            }),
+            models: vec![ModelCapability {
+                id: "rife-v4.6".into(),
+                scales: vec![2],
+            }],
+            scales: vec![2],
+            devices: vec![DeviceCapability {
+                index: 0,
+                name: "Apple M5".into(),
+                backend: "vulkan".into(),
+            }],
+            test_behaviors: Vec::new(),
+        };
+
+        capabilities
+            .validate()
+            .expect("complete video capabilities must validate");
     }
 
     #[test]

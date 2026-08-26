@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use zoos_runner_protocol::{
     FakeBehavior, FakeJobRequest, ImageUpscaleJobRequest, ImageUpscaleJobRequestV2,
+    VideoInterpolateJobRequest,
 };
+pub use zoos_runner_protocol::{RationalRate, VideoContainer};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -11,6 +13,22 @@ pub enum JobKind {
     #[default]
     FakeValidation,
     ImageUpscale,
+    VideoInterpolate,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoBackend {
+    #[default]
+    Auto,
+    VulkanGpu,
+    NcnnCpu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoSettings {
+    #[serde(default)]
+    pub backend: VideoBackend,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +133,14 @@ pub struct JobSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_settings: Option<ImageSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_settings: Option<VideoSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rate: Option<RationalRate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_rate: Option<RationalRate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_container: Option<VideoContainer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_index: Option<u32>,
@@ -145,6 +171,14 @@ pub(crate) struct ProductJobSpec {
     pub output_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_settings: Option<ImageSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_settings: Option<VideoSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rate: Option<RationalRate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_rate: Option<RationalRate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_container: Option<VideoContainer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -237,6 +271,7 @@ pub(crate) enum StoredRunnerRequest {
     Fake(FakeJobRequest),
     ImageUpscale(ImageUpscaleJobRequest),
     ImageUpscaleV2(ImageUpscaleJobRequestV2),
+    VideoInterpolate(VideoInterpolateJobRequest),
 }
 
 impl StoredRunnerRequest {
@@ -245,6 +280,17 @@ impl StoredRunnerRequest {
             Self::Fake(request) => &request.output.path,
             Self::ImageUpscale(request) => &request.output.path,
             Self::ImageUpscaleV2(request) => &request.output.path,
+            Self::VideoInterpolate(request) => &request.output.path,
+        }
+    }
+
+    pub fn expected_task(&self) -> zoos_runner_protocol::RunnerTask {
+        match self {
+            Self::Fake(_) => zoos_runner_protocol::RunnerTask::FakeValidation,
+            Self::ImageUpscale(_) | Self::ImageUpscaleV2(_) => {
+                zoos_runner_protocol::RunnerTask::ImageUpscale
+            }
+            Self::VideoInterpolate(_) => zoos_runner_protocol::RunnerTask::VideoInterpolate,
         }
     }
 }

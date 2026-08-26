@@ -6,8 +6,8 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, watch};
 use zoos_runner_protocol::{
-    FakeBehavior, ImageDeviceV2, ImageModelId, ImageSemanticModelV2, RunnerCapabilities,
-    RunnerEvent, RunnerEventPayload, RunnerTask,
+    FakeBehavior, ImageDeviceV2, ImageModelId, ImageSemanticModelV2, RifeModel, RunnerCapabilities,
+    RunnerEvent, RunnerEventPayload, VideoDevice,
 };
 
 use crate::domain::{
@@ -245,7 +245,7 @@ impl JobOrchestrator {
                 return;
             }
         };
-        if let Err(error) = self.inner.store.recheck_image_input(&job_id) {
+        if let Err(error) = self.inner.store.prepare_execution(&job_id) {
             self.finish_with_workspace_error(&job_id, &error, started_at_ms)
                 .await;
             return;
@@ -448,7 +448,7 @@ impl JobOrchestrator {
         exit_code: Option<i32>,
         started_at_ms: u64,
     ) -> Result<(), WorkspaceError> {
-        self.inner.store.publish_image_output(job_id)?;
+        self.inner.store.publish_output(job_id)?;
         self.inner
             .store
             .finish_manifest(job_id, "completed", exit_code, started_at_ms)?;
@@ -490,6 +490,7 @@ impl JobOrchestrator {
         let code = match kind {
             JobKind::FakeValidation => error.code(),
             JobKind::ImageUpscale => image_backend_error_code(error),
+            JobKind::VideoInterpolate => video_backend_error_code(error),
         }
         .to_owned();
         let message = error.user_message();
@@ -515,22 +516,21 @@ impl JobOrchestrator {
         started_at_ms: u64,
     ) -> Result<(), WorkspaceError> {
         let cleanup = self.inner.store.cleanup_unverified_output(job_id);
-        let image_job = self.inner.store.load_summary(job_id)?.kind == JobKind::ImageUpscale;
+        let kind = self.inner.store.load_summary(job_id)?.kind;
         let progress = self.inner.store.update_summary(job_id, |summary| {
             summary.status = JobStatus::Failed;
             summary.stage = None;
             summary.message = "Validation failed".into();
             summary.error = Some(JobErrorView {
-                code: if image_job {
-                    "UPSTREAM_FAILED"
-                } else {
-                    "INTERNAL_ERROR"
+                code: match kind {
+                    JobKind::FakeValidation => "INTERNAL_ERROR",
+                    JobKind::ImageUpscale | JobKind::VideoInterpolate => "UPSTREAM_FAILED",
                 }
                 .into(),
-                message: if image_job {
-                    "The local image engine failed unexpectedly."
-                } else {
-                    "An internal error interrupted the validation run."
+                message: match kind {
+                    JobKind::FakeValidation => "An internal error interrupted the validation run.",
+                    JobKind::ImageUpscale => "The local image engine failed unexpectedly.",
+                    JobKind::VideoInterpolate => "The local video engine failed unexpectedly.",
                 }
                 .into(),
             });
@@ -575,15 +575,24 @@ fn image_backend_error_code(error: &BackendError) -> &str {
     }
 }
 
+fn video_backend_error_code(error: &BackendError) -> &str {
+    match error {
+        BackendError::InvalidRunnerPath
+        | BackendError::RunnerNotRegistered(_)
+        | BackendError::SpawnFailed(_) => "ENGINE_NOT_INSTALLED",
+        BackendError::ProbeFailed(_) => "ASSET_HASH_MISMATCH",
+        BackendError::RunnerFailed { error_code, .. } => error_code,
+        BackendError::Cancelled => "CANCELLED",
+        _ => "UPSTREAM_FAILED",
+    }
+}
+
 fn validate_capabilities(
     stored: &crate::domain::StoredJob,
     capabilities: &RunnerCapabilities,
     launch: &RunnerLaunchSpec,
 ) -> Result<(), BackendError> {
-    let expected_task = match stored.progress.summary.kind {
-        JobKind::FakeValidation => RunnerTask::FakeValidation,
-        JobKind::ImageUpscale => RunnerTask::ImageUpscale,
-    };
+    let expected_task = stored.runner_request.expected_task();
     if !capabilities.tasks.contains(&expected_task) {
         return Err(BackendError::ProbeFailed(format!(
             "runner {} does not support {expected_task:?}",
@@ -615,6 +624,16 @@ fn validate_capabilities(
                     ImageDeviceV2::Cpu => (&["cpu", "ort_cpu", "onnxruntime"], None),
                 };
                 (model_ids, request.parameters.native_scale, backends, index)
+            }
+            StoredRunnerRequest::VideoInterpolate(request) => {
+                let model_ids: &[&str] = match request.parameters.model {
+                    RifeModel::RifeV46 => &["rife-v4.6", "rife_v4_6"],
+                };
+                let (backends, index): (&[&str], Option<u32>) = match request.parameters.device {
+                    VideoDevice::Vulkan { index } => (&["vulkan"], Some(index)),
+                    VideoDevice::NcnnCpu => (&["cpu", "ncnn_cpu"], None),
+                };
+                (model_ids, 2, backends, index)
             }
             StoredRunnerRequest::Fake(_) => return Ok(()),
         };
@@ -662,7 +681,7 @@ pub enum OrchestratorError {
 mod tests {
     use super::*;
     use image::{ImageFormat, Rgb, RgbImage};
-    use zoos_runner_protocol::{DeviceCapability, ModelCapability, UpstreamInfo};
+    use zoos_runner_protocol::{DeviceCapability, ModelCapability, RunnerTask, UpstreamInfo};
 
     #[test]
     fn image_safety_failure_keeps_its_structured_error_code() {

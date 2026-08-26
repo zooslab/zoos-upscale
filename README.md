@@ -1,164 +1,157 @@
 # Zoos Upscale
 
-> 사진과 영상을 더 선명하고 부드럽게 만드는 로컬 AI 업스케일러
+> 사진과 영상을 내 컴퓨터에서 선명하고 부드럽게 만드는 로컬 AI 업스케일러
 
-**현재 상태: Goal 0 기본 실행 경로 완료 · 이미지 MVP 준비 중**
+**현재 상태: Goal 0 + Goal 1A 구현 완료 · Apple M5 이미지 업스케일 검증 완료**
 
 > [!IMPORTANT]
-> 아직 다운로드할 수 있는 배포본은 없습니다. 현재는 제품 설계를 마치고 첫 구현을 진행하는 단계입니다.
+> 아직 일반 사용자가 내려받을 수 있는 배포본은 없습니다. 개발 환경에서는 사진 한 장을 실제로 업스케일할 수 있지만, 엔진과 모델 가중치의 재배포 권리를 확인하기 전까지 공개 앱 번들에는 이를 넣지 않습니다.
 
-## 어떤 프로그램인가요?
+## 지금 할 수 있는 일
 
-Zoos Upscale은 사진과 영상을 내 컴퓨터에서 직접 개선하는 데스크톱 앱입니다.
+현재 개발 버전의 범위는 일부러 작게 잡았습니다.
 
-- 작은 사진을 2배·4배로 선명하게 확대
-- 영상을 FHD·4K 해상도로 업스케일
-- 30 FPS 영상을 60 FPS처럼 부드럽게 보간
-- 여러 파일을 차례로 처리하고 중단된 작업을 이어서 진행
-- 원본은 건드리지 않고 결과를 새 파일로 저장
+| 항목 | 현재 지원 |
+|---|---|
+| 입력 | RGB 8-bit PNG 또는 JPEG 한 장 |
+| 프리셋 | 사진 / 애니·일러스트 |
+| 배율 | 2배 / 4배 |
+| AI 엔진 | Real-ESRGAN ncnn/Vulkan, GPU 0 |
+| 출력 | 원본 옆 `Upscaled/` 폴더의 새 PNG |
+| 검증 장치 | Apple M5 |
 
-파일을 외부 서버에 올리지 않고 사용자의 컴퓨터에서 처리하는 것을 기본 원칙으로 합니다.
+Apple M5에서 `사진·애니 × 2배·4배 × PNG·JPEG` 8개 조합을 각각 3회 실행했습니다. 모든 결과가 정확한 크기와 RGB8 형식이었고, 원본 SHA-256은 변하지 않았으며, 반복 결과는 커밋된 골든 이미지와 픽셀 단위로 같았습니다.
 
-## 더 자세히 알아보기
+아직 지원하지 않는 항목은 다음 단계에서 추가합니다.
 
-개발 구조와 기술 선택이 궁금하다면 [기술 아키텍처 문서](ARCHITECTURE.md)를 참고하세요.
-
-- 애플리케이션과 실행 엔진의 구성
-- 이미지·영상 데이터 흐름
-- 작업 중단·복구와 안전한 출력 방식
-- AI 모델 및 하드웨어 백엔드 후보군
-- 후보 기술을 실제 지원으로 승격하는 검증 기준
-
-## 어떻게 만들어지나요?
-
-화면과 AI 엔진을 분리해, 화면이 멈추거나 엔진 하나가 실패해도 앱 전체가 함께 망가지지 않도록 만듭니다.
-
-```mermaid
-flowchart LR
-    UI["가볍고 단순한 화면<br/>Tauri · Svelte"] --> CMD["허용된 요청만 전달"]
-    CMD --> CORE["Rust 작업 관리자<br/>진행 · 취소 · 복구"]
-    CORE --> ENGINE["검증된 로컬 엔진<br/>FFmpeg · ncnn · ONNX Runtime"]
-    TOOLS["Python · uv<br/>모델 준비 도구"] -. 개발할 때만 사용 .-> ENGINE
-```
-
-사용자에게 배포하는 앱에는 Python을 포함하지 않습니다. AI 모델을 준비하고 품질을 검사하는 개발 도구에서만 Python과 `uv`를 사용합니다.
+- 알파 채널, 회색조, 16-bit 이미지
+- 회전 정보가 적용되지 않은 EXIF orientation
+- 여러 파일 일괄 처리와 metadata·ICC·EXIF 보존
+- GPU가 없을 때 사용하는 ONNX Runtime CPU 경로
+- 영상 업스케일과 프레임 보간
+- Windows·Linux 및 NVIDIA·AMD GPU 공식 검증
 
 ## 사용 흐름
 
 ```mermaid
 flowchart LR
-    A["사진·영상 선택"] --> B["원하는 결과 선택<br/>2배 · 4K · 60 FPS"]
-    B --> C["내 컴퓨터에서<br/>AI 처리"]
-    C --> D["Upscaled 폴더에<br/>새 파일 저장"]
+    A["사진 또는 애니 선택"] --> B["2배 또는 4배 선택"]
+    B --> C["이미지 선택<br/>즉시 자동 시작"]
+    C --> D["내 컴퓨터의 GPU로 처리"]
+    D --> E["Upscaled 폴더에<br/>안전한 새 PNG 저장"]
 ```
 
-사용자는 복잡한 AI 모델이나 GPU 설정 대신 원하는 결과만 선택합니다.
+사용자는 모델 이름이나 GPU 옵션을 다룰 필요가 없습니다.
 
-1. 사진이나 영상을 끌어다 놓습니다.
-2. 원하는 해상도와 FPS를 선택합니다.
-3. **처리 시작**을 누릅니다.
-4. 완료된 파일을 확인합니다.
+1. **사진** 또는 **애니**를 고릅니다.
+2. **2배** 또는 **4배**를 고릅니다.
+3. **이미지 선택**을 누릅니다.
+4. 진행률을 확인하거나 작업을 취소합니다.
+5. 완료 화면에 표시된 결과 경로를 확인합니다.
 
-## 중요하게 생각하는 것
+## 파일을 어떻게 지키나요?
 
-### 쉽고 단순하게
+- 작업 시작 직전과 결과 공개 직전에 원본 SHA-256을 다시 확인합니다.
+- AI가 만드는 파일은 숨겨진 `.partial.png`에 먼저 저장합니다.
+- PNG 형식, RGB8, 정확한 배율, 비어 있지 않은 픽셀을 검증한 뒤에만 최종 이름으로 바꿉니다.
+- 기존 결과와 이름이 겹치면 `_2`부터 새 이름을 찾고, 마지막 순간에 충돌해도 기존 파일을 덮어쓰지 않습니다.
+- 실패·취소·강제 종료 후에는 이 작업이 소유한 partial과 미검증 결과를 정리합니다.
+- 손상된 작업 기록은 삭제하지 않고 `quarantine/`으로 격리해 다른 작업과 앱 실행을 보호합니다.
 
-처음 사용하는 사람도 별도 공부 없이 바로 처리할 수 있는 화면을 목표로 합니다.
+결과에는 입력 전후 hash, 출력 hash·형식·크기를 담은 `verification.json` 기록이 남습니다.
 
-### 내 컴퓨터에서 안전하게
+## 어떻게 만들어졌나요?
 
-파일과 AI 처리는 기본적으로 모두 로컬에서 진행하며, 텔레메트리는 기본 비활성화할 계획입니다.
-
-### 원본을 그대로
-
-원본 파일은 수정하지 않습니다. 처리가 끝난 결과만 별도의 `Upscaled` 폴더에 저장합니다.
-
-### 실패해도 다시 처음부터 하지 않게
-
-긴 영상은 작은 구간으로 나누어 처리하고, 중단되더라도 확인된 지점부터 이어서 처리할 수 있도록 설계하고 있습니다.
-
-## 개발 로드맵
-
-개발은 **Apple Silicon Mac에서 하나의 완성된 경로를 먼저 만든 뒤** 다른 GPU 환경으로 확장합니다.
+화면, 작업 관리자, AI 엔진을 분리했습니다. 화면에는 파일 시스템이나 shell 권한을 주지 않고, Rust만 네이티브 파일 선택창과 실행 경로를 다룹니다.
 
 ```mermaid
-flowchart TB
-    A["1. 제품 설계<br/>완료"] --> B["2. Tauri · Rust · Svelte<br/>Apache-2.0 확정"]
-    B --> C["3. Apple M5 엔진 확인<br/>Real-ESRGAN · RIFE 완료"]
-    C --> D["4. Tauri 앱 · Fake Runner<br/>기본 경로 완료"]
-    D --> E["5. 이미지 MVP<br/>GPU + CPU"]
-    E --> F["6. 영상 처리<br/>FFmpeg + RIFE"]
-    F --> G["7. Queue · 복구 · Preview<br/>macOS 첫 Beta"]
-
-    G --> I["공통 Backend 기준선<br/>ncnn/Vulkan + ORT CPU"]
-    I --> N["NVIDIA 노트북 검증"]
-    I --> M["AMD 노트북 검증"]
-    N -. 성능 부족이 입증될 때 .-> NV["CUDA · TensorRT 후보"]
-    M -. 성능 부족이 입증될 때 .-> AM["Windows ML · ROCm 후보"]
+flowchart LR
+    UI["Tauri · Svelte 화면"] -->|"허용된 명령만"| CORE["Rust 작업 관리자<br/>검증 · 진행 · 취소 · 복구"]
+    CORE -->|"절대 경로 · 고정 인자"| WRAP["Rust Real-ESRGAN wrapper"]
+    WRAP -->|"개발 캐시의 검증된 파일"| GPU["Real-ESRGAN ncnn/Vulkan<br/>Apple M5 GPU 0"]
+    TOOLS["Python · uv"] -. "모델 연구 도구만" .-> CORE
 ```
 
-- [x] 제품 범위와 기본 사용 흐름 설계
-- [x] 이미지·영상 처리 방식 설계
-- [x] 작업 중단·복구 및 원본 보호 정책 설계
-- [x] Tauri·Rust·Svelte 생산 스택과 Apache-2.0 라이선스 확정
-- [x] Apple M5에서 Real-ESRGAN·RIFE native 엔진 1차 검증
-- [x] 데스크톱 기본 화면과 native Fake Runner 성공·실패·timeout·취소 검증
-- [ ] FFmpeg를 포함한 Mac 개발 환경 완성
-- [ ] 실제 이미지 업스케일
-- [ ] GPU 실패 시 CPU 처리
-- [ ] 영상 프레임 보간과 업스케일
-- [ ] macOS Apple Silicon Beta
-- [ ] NVIDIA·AMD 노트북에서 공통 Backend 검증
-- [ ] 필요성이 입증된 하드웨어 전용 최적화
+제품 실행에는 Python이 필요하지 않습니다. Python과 `uv`는 모델 준비·품질 평가를 위한 개발 도구에서만 사용합니다.
 
-NVIDIA 장치가 있어도 처음부터 CUDA 전용 구현을 만들지 않습니다. 먼저 모든 장치에서 같은 ncnn/Vulkan 경로를 검증하고, 실제 benchmark에서 필요성이 확인된 경우에만 제조사별 Backend를 추가합니다.
-
-## 지원 예정 플랫폼
-
-1. **macOS Apple Silicon** — 첫 번째 Beta 목표
-2. **Windows x64**
-3. **Linux x64**
-
-실제 장치에서 검증하지 않은 환경은 지원된다고 표시하지 않을 예정입니다.
+세부 구조도, 데이터 흐름, 모델·백엔드 후보와 검증 기준은 [기술 아키텍처 문서](ARCHITECTURE.md)에 정리했습니다.
 
 ## 개발 환경에서 실행
 
-현재 검증 기준은 Node.js 22.22.3, pnpm 11.19.0, Rust 1.96.0입니다. 각 버전은 저장소의 설정과 lockfile로 고정됩니다.
+현재 검증 기준은 macOS Apple Silicon, Node.js 22.22.3, pnpm 11.19.0, Rust 1.96.0입니다.
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm tauri dev
+pnpm engine:fetch
+pnpm app:dev
 ```
 
-Goal 0 개발 화면에서 정상 완료, 실패 처리, 응답 없음·취소를 직접 재현할 수 있습니다. 전체 검증은 다음 명령으로 실행합니다.
+엔진 자산 다운로드는 `pnpm engine:fetch`에서만 수행합니다. 이 명령은 공식 Real-ESRGAN macOS v0.2.5.0 패키지의 hash를 검증하고 필요한 실행기 1개와 모델 파일 4개만 `.cache/runtime-assets/`에 설치합니다. 빌드와 앱 실행은 자산을 자동 다운로드하지 않으며, 캐시는 Git과 공개 앱 번들에 포함되지 않습니다.
+
+주요 자동 검증은 다음과 같습니다.
 
 ```bash
 pnpm check
 pnpm test
+pnpm license:check
+cargo fmt --all -- --check
+cargo xtask schema --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+cargo deny check
 ```
 
-모델 개발 도구는 제품과 분리된 uv 환경을 사용합니다.
+Apple M5 실기 게이트는 [테스트 안내](tests/hardware/README.md)를 참고하세요. 기본 CI에서는 실제 GPU·로컬 모델을 요구하지 않도록 이 테스트를 제외합니다.
+
+모델 연구 도구는 제품과 분리된 uv 환경을 사용합니다.
 
 ```bash
 uv sync --project tools/model --locked
 ```
 
+## 개발 로드맵
+
+```mermaid
+flowchart TB
+    G0["Goal 0<br/>계약 · 작업공간 · Fake Runner<br/>완료"] --> G1A["Goal 1A<br/>M5 단일 이미지 GPU 경로<br/>완료"]
+    G1A --> G1B["Goal 1B<br/>ORT CPU · Batch · Alpha · Metadata"]
+    G1B --> G2["Goal 2<br/>FFmpeg · RIFE 프레임 보간"]
+    G2 --> G3["Goal 3<br/>영상 업스케일"]
+    G3 --> BETA["macOS Apple Silicon Beta"]
+    BETA --> NV["NVIDIA 노트북 검증"]
+    BETA --> AMD["AMD 노트북 검증"]
+    NV -. "필요성이 입증될 때" .-> CUDA["TensorRT·CUDA 후보"]
+    AMD -. "필요성이 입증될 때" .-> ROCM["Windows ML·ROCm 후보"]
+```
+
+- [x] Tauri·Rust·Svelte 생산 스택과 Apache-2.0 라이선스 확정
+- [x] 범용 작업 계약, schema 생성, 안전한 작업공간과 손상 격리
+- [x] Real-ESRGAN 자산 catalog·hash 검증·라이선스 배포 게이트
+- [x] 단일 RGB8 PNG/JPEG 사진·애니 2배·4배 GPU 업스케일
+- [x] Apple M5 실제 Vulkan 회귀·취소 게이트
+- [ ] Goal 1B CPU fallback·일괄 처리·alpha·metadata
+- [ ] 영상 프레임 보간과 업스케일
+- [ ] 서명·notarization을 포함한 macOS Beta
+- [ ] NVIDIA·AMD 노트북의 공통 Vulkan·CPU 경로 검증
+
 ## 자주 묻는 질문
 
 ### 지금 사용할 수 있나요?
 
-아직은 사용할 수 없습니다. 첫 목표는 사진 한 장을 실제로 업스케일할 수 있는 최소 버전을 만드는 것입니다.
+개발 환경에서는 사용할 수 있습니다. 일반 사용자를 위한 서명된 설치 파일은 아직 없으며, 엔진과 모델 가중치도 공개 앱에 포함하지 않습니다.
 
 ### 파일이 인터넷으로 전송되나요?
 
-기본 동작에서는 전송하지 않습니다. 파일과 AI 처리는 로컬에서 수행하는 것을 원칙으로 합니다.
+아니요. 이미지 선택과 AI 처리는 로컬에서 진행합니다. 엔진 자산은 개발자가 명시적으로 `pnpm engine:fetch`를 실행할 때만 고정된 공식 패키지에서 내려받습니다. 일반적인 패키지 설치는 각 언어의 package registry에 접속할 수 있습니다.
 
-### 원본 파일을 덮어쓰나요?
+### 원본이나 기존 결과를 덮어쓰나요?
 
-아니요. 원본은 변경하지 않고 새 이름의 결과 파일을 생성합니다.
+아니요. 원본은 hash로 재확인하고, 결과는 원본 옆 `Upscaled/`에 새 이름으로 저장합니다. atomic no-replace 공개가 실패하면 기존 파일을 그대로 둡니다.
+
+### 왜 엔진과 모델을 앱에 넣지 않나요?
+
+코드 라이선스와 모델 가중치 재배포 권리는 별개입니다. 현재 catalog는 `approved_for_distribution: false`이며, 권리와 고지 의무가 확인되기 전에는 release bundle 검사가 엔진·모델 포함을 차단합니다.
 
 ## 라이선스
 
-Zoos Upscale의 자체 소스 코드는 [Apache License 2.0](LICENSE)으로 공개합니다. 함께 배포되는 FFmpeg, AI 실행기와 모델 가중치는 각각의 별도 라이선스와 고지 조건을 따릅니다.
+Zoos Upscale의 자체 소스 코드는 [Apache License 2.0](LICENSE)으로 공개합니다. 외부 실행기, AI 모델 가중치와 향후 FFmpeg는 각각의 별도 라이선스와 고지 조건을 따릅니다.

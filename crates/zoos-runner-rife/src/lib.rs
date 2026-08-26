@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,11 @@ const EXIT_CANCELLED: i32 = 50;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+#[cfg(unix)]
+const PROCESS_TERM_GRACE: Duration = Duration::from_millis(750);
+const MEDIA_PHASE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const INTERPOLATION_PHASE_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 const FFMPEG_HASH: &str = "653e700a788f3376ebc3817a3dcda56e111111410f7edd8eea919c4089216d4e";
 const FFPROBE_HASH: &str = "edaf9c5f53aef960ceb5f779d986e7dea86ee549e6716a2c03b70010b88a4da6";
@@ -319,6 +324,7 @@ fn execute_video_job<W: Write>(
                 completed: position as u64,
                 total: chunks.len() as u64,
                 started,
+                deadline: MEDIA_PHASE_TIMEOUT,
                 watch: Some((request.work.input_frames.clone(), input_frame_count(*chunk))),
             },
         )?;
@@ -335,6 +341,7 @@ fn execute_video_job<W: Write>(
                 completed: position as u64,
                 total: chunks.len() as u64,
                 started,
+                deadline: INTERPOLATION_PHASE_TIMEOUT,
                 watch: Some((request.work.output_frames.clone(), input_count * 2)),
             },
         )?;
@@ -347,8 +354,11 @@ fn execute_video_job<W: Write>(
         )?;
         require_png_count(&request.work.output_frames, input_count * 2)?;
         let expected_frames = chunk_output_frames(*chunk);
-        let chunk_path = chunk_dir.join(format!("{position:06}.mkv"));
-        let encode_args = ffmpeg_encode_args(request, &chunk_path, expected_frames);
+        // NUT preserves the exact rational frame time base. Matroska's default millisecond
+        // time base quantizes 60000/1001 and made the final MOV probe as a non-target CFR.
+        let chunk_path = chunk_dir.join(format!("{position:06}.nut"));
+        let chunk_temporary = temporary_output_path(&chunk_path, "encode");
+        let encode_args = ffmpeg_encode_args(request, &chunk_temporary, expected_frames);
         run_command(
             &assets.ffmpeg,
             &encode_args,
@@ -359,22 +369,34 @@ fn execute_video_job<W: Write>(
                 completed: (position + 1) as u64,
                 total: chunks.len() as u64,
                 started,
+                deadline: MEDIA_PHASE_TIMEOUT,
                 watch: None,
             },
         )?;
-        if !is_regular_nonempty(&chunk_path) {
+        if !is_regular_nonempty(&chunk_temporary) {
             return Err(Failure::upstream("chunk encoder produced no output"));
         }
+        publish_no_replace(&chunk_temporary, &chunk_path)?;
         remove_directory(&request.work.input_frames)?;
         remove_directory(&request.work.output_frames)?;
         chunk_paths.push(chunk_path);
     }
     let concat_list = request.work.root.join("concat.txt");
-    write_concat_list(&concat_list, &chunk_paths)?;
-    let joined_video = request.work.root.join("joined-video.mkv");
+    write_concat_list(
+        &concat_list,
+        &chunk_paths,
+        &chunks,
+        request.parameters.target_rate,
+    )?;
+    let joined_video = request.work.root.join("joined-video.nut");
+    let joined_temporary = temporary_output_path(&joined_video, "concat");
     run_command(
         &assets.ffmpeg,
-        &ffmpeg_concat_args(&concat_list, &joined_video),
+        &ffmpeg_concat_args(
+            &concat_list,
+            &joined_temporary,
+            request.parameters.target_rate,
+        ),
         events,
         CommandProgress {
             stage: "joining",
@@ -382,15 +404,18 @@ fn execute_video_job<W: Write>(
             completed: chunks.len() as u64,
             total: chunks.len() as u64,
             started,
+            deadline: MEDIA_PHASE_TIMEOUT,
             watch: None,
         },
     )?;
-    if !is_regular_nonempty(&joined_video) {
+    if !is_regular_nonempty(&joined_temporary) {
         return Err(Failure::upstream("concat produced no joined video"));
     }
+    publish_no_replace(&joined_temporary, &joined_video)?;
+    let final_temporary = temporary_output_path(&request.output.path, "mux");
     run_command(
         &assets.ffmpeg,
-        &ffmpeg_mux_args(request, &joined_video),
+        &ffmpeg_mux_args(request, &joined_video, &final_temporary),
         events,
         CommandProgress {
             stage: "muxing",
@@ -398,9 +423,14 @@ fn execute_video_job<W: Write>(
             completed: chunks.len() as u64,
             total: chunks.len() as u64,
             started,
+            deadline: MEDIA_PHASE_TIMEOUT,
             watch: None,
         },
     )?;
+    if !is_regular_nonempty(&final_temporary) {
+        return Err(Failure::upstream("mux produced no final video"));
+    }
+    publish_no_replace(&final_temporary, &request.output.path)?;
     Ok(ExecutionStats {
         chunk_count: chunks.len(),
         scene_cut_count,
@@ -534,13 +564,17 @@ fn ffmpeg_encode_args(
         gop.to_string().into(),
         "-keyint_min".into(),
         gop.to_string().into(),
+        "-r".into(),
+        rate_text(request.parameters.target_rate).into(),
+        "-fps_mode".into(),
+        "cfr".into(),
         "-progress".into(),
         "pipe:1".into(),
         output.as_os_str().to_owned(),
     ]
 }
 
-fn ffmpeg_concat_args(list: &Path, output: &Path) -> Vec<OsString> {
+fn ffmpeg_concat_args(list: &Path, output: &Path, target_rate: RationalRate) -> Vec<OsString> {
     vec![
         "-nostdin".into(),
         "-hide_banner".into(),
@@ -557,13 +591,21 @@ fn ffmpeg_concat_args(list: &Path, output: &Path) -> Vec<OsString> {
         "0:v:0".into(),
         "-c:v".into(),
         "copy".into(),
+        "-r".into(),
+        rate_text(target_rate).into(),
+        "-fps_mode".into(),
+        "cfr".into(),
         "-progress".into(),
         "pipe:1".into(),
         output.as_os_str().to_owned(),
     ]
 }
 
-fn ffmpeg_mux_args(request: &VideoInterpolateJobRequest, video: &Path) -> Vec<OsString> {
+fn ffmpeg_mux_args(
+    request: &VideoInterpolateJobRequest,
+    video: &Path,
+    output: &Path,
+) -> Vec<OsString> {
     let mut args = vec![
         "-nostdin".into(),
         "-hide_banner".into(),
@@ -605,7 +647,23 @@ fn ffmpeg_mux_args(request: &VideoInterpolateJobRequest, video: &Path) -> Vec<Os
             }
         }
     }
-    args.extend([OsString::from("-c:v"), OsString::from("copy")]);
+    args.extend([
+        OsString::from("-c:v"),
+        OsString::from("copy"),
+        OsString::from("-r"),
+        OsString::from(rate_text(request.parameters.target_rate)),
+        OsString::from("-fps_mode"),
+        OsString::from("cfr"),
+    ]);
+    if matches!(
+        request.output.container,
+        VideoContainer::Mp4 | VideoContainer::Mov
+    ) {
+        args.extend([
+            OsString::from("-video_track_timescale"),
+            OsString::from(request.parameters.target_rate.numerator.to_string()),
+        ]);
+    }
     if request
         .mux_plan
         .streams
@@ -629,7 +687,7 @@ fn ffmpeg_mux_args(request: &VideoInterpolateJobRequest, video: &Path) -> Vec<Os
         }),
         OsString::from("-progress"),
         OsString::from("pipe:1"),
-        request.output.path.as_os_str().to_owned(),
+        output.as_os_str().to_owned(),
     ]);
     args
 }
@@ -684,11 +742,13 @@ fn scene_difference_permille(first: &Path, second: &Path) -> Result<u64, Failure
 }
 
 fn copy_replace(source: &Path, destination: &Path) -> Result<(), Failure> {
-    if destination.exists() {
-        fs::remove_file(destination).map_err(|error| Failure::upstream(error.to_string()))?;
-    }
-    fs::copy(source, destination).map_err(|error| Failure::upstream(error.to_string()))?;
-    Ok(())
+    let mut input = open_read_no_follow(source)
+        .map_err(|error| Failure::upstream(format!("unsafe source frame: {error}")))?;
+    atomic_replace_file(destination, |output| {
+        io::copy(&mut input, output)?;
+        Ok(())
+    })
+    .map_err(|error| Failure::upstream(error.to_string()))
 }
 
 fn frame_path(directory: &Path, index: u64) -> PathBuf {
@@ -705,6 +765,7 @@ struct CommandProgress<'a> {
     completed: u64,
     total: u64,
     started: Instant,
+    deadline: Duration,
     watch: Option<(PathBuf, u64)>,
 }
 
@@ -714,36 +775,61 @@ fn run_command<W: Write>(
     events: &mut EventWriter<'_, W>,
     progress: CommandProgress<'_>,
 ) -> Result<(), Failure> {
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| Failure::upstream(format!("could not start upstream: {error}")))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Failure::upstream("missing stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| Failure::upstream("missing stderr"))?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_child_group(&mut child);
+            return Err(Failure::upstream("missing stdout"));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            terminate_child_group(&mut child);
+            return Err(Failure::upstream("missing stderr"));
+        }
+    };
     let stdout_task = thread::spawn(move || io::copy(&mut BufReader::new(stdout), &mut io::sink()));
     let stderr_task = thread::spawn(move || read_bounded(stderr));
     let mut last_event = Instant::now();
+    let phase_started = Instant::now();
     let status = loop {
         if CANCELLED.swap(false, Ordering::SeqCst) {
-            terminate_child(&mut child);
+            terminate_child_group(&mut child);
             let _ = stdout_task.join();
             let _ = stderr_task.join();
             return Err(Failure::cancelled());
+        }
+        if phase_started.elapsed() >= progress.deadline {
+            terminate_child_group(&mut child);
+            let _ = stdout_task.join();
+            let _ = stderr_task.join();
+            return Err(Failure::upstream(format!(
+                "{} phase exceeded its {:?} hard deadline",
+                progress.stage, progress.deadline
+            )));
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(error) => {
-                terminate_child(&mut child);
+                terminate_child_group(&mut child);
+                let _ = stdout_task.join();
+                let _ = stderr_task.join();
                 return Err(Failure::upstream(error.to_string()));
             }
         }
@@ -766,6 +852,9 @@ fn run_command<W: Write>(
         }
         thread::sleep(POLL_INTERVAL);
     };
+    // A successful or failed parent may still have descendants holding pipes or files.
+    // Always drain its dedicated process group before joining the reader threads.
+    terminate_child_group(&mut child);
     let _ = stdout_task.join();
     let diagnostic = stderr_task.join().unwrap_or_default();
     if !status.success() {
@@ -831,7 +920,37 @@ fn read_bounded(mut reader: impl Read) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn terminate_child(child: &mut Child) {
+#[cfg(unix)]
+fn terminate_child_group(child: &mut Child) {
+    let process_group = child.id() as libc::pid_t;
+    unsafe {
+        libc::kill(-process_group, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + PROCESS_TERM_GRACE;
+    while process_group_exists(process_group) && Instant::now() < deadline {
+        let _ = child.try_wait();
+        thread::sleep(POLL_INTERVAL);
+    }
+    if process_group_exists(process_group) {
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+        let kill_deadline = Instant::now() + PROCESS_TERM_GRACE;
+        while process_group_exists(process_group) && Instant::now() < kill_deadline {
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn process_group_exists(process_group: libc::pid_t) -> bool {
+    let result = unsafe { libc::kill(-process_group, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn terminate_child_group(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -876,20 +995,32 @@ fn validate_private_paths(
         }
     }
     for path in [
-        root,
-        &request.work.input_frames,
-        &request.work.output_frames,
+        root.clone(),
+        request.work.input_frames.clone(),
+        request.work.output_frames.clone(),
+        request.work.root.join("chunks"),
     ] {
-        if let Ok(metadata) = fs::symlink_metadata(path)
+        if let Ok(metadata) = fs::symlink_metadata(&path)
             && metadata.file_type().is_symlink()
         {
             return Err("managed work path must not be a symlink".into());
         }
     }
-    match fs::symlink_metadata(&request.output.path) {
-        Ok(_) => return Err("private output already exists".into()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.to_string()),
+    for path in [
+        request.output.path.clone(),
+        request.work.root.join("concat.txt"),
+        request.work.root.join("joined-video.nut"),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(format!(
+                    "managed internal output already exists: {}",
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
     }
     Ok(())
 }
@@ -1014,7 +1145,7 @@ fn fat_contains_arm64(bytes: &[u8]) -> bool {
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut file = open_read_no_follow(path).map_err(|error| error.to_string())?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -1065,7 +1196,7 @@ fn cleanup_success_intermediates(request: &VideoInterpolateJobRequest) -> Result
     }
     for file in [
         request.work.root.join("concat.txt"),
-        request.work.root.join("joined-video.mkv"),
+        request.work.root.join("joined-video.nut"),
     ] {
         match fs::remove_file(file) {
             Ok(()) => {}
@@ -1107,11 +1238,7 @@ fn write_runner_evidence(
         }
     });
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)
-            .map_err(|error| error.to_string())?;
+        let mut file = open_new_no_follow(&temporary_path).map_err(|error| error.to_string())?;
         serde_json::to_writer_pretty(&mut file, &evidence).map_err(|error| error.to_string())?;
         file.write_all(b"\n").map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
@@ -1137,14 +1264,108 @@ fn cleanup_work_root(path: &Path) {
     }
 }
 
-fn write_concat_list(path: &Path, chunks: &[PathBuf]) -> Result<(), Failure> {
-    let mut file = File::create(path).map_err(|error| Failure::upstream(error.to_string()))?;
-    for chunk in chunks {
-        let escaped = chunk.to_string_lossy().replace('\'', "'\\''");
-        writeln!(file, "file '{escaped}'").map_err(|error| Failure::upstream(error.to_string()))?;
+fn write_concat_list(
+    path: &Path,
+    chunk_paths: &[PathBuf],
+    chunks: &[Chunk],
+    target_rate: RationalRate,
+) -> Result<(), Failure> {
+    if chunk_paths.len() != chunks.len() {
+        return Err(Failure::upstream("concat chunk metadata mismatch"));
     }
-    file.sync_all()
-        .map_err(|error| Failure::upstream(error.to_string()))
+    atomic_replace_file(path, |file| {
+        for (chunk_path, chunk) in chunk_paths.iter().zip(chunks) {
+            let escaped = chunk_path.to_string_lossy().replace('\'', "'\\''");
+            let duration = chunk_output_frames(*chunk) as f64 * f64::from(target_rate.denominator)
+                / f64::from(target_rate.numerator);
+            writeln!(file, "file '{escaped}'")?;
+            writeln!(file, "duration {duration:.12}")?;
+        }
+        Ok(())
+    })
+    .map_err(|error| Failure::upstream(error.to_string()))
+}
+
+fn temporary_output_path(path: &Path, phase: &str) -> PathBuf {
+    let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or("video");
+    let extension = path.extension().and_then(OsStr::to_str).unwrap_or("tmp");
+    path.with_file_name(format!(
+        ".{stem}.{phase}.{}.{sequence}.{extension}",
+        std::process::id()
+    ))
+}
+
+fn publish_no_replace(source: &Path, destination: &Path) -> Result<(), Failure> {
+    if !is_regular_nonempty(source) {
+        return Err(Failure::upstream(
+            "refusing to publish a non-regular internal output",
+        ));
+    }
+    fs::hard_link(source, destination).map_err(|error| {
+        Failure::upstream(format!(
+            "could not atomically publish internal output {}: {error}",
+            destination.display()
+        ))
+    })?;
+    if let Err(error) = fs::remove_file(source) {
+        let _ = fs::remove_file(destination);
+        return Err(Failure::upstream(error.to_string()));
+    }
+    sync_parent(destination).map_err(|error| Failure::upstream(error.to_string()))
+}
+
+fn atomic_replace_file(
+    destination: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    let temporary = temporary_output_path(destination, "write");
+    let result = (|| {
+        let mut file = open_new_no_follow(&temporary)?;
+        write(&mut file)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, destination)?;
+        sync_parent(destination)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn open_new_no_follow(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn open_read_no_follow(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("path is not a regular file"));
+    }
+    Ok(file)
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("path has no parent"))?;
+    File::open(parent)?.sync_all()
 }
 
 fn rate_text(rate: RationalRate) -> String {
@@ -1379,7 +1600,11 @@ mod tests {
     #[test]
     fn mux_arguments_follow_explicit_stream_actions() {
         let request = fixture_request();
-        let args = ffmpeg_mux_args(&request, &root().join("video.mkv"));
+        let args = ffmpeg_mux_args(
+            &request,
+            &root().join("video.mkv"),
+            &root().join("output.mkv"),
+        );
         let text = args
             .iter()
             .map(|arg| arg.to_string_lossy())
@@ -1388,6 +1613,36 @@ mod tests {
         assert!(text.windows(2).any(|pair| pair == ["-map", "1:1"]));
         assert!(text.windows(2).any(|pair| pair == ["-map_metadata", "1"]));
         assert!(text.windows(2).any(|pair| pair == ["-map_chapters", "1"]));
+        assert!(text.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(text.windows(2).any(|pair| pair == ["-r", "60/1"]));
+        assert!(text.windows(2).any(|pair| pair == ["-fps_mode", "cfr"]));
+        assert!(!text.iter().any(|arg| arg == "-video_track_timescale"));
+    }
+
+    #[test]
+    fn mov_mux_pins_target_rate_and_track_timescale_without_reencoding() {
+        let mut request = fixture_request();
+        request.output.container = VideoContainer::Mov;
+        request.parameters.target_rate = RationalRate {
+            numerator: 60_000,
+            denominator: 1_001,
+        };
+        let args = ffmpeg_mux_args(
+            &request,
+            &root().join("video.mkv"),
+            &root().join("output.mov"),
+        );
+        let text = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(text.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(text.windows(2).any(|pair| pair == ["-r", "60000/1001"]));
+        assert!(text.windows(2).any(|pair| pair == ["-fps_mode", "cfr"]));
+        assert!(
+            text.windows(2)
+                .any(|pair| pair == ["-video_track_timescale", "60000"])
+        );
     }
 
     #[test]
@@ -1488,7 +1743,7 @@ mod tests {
         for file in [
             request.output.path.clone(),
             request.work.root.join("concat.txt"),
-            request.work.root.join("joined-video.mkv"),
+            request.work.root.join("joined-video.nut"),
         ] {
             fs::write(file, b"owned").unwrap();
         }
@@ -1497,6 +1752,69 @@ mod tests {
         assert!(!request.work.input_frames.exists());
         assert!(!request.work.output_frames.exists());
         assert!(!request.work.root.join("chunks").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn managed_internal_files_replace_symlinks_without_touching_targets() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let victim = temporary.path().join("victim");
+        fs::write(&victim, b"keep").unwrap();
+
+        let concat = temporary.path().join("concat.txt");
+        std::os::unix::fs::symlink(&victim, &concat).unwrap();
+        let chunk = temporary.path().join("chunk.mkv");
+        write_concat_list(
+            &concat,
+            std::slice::from_ref(&chunk),
+            &[Chunk {
+                start_frame: 0,
+                end_frame: 1,
+                final_chunk: true,
+            }],
+            RationalRate {
+                numerator: 60,
+                denominator: 1,
+            },
+        )
+        .expect("atomic concat");
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        assert!(fs::symlink_metadata(&concat).unwrap().is_file());
+        assert!(fs::read_to_string(&concat).unwrap().contains("chunk.mkv"));
+        assert!(
+            fs::read_to_string(&concat)
+                .unwrap()
+                .contains("duration 0.066666666667")
+        );
+
+        let source = temporary.path().join("source.png");
+        fs::write(&source, b"frame").unwrap();
+        let frame = temporary.path().join("frame.png");
+        std::os::unix::fs::symlink(&victim, &frame).unwrap();
+        copy_replace(&source, &frame).expect("atomic frame replacement");
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(fs::read(&frame).unwrap(), b"frame");
+        assert!(
+            !fs::symlink_metadata(&frame)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn internal_publish_never_replaces_an_existing_symlink() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let source = temporary.path().join("source.mkv");
+        let victim = temporary.path().join("victim");
+        let destination = temporary.path().join("joined.mkv");
+        fs::write(&source, b"video").unwrap();
+        fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, &destination).unwrap();
+        assert!(publish_no_replace(&source, &destination).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(fs::read(&source).unwrap(), b"video");
     }
 
     #[test]
@@ -1514,6 +1832,7 @@ mod tests {
                 completed: 0,
                 total: 1,
                 started: Instant::now(),
+                deadline: Duration::from_secs(10),
                 watch: None,
             },
         )
@@ -1533,11 +1852,81 @@ mod tests {
                 completed: 0,
                 total: 1,
                 started: Instant::now(),
+                deadline: Duration::from_secs(10),
                 watch: None,
             },
         )
         .expect_err("false must fail");
         assert_eq!(failure.code, "UPSTREAM_FAILED");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn phase_deadline_terminates_the_upstream_group() {
+        let mut output = Vec::new();
+        let mut events = EventWriter::new(&mut output, "job-deadline");
+        let started = Instant::now();
+        let failure = run_command(
+            Path::new("/bin/sleep"),
+            &[OsString::from("30")],
+            &mut events,
+            CommandProgress {
+                stage: "interpolating",
+                chunk_id: "chunk-0".into(),
+                completed: 0,
+                total: 1,
+                started,
+                deadline: Duration::from_millis(100),
+                watch: None,
+            },
+        )
+        .expect_err("deadline must fail");
+        assert!(failure.message.contains("hard deadline"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn normal_and_failed_upstreams_leave_no_term_resistant_descendants() {
+        for exit in [0, 7] {
+            let temporary = tempfile::tempdir().expect("tempdir");
+            let pid_file = temporary.path().join("descendant.pid");
+            let script = format!(
+                "(trap '' TERM; sleep 30) & echo $! > '{}'; exit {exit}",
+                pid_file.display()
+            );
+            let mut output = Vec::new();
+            let mut events = EventWriter::new(&mut output, "job-tree");
+            let result = run_command(
+                Path::new("/bin/sh"),
+                &[OsString::from("-c"), OsString::from(script)],
+                &mut events,
+                CommandProgress {
+                    stage: "interpolating",
+                    chunk_id: "chunk-0".into(),
+                    completed: 0,
+                    total: 1,
+                    started: Instant::now(),
+                    deadline: Duration::from_secs(5),
+                    watch: None,
+                },
+            );
+            assert_eq!(result.is_ok(), exit == 0);
+            let descendant: libc::pid_t = fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let gone = (0..40).any(|_| {
+                if unsafe { libc::kill(descendant, 0) } != 0 {
+                    true
+                } else {
+                    thread::sleep(Duration::from_millis(25));
+                    false
+                }
+            });
+            assert!(gone, "descendant {descendant} survived exit {exit}");
+        }
     }
 
     #[test]
@@ -1574,6 +1963,16 @@ mod tests {
             encode
                 .windows(2)
                 .any(|pair| pair == [OsStr::new("-start_number"), OsStr::new("1")])
+        );
+        assert!(
+            encode
+                .windows(2)
+                .any(|pair| pair == [OsStr::new("-r"), OsStr::new("60/1")])
+        );
+        assert!(
+            encode
+                .windows(2)
+                .any(|pair| pair == [OsStr::new("-fps_mode"), OsStr::new("cfr")])
         );
         for forbidden in ["sh", "bash", "zsh", "cmd.exe", "powershell"] {
             assert_ne!(assets.engine.file_name().unwrap(), OsStr::new(forbidden));

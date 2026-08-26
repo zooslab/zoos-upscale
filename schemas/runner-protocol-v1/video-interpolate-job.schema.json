@@ -99,6 +99,13 @@
         },
         "kind": {
           "$ref": "#/definitions/MuxStreamKind"
+        },
+        "metadata": {
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false

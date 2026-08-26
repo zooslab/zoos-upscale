@@ -228,6 +228,12 @@ impl MediaDescriptor {
                             }
                         },
                     },
+                    metadata: stream
+                        .tags
+                        .iter()
+                        .filter(|(key, _)| !ignored_generated_tag(key, TagScope::Stream))
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
                 })
                 .collect(),
             copy_metadata: true,
@@ -800,8 +806,7 @@ fn ignored_generated_tag(key: &str, scope: TagScope) -> bool {
         TagScope::Stream => {
             key == "encoder"
                 || key == "duration"
-                || key == "number_of_frames"
-                || key == "number_of_bytes"
+                || key.starts_with("number_of_")
                 || key.starts_with("statistics_")
                 || key.starts_with("_") && key.ends_with("_eng")
         }
@@ -1208,8 +1213,17 @@ mod tests {
     #[test]
     fn video_only_plan_contains_the_video_and_copy_policies() {
         let (_directory, input, bytes) = fixture("video-only.json", "mp4");
-        let descriptor =
+        let mut descriptor =
             parse_descriptor(&input, &bytes, ProbeMode::Source).expect("valid video-only probe");
+        descriptor.streams[0]
+            .tags
+            .insert("handler_name".into(), "VideoHandler".into());
+        descriptor.streams[0]
+            .tags
+            .insert("encoder".into(), "generated".into());
+        descriptor.streams[0]
+            .tags
+            .insert("number_of_packets".into(), "300".into());
         assert_eq!(
             descriptor.frame_rate,
             RationalRate {
@@ -1218,6 +1232,23 @@ mod tests {
             }
         );
         assert_eq!(descriptor.mux_plan().streams.len(), 1);
+        assert_eq!(
+            descriptor.mux_plan().streams[0]
+                .metadata
+                .get("handler_name")
+                .map(String::as_str),
+            Some("VideoHandler")
+        );
+        assert!(
+            !descriptor.mux_plan().streams[0]
+                .metadata
+                .contains_key("encoder")
+        );
+        assert!(
+            !descriptor.mux_plan().streams[0]
+                .metadata
+                .contains_key("number_of_packets")
+        );
         assert_eq!(
             descriptor.mux_plan().streams[0].action,
             MuxStreamAction::InterpolateVideo

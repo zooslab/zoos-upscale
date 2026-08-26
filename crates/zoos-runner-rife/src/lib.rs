@@ -617,8 +617,15 @@ fn ffmpeg_mux_args(
         "-i".into(),
         request.input.path.as_os_str().to_owned(),
     ];
+    let mut video_index = 0u32;
+    let mut audio_index = 0u32;
     let mut subtitle_index = 0u32;
     for stream in &request.mux_plan.streams {
+        let output_stream = match stream.kind {
+            MuxStreamKind::Video => format!("v:{video_index}"),
+            MuxStreamKind::Audio => format!("a:{audio_index}"),
+            MuxStreamKind::Subtitle => format!("s:{subtitle_index}"),
+        };
         match stream.action {
             MuxStreamAction::InterpolateVideo => {
                 args.extend([OsString::from("-map"), OsString::from("0:v:0")]);
@@ -645,6 +652,30 @@ fn ffmpeg_mux_args(
                 ]);
                 subtitle_index += 1;
             }
+        }
+        if request.mux_plan.copy_metadata {
+            args.extend([
+                OsString::from(format!("-map_metadata:s:{output_stream}")),
+                OsString::from(format!("1:s:{}", stream.input_index)),
+            ]);
+            for (key, value) in &stream.metadata {
+                args.push(OsString::from(format!("-metadata:s:{output_stream}")));
+                let key = if matches!(
+                    request.output.container,
+                    VideoContainer::Mp4 | VideoContainer::Mov
+                ) && key.eq_ignore_ascii_case("name")
+                {
+                    "title"
+                } else {
+                    key
+                };
+                args.push(OsString::from(format!("{key}={value}")));
+            }
+        }
+        match stream.kind {
+            MuxStreamKind::Video => video_index += 1,
+            MuxStreamKind::Audio => audio_index += 1,
+            MuxStreamKind::Subtitle => {}
         }
     }
     args.extend([
@@ -1613,6 +1644,14 @@ mod tests {
         assert!(text.windows(2).any(|pair| pair == ["-map", "1:1"]));
         assert!(text.windows(2).any(|pair| pair == ["-map_metadata", "1"]));
         assert!(text.windows(2).any(|pair| pair == ["-map_chapters", "1"]));
+        assert!(
+            text.windows(2)
+                .any(|pair| pair == ["-map_metadata:s:v:0", "1:s:0"])
+        );
+        assert!(
+            text.windows(2)
+                .any(|pair| pair == ["-map_metadata:s:a:0", "1:s:1"])
+        );
         assert!(text.windows(2).any(|pair| pair == ["-c:v", "copy"]));
         assert!(text.windows(2).any(|pair| pair == ["-r", "60/1"]));
         assert!(text.windows(2).any(|pair| pair == ["-fps_mode", "cfr"]));
@@ -1623,6 +1662,18 @@ mod tests {
     fn mov_mux_pins_target_rate_and_track_timescale_without_reencoding() {
         let mut request = fixture_request();
         request.output.container = VideoContainer::Mov;
+        request.mux_plan.streams[1]
+            .metadata
+            .insert("name".into(), "Audio = Korean; $(safe)".into());
+        request
+            .mux_plan
+            .streams
+            .push(zoos_runner_protocol::MuxStreamPlan {
+                input_index: 2,
+                kind: MuxStreamKind::Subtitle,
+                action: MuxStreamAction::TranscodeMovText,
+                metadata: Default::default(),
+            });
         request.parameters.target_rate = RationalRate {
             numerator: 60_000,
             denominator: 1_001,
@@ -1642,6 +1693,14 @@ mod tests {
         assert!(
             text.windows(2)
                 .any(|pair| pair == ["-video_track_timescale", "60000"])
+        );
+        assert!(
+            text.windows(2)
+                .any(|pair| pair == ["-map_metadata:s:s:0", "1:s:2"])
+        );
+        assert!(
+            text.windows(2)
+                .any(|pair| pair == ["-metadata:s:a:0", "title=Audio = Korean; $(safe)"])
         );
     }
 
@@ -2026,11 +2085,13 @@ mod tests {
                         input_index: 0,
                         kind: MuxStreamKind::Video,
                         action: MuxStreamAction::InterpolateVideo,
+                        metadata: Default::default(),
                     },
                     MuxStreamPlan {
                         input_index: 1,
                         kind: MuxStreamKind::Audio,
                         action: MuxStreamAction::Copy,
+                        metadata: Default::default(),
                     },
                 ],
                 copy_metadata: true,

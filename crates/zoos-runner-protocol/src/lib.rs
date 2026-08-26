@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use schemars::JsonSchema;
@@ -338,11 +339,12 @@ pub struct MuxPlan {
 
 impl MuxPlan {
     fn validate(&self) -> Result<(), ContractError> {
-        if self.streams.is_empty() {
+        if self.streams.is_empty() || self.streams.len() > 32 {
             return Err(ContractError::InvalidVideoParameter("mux_plan.streams"));
         }
         let mut indices = std::collections::HashSet::new();
         let mut interpolated_video_count = 0;
+        let mut metadata_bytes = 0usize;
         for stream in &self.streams {
             if !indices.insert(stream.input_index) {
                 return Err(ContractError::InvalidVideoParameter("mux_plan.input_index"));
@@ -355,6 +357,30 @@ impl MuxPlan {
                 MuxStreamAction::Copy if stream.kind != MuxStreamKind::Video => {}
                 _ => return Err(ContractError::InvalidVideoParameter("mux_plan.action")),
             }
+            if !self.copy_metadata && !stream.metadata.is_empty() {
+                return Err(ContractError::InvalidVideoParameter("mux_plan.metadata"));
+            }
+            if stream.metadata.len() > 64 {
+                return Err(ContractError::InvalidVideoParameter("mux_plan.metadata"));
+            }
+            for (key, value) in &stream.metadata {
+                if key.is_empty()
+                    || key.len() > 128
+                    || value.len() > 4_096
+                    || key.contains('=')
+                    || key.bytes().any(|byte| byte.is_ascii_control())
+                    || value.contains('\0')
+                {
+                    return Err(ContractError::InvalidVideoParameter("mux_plan.metadata"));
+                }
+                metadata_bytes = metadata_bytes
+                    .checked_add(key.len())
+                    .and_then(|total| total.checked_add(value.len()))
+                    .ok_or(ContractError::InvalidVideoParameter("mux_plan.metadata"))?;
+                if metadata_bytes > 64 * 1_024 {
+                    return Err(ContractError::InvalidVideoParameter("mux_plan.metadata"));
+                }
+            }
         }
         if interpolated_video_count != 1 {
             return Err(ContractError::InvalidVideoParameter("mux_plan.video"));
@@ -363,12 +389,14 @@ impl MuxPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MuxStreamPlan {
     pub input_index: u32,
     pub kind: MuxStreamKind,
     pub action: MuxStreamAction,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -999,11 +1027,13 @@ mod tests {
                         input_index: 0,
                         kind: MuxStreamKind::Video,
                         action: MuxStreamAction::InterpolateVideo,
+                        metadata: Default::default(),
                     },
                     MuxStreamPlan {
                         input_index: 1,
                         kind: MuxStreamKind::Audio,
                         action: MuxStreamAction::Copy,
+                        metadata: Default::default(),
                     },
                 ],
                 copy_metadata: true,
@@ -1071,6 +1101,73 @@ mod tests {
             request.validate(),
             Err(ContractError::InvalidVideoParameter("mux_plan.action"))
         );
+    }
+
+    #[test]
+    fn video_mux_metadata_is_bounded_and_backward_compatible() {
+        let mut request = video_request();
+        request.mux_plan.streams[0]
+            .metadata
+            .insert("name".into(), "Main video".into());
+        request.validate().expect("semantic metadata must validate");
+
+        for invalid_key in ["", "bad=key", "bad\nkey"] {
+            let mut invalid = video_request();
+            invalid.mux_plan.streams[0]
+                .metadata
+                .insert(invalid_key.into(), "value".into());
+            assert_eq!(
+                invalid.validate(),
+                Err(ContractError::InvalidVideoParameter("mux_plan.metadata"))
+            );
+        }
+
+        let mut disabled = request.clone();
+        disabled.mux_plan.copy_metadata = false;
+        assert_eq!(
+            disabled.validate(),
+            Err(ContractError::InvalidVideoParameter("mux_plan.metadata"))
+        );
+
+        let mut too_many_tags = video_request();
+        too_many_tags.mux_plan.streams[0].metadata = (0..65)
+            .map(|index| (format!("tag{index}"), "value".into()))
+            .collect();
+        assert_eq!(
+            too_many_tags.validate(),
+            Err(ContractError::InvalidVideoParameter("mux_plan.metadata"))
+        );
+
+        let mut too_large = video_request();
+        too_large.mux_plan.streams[0].metadata = (0..64)
+            .map(|index| (format!("tag{index}"), "x".repeat(1_025)))
+            .collect();
+        assert_eq!(
+            too_large.validate(),
+            Err(ContractError::InvalidVideoParameter("mux_plan.metadata"))
+        );
+
+        let mut too_many_streams = video_request();
+        for input_index in 2..33 {
+            too_many_streams.mux_plan.streams.push(MuxStreamPlan {
+                input_index,
+                kind: MuxStreamKind::Audio,
+                action: MuxStreamAction::Copy,
+                metadata: Default::default(),
+            });
+        }
+        assert_eq!(
+            too_many_streams.validate(),
+            Err(ContractError::InvalidVideoParameter("mux_plan.streams"))
+        );
+
+        let mut value = serde_json::to_value(video_request()).unwrap();
+        value["mux_plan"]["streams"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("metadata");
+        let decoded: VideoInterpolateJobRequest = serde_json::from_value(value).unwrap();
+        assert!(decoded.mux_plan.streams[0].metadata.is_empty());
     }
 
     #[test]
